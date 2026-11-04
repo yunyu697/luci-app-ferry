@@ -4,7 +4,7 @@
 
 ## 1. 一句话现状
 
-功能（节点/规则/预设/部署/档案/双内核配置生成）已完成，并已完成 `proxymesh` → `ferry`（渡口）改名与首发：全仓库无旧名残留；静态检查、5 个离线测试全部通过；在自建 QEMU 实例上做了真机安装验证——OpenWrt 24.10.4（opkg）与 ImmortalWrt 25.12.0（apk）均完成“装包 → 服务启动 → 菜单文件就位 → 卸载（prerm/pre-deinstall 执行、dnsmasq 还原、nft 表清空、用户数据保留）→ 重启后 dnsmasq 接管仍成立”。产物 ipk/apk 通过 GitHub Release 分发，不入库。
+功能（节点/规则/预设/部署/档案/双内核配置生成）已完成，并已完成项目改名（旧名 → `ferry`，中文名「渡口」）与首发：全仓库无旧名残留；静态检查、5 个离线测试全部通过；在自建 QEMU 实例上做了真机安装验证——OpenWrt 24.10.4（opkg）与 ImmortalWrt 25.12.0（apk）均完成“装包 → 服务启动 → 菜单文件就位 → 卸载（prerm/pre-deinstall 执行、dnsmasq 还原、nft 表清空、用户数据保留）→ 重启后 dnsmasq 接管仍成立”。产物 ipk/apk 通过 GitHub Release 分发，不入库。
 
 ## 2. 关键文件职责
 
