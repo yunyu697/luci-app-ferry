@@ -1,0 +1,18 @@
+#!/bin/sh
+# 首次安装时初始化运行目录，并触发一次 LuCI 菜单/索引刷新。
+[ -f /etc/config/ferry ] || exit 0
+
+mkdir -p /etc/mihomo/providers /etc/sing-box /var/etc/ferry
+mkdir -p /etc/ferry/rules-cache/mihomo /etc/ferry/rules-cache/sing-box
+
+# 首次启动时 shell 侧会把现有 UCI 迁移为一个默认 profile；这里只保证目录存在，
+# 不预写 nodes.json / profiles.json，避免与 LuCI 的写入产生竞态。
+touch /etc/ferry/.keep 2>/dev/null
+
+# 开机自启（enabled=0 时 start 会直接跳过，不会真的启动内核）
+/etc/init.d/ferry enable >/dev/null 2>&1
+
+# 清空 LuCI 索引缓存，让新菜单/视图立即可见（不影响用户配置）
+rm -f /tmp/luci-indexcache* 2>/dev/null
+
+exit 0

@@ -1,0 +1,29 @@
+# 构建产物
+dist/
+build/
+*.ipk
+*.apk
+
+# 本地测试输出、缓存与日志（不纳入版本库）
+tests/out/
+tests/.cache/
+logs/
+*.log
+
+# 虚拟机镜像与磁盘覆盖层
+images/
+*.img
+*.qcow2
+*.vdi
+*.vmdk
+
+# 内核二进制等大文件
+kernels/
+*.exe
+*.bin
+
+# 编辑器/系统临时文件
+*.swp
+*~
+.DS_Store
+Thumbs.db

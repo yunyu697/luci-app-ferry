@@ -1,0 +1,88 @@
+# Ferry —— mihomo / sing-box 透明代理网关
+# 修改后执行：/etc/init.d/ferry reload
+# LuCI: 服务 -> Ferry
+
+config ferry 'main'
+	# 总开关
+	option enabled '0'
+
+	# 部署形态：router（主路由）| bypass（旁路由）| client（仅生成配置/客户端代理）
+	option deploy 'router'
+
+	# 内核：mihomo | singbox（同一时间只运行一个）
+	option kernel 'mihomo'
+
+	# 运行模式：tproxy | tun | redirect
+	#   tproxy   TCP + UDP，Linux 透明代理首选
+	#   tun      虚拟网卡接管，兼容性最好，路由器自身流量也会被接管
+	#   redirect 仅 TCP（REDIRECT/NAT），UDP/QUIC 需丢弃或额外处理
+	option mode 'tproxy'
+
+	# 透明代理端口（TPROXY / REDIRECT 模式下内核的监听端口）
+	option proxy_port '7890'
+
+	# 混合端口（HTTP+SOCKS5），供局域网设备显式配置代理；填 0 关闭
+	option mixed_port '7891'
+
+	# 内核 DNS 监听端口（mihomo 用 dns.listen，sing-box 非 TUN 用 direct inbound）
+	option dns_port '1053'
+
+	# 劫持局域网 53 端口到内核 DNS
+	option hijack_dns '1'
+
+	# 把 dnsmasq 上游改为内核 DNS，避免路由器自身 DNS 泄漏（TUN 模式由内核接管）
+	option router_dns '1'
+
+	# mihomo DNS 增强模式：fake-ip | redir-host
+	option dns_mode 'fake-ip'
+
+	# 订阅 URL
+	#   mihomo：Clash/mihomo 格式 YAML，将作为 proxy-provider 使用
+	#   singbox：需直接返回完整的 sing-box JSON 配置（转换请在外部完成）
+	option sub_url ''
+
+	# 用户自备内核配置文件（优先于 sub_url，插件不再生成配置）
+	#   mihomo：填 YAML 路径；singbox：填 JSON 路径
+	option config_path ''
+
+	# 内核二进制路径，留空则自动使用 /usr/bin/mihomo 或 /usr/bin/sing-box
+	option bin_path ''
+
+	# 日志级别：silent | error | warning | info | debug
+	option log_level 'info'
+
+	# 局域网接口，留空则自动从 network.lan 推断（通常为 br-lan）
+	option lan_iface ''
+
+	# 需要绕过的内网/保留网段（插件还会内置 127/8、10/8、172.16/12、
+	# 192.168/16、169.254/16、100.64/10、224/4、240/4）
+	list bypass_cidr '192.168.0.0/16'
+
+	# 需要绕过（直连）的目标 IP，可重复添加（例如：list bypass_ip '192.168.1.10'）
+
+	# 是否接管 IPv6（需要在 nftables 路径下才有意义）
+	option enable_ipv6 '1'
+
+	# redirect 模式下丢弃转发 UDP/443（QUIC），避免 QUIC 绕过代理泄漏
+	option block_quic '1'
+
+	# mihomo TUN 模式使用的协议栈：system | gvisor | mixed
+	option tun_stack 'system'
+
+	# 接管实现：auto | nft | iptables
+	option firewall_backend 'auto'
+
+	# 规则集镜像源：github | ghproxy | jsdelivr | custom
+	option rule_mirror 'github'
+	# rule_mirror=custom 时使用的前缀，例如 https://mirror.example.com/github/
+	option rule_mirror_custom ''
+	# 备用源：github | ghproxy | jsdelivr，或完整前缀 https://xxx/
+	option rule_mirror_backup 'ghproxy'
+	# 每次启动是否尝试更新规则集缓存（0 表示只用本地缓存）
+	option rule_update '1'
+
+	# 当前激活的 profile id（由 LuCI 维护，通常不需要手工修改）
+	option profile 'default'
+
+	# 所有规则都不匹配时的默认策略：proxy | direct
+	option final_policy 'proxy'

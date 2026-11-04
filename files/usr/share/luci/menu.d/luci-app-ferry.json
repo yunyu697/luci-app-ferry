@@ -1,0 +1,68 @@
+{
+	"admin/services/ferry": {
+		"title": "Ferry",
+		"order": 60,
+		"action": {
+			"type": "view",
+			"path": "ferry/main"
+		},
+		"depends": {
+			"acl": [ "luci-app-ferry" ]
+		}
+	},
+	"admin/services/ferry/nodes": {
+		"title": "节点管理",
+		"order": 61,
+		"action": {
+			"type": "view",
+			"path": "ferry/nodes"
+		},
+		"depends": {
+			"acl": [ "luci-app-ferry" ]
+		}
+	},
+	"admin/services/ferry/rules": {
+		"title": "分流规则",
+		"order": 62,
+		"action": {
+			"type": "view",
+			"path": "ferry/rules"
+		},
+		"depends": {
+			"acl": [ "luci-app-ferry" ]
+		}
+	},
+	"admin/services/ferry/presets": {
+		"title": "场景预设",
+		"order": 63,
+		"action": {
+			"type": "view",
+			"path": "ferry/presets"
+		},
+		"depends": {
+			"acl": [ "luci-app-ferry" ]
+		}
+	},
+	"admin/services/ferry/deploy": {
+		"title": "部署形态",
+		"order": 64,
+		"action": {
+			"type": "view",
+			"path": "ferry/deploy"
+		},
+		"depends": {
+			"acl": [ "luci-app-ferry" ]
+		}
+	},
+	"admin/services/ferry/profiles": {
+		"title": "配置档案",
+		"order": 65,
+		"action": {
+			"type": "view",
+			"path": "ferry/profiles"
+		},
+		"depends": {
+			"acl": [ "luci-app-ferry" ]
+		}
+	}
+}

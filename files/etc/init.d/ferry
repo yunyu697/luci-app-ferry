@@ -1,0 +1,135 @@
+#!/bin/sh /etc/rc.common
+
+START=99
+STOP=10
+USE_PROCD=1
+
+. /usr/lib/ferry/common.sh
+. /usr/lib/ferry/nodes.sh
+. /usr/lib/ferry/rules.sh
+. /usr/lib/ferry/generate.sh
+. /usr/lib/ferry/firewall.sh
+
+pm_start_kernel() {
+	local bin cfg
+	bin=$(pm_kernel_bin)
+
+	procd_open_instance
+	if [ "$PM_KERNEL" = singbox ]; then
+		cfg="${PM_RUNTIME_CONFIG:-$PM_SINGBOX_DIR/config.json}"
+		procd_set_param command "$bin" run -c "$cfg" -D "$PM_SINGBOX_DIR"
+	else
+		if [ -n "$PM_CONFIG_PATH" ] && [ -f "$PM_CONFIG_PATH" ] && [ "$PM_RUNTIME_CONFIG" = "$PM_CONFIG_PATH" ]; then
+			procd_set_param command "$bin" -d "$PM_MIHOMO_DIR" -f "$PM_CONFIG_PATH"
+		else
+			procd_set_param command "$bin" -d "$PM_MIHOMO_DIR"
+		fi
+	fi
+	procd_set_param respawn 3600 5 5
+	procd_set_param stdout 1
+	procd_set_param stderr 1
+	procd_close_instance
+}
+
+start_service() {
+	PM_RUNTIME_CONFIG=''
+	pm_load
+
+	if [ "$PM_ENABLED" != 1 ]; then
+		pm_log "服务未启用（ferry.main.enabled=0），跳过启动"
+		return 0
+	fi
+
+	if ! pm_prepare; then
+		pm_log "配置准备失败，服务不会启动，局域网保持直连" err
+		return 1
+	fi
+
+	pm_log "启动内核：$(pm_kernel_bin) (profile=$PM_PROFILE_ID deploy=$PM_DEPLOY kernel=$PM_KERNEL mode=$PM_MODE)"
+	pm_start_kernel
+
+	# 注意：procd 要等本脚本返回后才真正 spawn 实例，所以这里不能等端口就绪
+	# （在真机上表现为死等 20 秒超时、规则和 dnsmasq 永远装不上）。
+	# 配置合法性已在 pm_prepare 里用内核自检确认，直接装接管规则；
+	# 若内核起不来，procd 会按 respawn 策略拉起并在 LuCI 状态里暴露告警。
+	if pm_fw_up; then
+		pm_dnsmasq_apply
+		pm_status_write
+		if pm_is_client; then
+			pm_log "客户端形态已就绪：mixed 端口 $PM_MIXED_PORT"
+		else
+			pm_log "已启动并接管局域网流量"
+		fi
+	else
+		pm_log "接管规则安装失败，局域网保持直连" err
+		pm_status_write
+		return 1
+	fi
+	return 0
+}
+
+stop_service() {
+	pm_load
+	pm_fw_down
+	pm_dnsmasq_restore
+	pm_status_write
+	pm_log "已停止，接管规则已清理"
+	return 0
+}
+
+reload_service() {
+	stop
+	start
+}
+
+service_triggers() {
+	procd_add_reload_trigger "ferry"
+}
+
+status_service() {
+	pm_load
+	local bin
+	bin=$(pm_kernel_bin)
+
+	if pgrep -f "$bin" >/dev/null 2>&1; then
+		echo "ferry: running (profile=$PM_PROFILE_ID deploy=$PM_DEPLOY kernel=$PM_KERNEL mode=$PM_MODE port=$PM_PROXY_PORT)"
+	else
+		echo "ferry: stopped (profile=$PM_PROFILE_ID deploy=$PM_DEPLOY)"
+	fi
+
+	if pm_is_client; then
+		echo "firewall: skipped (client deploy)"
+	elif nft list tables 2>/dev/null | grep -q "ferry"; then
+		echo "firewall: nft table active"
+	elif iptables -t nat -S PM_DNS >/dev/null 2>&1 || iptables -t nat -S PM_REDIR >/dev/null 2>&1; then
+		echo "firewall: iptables chains active"
+	else
+		echo "firewall: no rules"
+	fi
+
+	echo "content: nodes=$(pm_count_nodes) rules=$(pm_count_rules)"
+	# 运行时包管理器：OpenWRT main/apk 分支为 apk，23.05/24.10 与 ImmortalWrt 为 opkg
+	local mgr
+	mgr=$(pm_pkgmgr)
+	echo "package_manager: ${mgr:-none}"
+	if [ "$mgr" = apk ]; then
+		echo "install_hint: $(pm_pkg_install_hint '<包文件>.apk')"
+	else
+		echo "install_hint: $(pm_pkg_install_hint '<包文件>.ipk')"
+	fi
+	# 依赖快速自检：只提示缺失，不阻止服务运行（iptables 兼容栈刻意非硬依赖）
+	local dep missing
+	missing=''
+	for dep in nftables ip-full uclient-fetch; do
+		pm_pkg_installed "$dep" || missing="$missing $dep"
+	done
+	[ -z "$missing" ] || echo "missing_deps:$missing"
+
+	if [ -f "$(pm_dnsmasq_backup_dir)/server" ]; then
+		echo "dnsmasq: upstream rewritten to 127.0.0.1#$PM_DNS_PORT"
+	fi
+	if [ -s "$PM_STATUS_FILE" ]; then
+		echo "status: $PM_STATUS_FILE"
+	fi
+	return 0
+}

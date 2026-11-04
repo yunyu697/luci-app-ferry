@@ -1,0 +1,36 @@
+{
+	"luci-app-ferry": {
+		"description": "Grant access to Ferry configuration, node store and profiles",
+		"read": {
+			"uci": [ "ferry" ],
+			"file": {
+				"/etc/ferry/nodes.json": [ "read" ],
+				"/etc/ferry/profiles.json": [ "read" ],
+				"/etc/ferry/status.json": [ "read" ],
+				"/etc/ferry/nodes.lst": [ "read" ],
+				"/etc/ferry/rules.lst": [ "read" ],
+				"/etc/ferry/custom.lst": [ "read" ],
+				"/etc/mihomo/config.yaml": [ "read" ],
+				"/etc/sing-box/config.json": [ "read" ],
+				"/etc/mihomo/*.yaml": [ "read" ],
+				"/etc/mihomo/*.yml": [ "read" ],
+				"/etc/sing-box/*.json": [ "read" ],
+				"/etc/ferry/config/*": [ "read" ]
+			}
+		},
+		"write": {
+			"uci": [ "ferry" ],
+			"ubus": {
+				"service": [ "reload", "list" ]
+			},
+			"file": {
+				"/etc/ferry/nodes.json": [ "write" ],
+				"/etc/ferry/profiles.json": [ "write" ],
+				"/etc/ferry/nodes.lst": [ "write" ],
+				"/etc/ferry/rules.lst": [ "write" ],
+				"/etc/ferry/custom.lst": [ "write" ],
+				"/etc/init.d/ferry": [ "exec" ]
+			}
+		}
+	}
+}
