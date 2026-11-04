@@ -245,12 +245,12 @@ apk add /tmp/luci-app-ferry-*.apk
 
 | 固件分支 | 包格式 | 预期状态 |
 | --- | --- | --- |
-| OpenWRT main / snapshot（`CONFIG_USE_APK=y`） | apk | 理论可行（静态检查通过，未编译、未安装） |
-| OpenWRT 24.10.x | ipk | 理论可行（静态检查通过，未编译、未安装） |
-| OpenWRT 23.05.x | ipk | 理论可行（静态检查通过，未编译、未安装） |
-| ImmortalWrt 24.10 | ipk | 理论可行（静态检查通过，未编译、未安装） |
-| ImmortalWrt 23.05 | ipk | 理论可行（静态检查通过，未编译、未安装） |
-| 任一分支的 TPROXY/TUN 实际接管 | — | 未验证（需真机 nft 内核/转发路径） |
+| OpenWRT main / snapshot（`CONFIG_USE_APK=y`） | apk | 部分验证（ImmortalWrt 25.12.0 / apk-tools 3.0.5 上完成装/卸/重启） |
+| OpenWRT 24.10.x | ipk | 已验证（QEMU 真机：OpenWrt 24.10.4 x86_64） |
+| OpenWRT 23.05.x | ipk | 理论可行（固件/包管理器机制同上，未单独跑） |
+| ImmortalWrt 24.10 | ipk | 理论可行（未单独跑；25.12 的 apk 分支已验证） |
+| ImmortalWrt 25.12 | apk | 已验证（QEMU 真机：25.12.0 x86_64，apk-tools 3.0.5） |
+| 任一分支的 TPROXY/TUN 实际接管 | — | 未验证（需真实客户端流量） |
 
 > `uci-defaults` 在安装后不保证立即执行（通常随下一次开机）。上面的 `sh /etc/uci-defaults/50-ferry` 是显式兜底：建目录、`enable` 服务、清 LuCI 索引；脚本本身不写 `nodes.json`/`profiles.json`，不会覆盖已有配置。
 
@@ -286,7 +286,7 @@ apk add /tmp/luci-app-ferry-*.apk
 
 因此 `Makefile` 里写的是 `Package/luci-app-ferry/prerm`，脚本对 opkg 的 `upgrade` 参数直接退出（升级不该停服务），其余情况调用 `/usr/lib/ferry/uninstall.sh`。
 
-> 未验证项：以上是构建系统与包管理器文档层面的核对结论；本环境没有 OpenWrt apk 真机，`apk del` 是否真的执行 `pre-deinstall` 未做实机验证。
+> 已在 ImmortalWrt 25.12.0 的 QEMU 真机上实测：`apk del luci-app-ferry` 确实执行 `pre-deinstall`（在包内 uninstall.sh 插入标记文件后卸载，标记被写出），且服务退出、nft 表清空、dnsmasq 上游还原。
 
 #### 卸载步骤
 
@@ -808,20 +808,35 @@ iptables -t nat -S | grep PM_
 
 ## 9. 验证情况
 
-已做（本机 macOS，非 OpenWRT 内核）：
+分层说明：真机实测（QEMU）→ 静态/离线 → 仍未验证。
 
-**静态检查**
+### 9.1 真机实测（自建 QEMU，x86_64，原镜像只读 + qcow2 覆盖层）
+
+| 固件 | 包格式 | 场景 | 结果 |
+| --- | --- | --- | --- |
+| OpenWrt 24.10.4（kernel 6.6.110） | ipk / opkg | 安装 → 服务启动 → 菜单/ACL 文件就位 → 服务运行中卸载 | 37 项断言全 PASS |
+| OpenWrt 24.10.4 | ipk | 启用服务 → 重启 → 停用 | 12 项 PASS（重启后 dnsmasq 接管仍成立，停用后上游还原） |
+| ImmortalWrt 25.12.0（kernel 6.12.87，apk-tools 3.0.5） | apk | `apk add --allow-untrusted` → 服务启动 → 菜单 → `apk del` | 28 项 PASS |
+| ImmortalWrt 25.12.0 | apk | 重启自愈 + 卸载断言 | 21 项 PASS（pre-deinstall 标记文件被写出） |
+
+断言覆盖：procd 服务启动/停止与进程退出、菜单与 ACL JSON 就位并可被 `jsonfilter` 解析、prerm/pre-deinstall 实际执行（在包内 `uninstall.sh` 插入标记文件后卸载，标记被写出）、nft 表与 iptables 兼容链清空、TPROXY 策略路由删除、dnsmasq 上游恢复到原始值、`/etc/ferry` 与 `/etc/config/ferry` 按预期保留。
+
+### 9.2 静态检查
 
 - 所有 shell 脚本 `sh -n` 通过（init.d、common.sh、nodes.sh、rules.sh、generate.sh、firewall.sh、uci-defaults、`scripts/build.sh`、`scripts/fetch-kernel.sh`）。
-- 全部 LuCI 视图与模块（`main.js`、`nodes.js`、`rules.js`、`presets.js`、`deploy.js`、`profiles.js`、`links.js`、`preset-defs.js`、`store.js`）通过 `deno` JS 解析；`menu.d` / `acl.d` 通过 JSON 解析。
+- 全部 LuCI 视图与模块（`main.js`、`nodes.js`、`rules.js`、`presets.js`、`deploy.js`、`profiles.js`、`links.js`、`preset-defs.js`、`store.js`）通过 `node --check`；`menu.d` / `acl.d` 通过 JSON 解析。
 - `Makefile` 静态校验：`PKG_NAME` 全小写、`PKG_VERSION` 不含 `-`、`PKG_RELEASE` 为整数、两处 `include` 齐备、`PKGARCH:=all`、`conffiles` 声明。
 - 伪造 `/etc/apk`、`/etc/opkg` 与对应的 `apk`/`opkg` 命令，验证 `pm_pkgmgr`、`pm_pkg_installed`、`pm_pkg_install_hint`：apk 分支输出 `apk` / `apk info -e` / `apk add --allow-untrusted`，opkg 分支输出 `opkg` / `opkg list-installed` / `opkg install`；空目录返回 `none`。
 - 伪造 SDK 测 `scripts/build.sh`：`CONFIG_USE_APK=y` 识别为 apk 并收集 `.apk`，缺省识别为 ipk 并收集 `.ipk`，产物落到 `dist/apk` / `dist/ipk`。
 - 依赖包名只做了“与已知 feed 命名对照”的静态核对；**没有** feeds 索引可查，apk 分支的 `kmod-nft-*` 等未在线确认。
 
-**真实内核生成校验（x86_64 二进制，macOS + Rosetta 2）**
+**离线回归**
 
-节点样本：7 类 mock 节点（vmess ws+tls、vless reality+grpc、ss+obfs、ssr、trojan ws、hysteria2 obfs、tuic）、9 条分类规则、4 条自定义条目，配合真实规则缓存（MetaCubeX `meta` `.yaml` 与 `sing` `.srs`，16 个 geosite）。内核：mihomo 1.19.0 `darwin-amd64-compatible`、sing-box 1.14.4 `darwin-amd64`，均为 **x86_64**。
+`tests/` 下 5 个脚本在当前源码上重跑，合计 119 项断言全 PASS：`test-dnsmasq.sh` 26、`test-firewall.sh` 21、`test-uninstall.sh` 26、`test-rules.sh` 26、`test-generate.sh` 20。
+
+**配置生成与内核自检（x86_64 二进制）**
+
+节点样本：7 类 mock 节点（vmess ws+tls、vless reality+grpc、ss+obfs、ssr、trojan ws、hysteria2 obfs、tuic）、9 条分类规则、4 条自定义条目，配合真实规则缓存（MetaCubeX `meta` `.yaml` 与 `sing` `.srs`，16 个 geosite）。下表 8 组最初用 mihomo 1.19.0 / sing-box 1.14.4 的 **x86_64** 二进制（darwin-amd64-compatible + Rosetta 2）跑自检；随后在 QEMU（Linux x86_64）换成 mihomo `linux-amd64-compatible` 复跑 `-t`，同样通过。
 
 | # | 内核（x86_64） | 部署形态 | 模式 | 校验命令 | 结果 |
 | --- | --- | --- | --- | --- | --- |
@@ -840,14 +855,15 @@ iptables -t nat -S | grep PM_
 - sing-box 侧 SSR 被跳过并写入 `status.json` 告警（`nodes=7`，代理 outbound 6 个）。
 - mihomo `proxies` 逐字段核对：`servername`（vmess/vless）与 `sni`（trojan/hysteria2/tuic）分开，`reality-opts`、`ws-opts.headers.Host`、`grpc-opts.grpc-service-name`、SS `plugin-opts`、SSR `protocol/obfs` 均符合预期。
 
-**没有做（别当成已验证）**
+**仍未验证（别当成已验证）**
 
-- **未实际运行 `make package/luci-app-ferry/compile`**：本机没有 OpenWRT/ImmortalWrt SDK，也没有 apk 模式 SDK，因此 `.ipk`/`.apk` 真实产物一个都没有生成。上表只覆盖“配置生成 + 内核自检”，不覆盖打包。
-- 未在 Linux x86_64 上运行 `linux-amd64` 二进制：macOS 只能跑 `darwin-amd64`（Rosetta），二者同为 x86_64 指令集，但不是同一份文件；Linux 版需在 x86_64 软路由/虚机上确认。
-- `nft -f` 对 IPv6 `tproxy`/`redirect` 的接受度、`kmod-nft-tproxy`/`kmod-nft-nat`/`kmod-tun` 与固件内核匹配、TPROXY 策略路由真实转发、procd 启动顺序、`bindv6only`、dnsmasq 上游还原，均需真机。
-- LuCI 表单在 23.05 / 24.10 的具体渲染、`ui.showModal` 回调、`fs.exec` 提权行为。
-- 旁路由真实拓扑连通性；节点延迟测试未实现。
-- 内核版本：只验过 mihomo 1.19.0 / sing-box 1.14.4；其它版本请用 `config_path` 或先 `-t` / `check`。
+- TPROXY/TUN 的**真实客户端流量转发**：QEMU 里只断言了规则、策略路由、进程与配置，没有真实终端跑流量。
+- ARM/MIPS 等非 x86_64 架构；本包本身 `Architecture: all`，但内核二进制需自行匹配架构，未实测。
+- sing-box 路径的端到端运行（配置 `check` 通过，未在设备上实际接管流量）。
+- 真实手机/电视/游戏机等终端接入；旁路由真实拓扑连通性；节点延迟测试未实现。
+- 上游订阅与规则集在真实网络下的下载行为（离线测试用本地缓存）。
+- apk 签名/信任链：发布包未签名，必须 `--allow-untrusted`。
+- LuCI 在 23.05 的具体渲染、`ui.showModal` 回调、`fs.exec` 提权行为。
 
 
 ---
