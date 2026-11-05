@@ -27,11 +27,15 @@
 5. `uninstall.sh --purge` 在无内核版本库时留下空壳 `/etc/ferry`；改为无 `kernels/` 时清理空目录
 6. 手工 ipk 外层为 tar.gz：实测 OpenWrt 24.10 的 opkg(2024-10-16) 会拒绝 ar 容器（Malformed package file），接受 tar.gz 包裹；已按可安装形式保留
 
+## 已发布
+
+- 提交 `d5a2c6e` → 远端 main；tag `v1.0.0-r3`
+- Release：https://github.com/yunyu697/luci-app-ferry/releases/tag/v1.0.0-r3（附件 ipk / apk / SHA256SUMS，远端下载后逐项 digest 与本地一致）
+
 ## 未完成 / 下一步
 
-1. 本仓库改动的提交（author/committer `yunyu697 <1869716+yunyu697@users.noreply.github.com>`）+ tag `v1.0.0-r3`
-2. GitHub Release 附件（ipk/apk/SHA256SUMS）并逐项比对远端 digest
-3. 后续独立任务（不与本内核提交混在一起）：GitHub Actions 真编译 CI、`KERNEL-ARCH-MATRIX.md` 架构矩阵
+1. 后续独立任务（不与本内核提交混在一起）：GitHub Actions 真编译 CI、`KERNEL-ARCH-MATRIX.md` 架构矩阵
+2. 非 x86_64 架构的真实运行验证（当前仅 ELF 头校验）
 
 ## 注意
 
