@@ -270,4 +270,45 @@ return notice ? E('div', {}, [ notice, node ]) : node;
   `return node.then(function(n){ return E('div', {}, [ notice, n ]); });`
 - 配置还原：`cp /tmp/ferry.bak /etc/config/ferry` 后复测正例 PASS，页面恢复正常。
 
+## r6：修复反例缺陷 + 回归断言（v1.0.0-r6，2026-11-06）
+
+### 根因（两处）
+
+1. `view/ferry/main.js`：`form.Map.render()` 返回 Promise，r5 失败分支把它放进 `E('div', {}, [notice, node])`，
+   渲染成 `[object Promise]`，表单丢失；`form.Map` 渲染期的 `uci.get` 在配置缺失时抛 `RPCError`（ubus code 4）。
+2. `ferry/store.js`：LuCI `uci.load()` 的 `loadPackage()` 会把**失败的 Promise 缓存**进 `uci.loaded`，
+   同页面「重试」永远拿到同一个 reject——必须 `uci.unload('ferry')` 才能重新读盘。
+
+### 修复
+
+- `main.js`：`render()` 改为容器化 `paint(state)`；真实失败分支不再走 `form.Map`，
+  改渲染静态骨架（标题「Ferry 透明代理网关」+「启用」select +「代理内核」input），
+  同时渲染提示与「重试」按钮；重试回调真正调用 `self.load()`，成功后 `paint(ok)` 重建完整表单。
+  导航中断（`AbortError` / `ERR_ABORTED` 等）仍不弹提示。
+- `store.js`：新增 `loadOnce()`（`uci.unload('ferry')` → `uci.load('ferry')`），首次失败后的 600ms 重试也走它。
+- `deploy.js` / `rules.js` 静态检查：`render()` 返回普通 `E()` 节点，无 Promise 入 DOM 写法，未改。
+- `Makefile`：`PKG_RELEASE` 5 → 6。
+
+### 回归断言（可重复执行，非截图）
+
+`tests/luci-dom-negative.sh` + `tests/luci-dom-assert.mjs`：串口驱动 guest（备份并移除 `/etc/config/ferry`）
++ 宿主机 headless Chromium（CDP），断言 DOM 文本/选择器与 `Runtime.exceptionThrown`；失败非零退出。
+实测：**ASSERT PASS=14 FAIL=0**（`RESULT: PASS`）
+
+- 移除配置后：提示 ✓ / 重试按钮 ✓ / 骨架（标题 + `inputs=2` + `selects=1`）✓ /
+  未捕获异常 `count=0` ✓ / 无 `factory yields invalid constructor` ✓
+- 还原配置后点重试：提示消失 ✓ / 完整表单 `inputs=18 selects=8` ✓ / 首个 select `value=mihomo` ✓ /
+  重试过程异常 `count=0` ✓
+- 首轮实测 13/14（「重试后提示消失」FAIL，表单停在骨架）→ 由此定位 `uci.load` 失败缓存问题 → 修复后 14/14。
+
+### 出包与门禁
+
+- ipk：`luci-app-ferry_1.0.0-r6_all.ipk`，84,826 B，`ecb974f9e104d92269e19bb0fb09c2dd2d266300c8c9e8af54f1407f421e4c16`
+- apk：`luci-app-ferry-1.0.0-r6.apk`，84,707 B，`5781782b5d443803b15bfe28f154eb9cd0b40bda5db3b51e74571b0b0ccb8a46`
+- 一致性：ipk / apk 各 31 文件 `diff -r` **NO_DIFF**；与源码逐文件 `cmp` **ALL_MATCH**。
+- smoke（OpenWrt 24.10.4 x86_64 headless QEMU）：首跑 **PASS=79 FAIL=1**（仅 `00-router-net.sh` WAN TCP 探测，
+  环境类 `Failed to send request: Operation not permitted`），复跑 **PASS=80 FAIL=0**。
+- r5 Release 已追加「勘误（2026-11-06）」，说明 r5 的「保留表单骨架」在真实失败时不成立，指向 r6。
+
+
 

@@ -41,15 +41,22 @@ function isInterruption(err) {
 		/ERR_ABORTED|aborted|cancelled|canceled|Failed to fetch/i.test(msg);
 }
 
+/* LuCI 的 uci.load() 会把失败的 Promise 缓存进 uci.loaded，之后同一页面的
+   重试永远拿到同一个 reject。每次加载前先 unload，重试才可能成功。 */
+function loadOnce() {
+	uci.unload('ferry');
+	return uci.load('ferry');
+}
+
 function loadConfig() {
-	return uci.load('ferry').then(function() {
+	return loadOnce().then(function() {
 		return { ok: true, interrupted: false };
 	}).catch(function(err) {
 		if (isInterruption(err))
 			return { ok: false, interrupted: true, error: err };
 		return new Promise(function(resolve) {
 			setTimeout(function() {
-				uci.load('ferry').then(function() {
+				loadOnce().then(function() {
 					resolve({ ok: true, interrupted: false });
 				}, function(err2) {
 					resolve({

@@ -10,24 +10,73 @@ return view.extend({
 	},
 
 	render: function(cfg) {
-		var m, s, o;
+		var self = this;
+		var container = E('div', {});
 		cfg = cfg || { ok: false, interrupted: true };
 
-		/* 配置读取失败（非导航中断）：给可见提示 + 重试，页面骨架仍然渲染 */
-		var notice = null;
-		if (!cfg.ok && !cfg.interrupted) {
-			notice = E('div', { class: 'cbi-section-error', style: 'margin-bottom:12px' }, [
-				E('p', {}, _('配置读取失败，已用空白状态启动，可点重试。')),
-				E('button', {
-					class: 'cbi-button cbi-button-apply',
-					click: function() {
-						window.location.reload();
-					}
-				}, _('重试'))
+		/* 配置读取失败（非导航中断）：给可见提示 + 重试，页面骨架仍然渲染。
+		   m.render() 返回 Promise，必须等它 resolve 后再拼装，不能直接放进 E()。 */
+		function paint(state) {
+			container.innerHTML = '';
+
+			if (!state.ok && !state.interrupted) {
+				var retry = E('button', { class: 'cbi-button cbi-button-apply' }, _('重试'));
+				retry.addEventListener('click', function() {
+					retry.disabled = true;
+					retry.textContent = _('重试中…');
+					self.load().then(function(next) {
+						if (next && next.ok)
+							return paint(next);
+						retry.disabled = false;
+						retry.textContent = _('重试');
+					});
+				});
+				container.appendChild(E('div', { class: 'cbi-section-error', style: 'margin-bottom:12px' }, [
+					E('p', {}, _('配置读取失败，已用空白状态启动，可点重试。')),
+					retry
+				]));
+				/* 配置不可用时不再走 form.Map（其内部 uci.get 会抛 RPC 异常），
+				   改为渲染等价的空白骨架：标题 + 基础控件都在，点「重试」成功后再换成完整表单。 */
+				container.appendChild(blankSkeleton());
+				return Promise.resolve(container);
+			}
+
+			return makeMap().render().then(function(node) {
+				container.appendChild(node);
+				return container;
+			});
+		}
+
+		return paint(cfg);
+
+		function blankSkeleton() {
+			return E('div', {}, [
+				E('h2', {}, _('Ferry 透明代理网关')),
+				E('p', { class: 'cbi-section-descr' }, _('配置暂不可用，以下为空白表单骨架。')),
+				E('div', { class: 'cbi-section' }, [
+					E('div', { class: 'cbi-value' }, [
+						E('label', { class: 'cbi-value-title' }, _('启用')),
+						E('div', { class: 'cbi-value-field' }, [
+							E('select', { class: 'cbi-input-select', disabled: 'disabled' }, [
+								E('option', { value: '0', selected: 'selected' }, '0'),
+								E('option', { value: '1' }, '1')
+							])
+						])
+					]),
+					E('div', { class: 'cbi-value' }, [
+						E('label', { class: 'cbi-value-title' }, _('代理内核')),
+						E('div', { class: 'cbi-value-field' }, [
+							E('input', { type: 'text', class: 'cbi-input-text', value: '', disabled: 'disabled', placeholder: 'mihomo / sing-box' })
+						])
+					])
+				])
 			]);
 		}
 
-		/* LuCI 24.10.4 起旧的下拉类已并入 form.ListValue（默认 widget=select） */
+		function makeMap() {
+			var m, s, o;
+
+			/* LuCI 24.10.4 起旧的下拉类已并入 form.ListValue（默认 widget=select） */
 		var Select = form.Select || form.ListValue;
 
 		m = new form.Map('ferry', _('Ferry 透明代理网关'),
@@ -198,7 +247,7 @@ return view.extend({
 		o.default = _('保存并应用后，可用 SSH 执行 /etc/init.d/ferry status 查看状态，' +
 			'logread -e ferry 查看日志。');
 
-		var node = m.render();
-		return notice ? E('div', {}, [ notice, node ]) : node;
+			return m;
+		}
 	}
 });
