@@ -136,9 +136,8 @@ return view.extend({
 				E('tr', { class: 'cbi-section-table-titles' }, [
 					E('th', {}, '状态'), E('th', {}, '名称'), E('th', {}, '类型'),
 					E('th', {}, '地址'), E('th', {}, '凭据'), E('th', {}, '操作')
-				]),
-				rows
-			]));
+				])
+			].concat(rows)));
 		}
 		this.refresh = refresh;
 

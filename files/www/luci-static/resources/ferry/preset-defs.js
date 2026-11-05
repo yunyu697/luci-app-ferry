@@ -1,4 +1,5 @@
 'use strict';
+'require baseclass';
 /* 分类与场景预设定义（供 LuCI 使用；shell 侧的 geo 名称映射在 rules.sh 中） */
 
 var CATEGORIES = [
@@ -76,9 +77,9 @@ function buildRules(presetId) {
 	});
 }
 
-return {
+return baseclass.extend({
 	CATEGORIES: CATEGORIES,
 	PRESETS: PRESETS,
 	findPreset: findPreset,
 	buildRules: buildRules
-};
+});

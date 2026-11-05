@@ -135,8 +135,8 @@ echo "src-link ferry $(pwd)/feeds/ferry" >> feeds.conf
 make package/luci-app-ferry/compile V=s
 ```
 
-- opkg 分支产物：`bin/packages/<arch>/luci/luci-app-ferry_1.0.0-1_all.ipk`
-- apk 分支产物：同名源码编出 `.apk`，版本串为 `1.0.0-r1`（`PKG_RELEASE` 被 apk 拼成 `-r1`）
+- opkg 分支产物：`bin/packages/<arch>/luci/luci-app-ferry_1.0.0-r2_all.ipk`
+- apk 分支产物：同名源码编出 `.apk`，版本串为 `1.0.0-r2`（`PKG_RELEASE` 被 apk 拼成 `-r2`）
 
 ### 3.3 依赖与各分支包名
 
@@ -172,7 +172,7 @@ make package/luci-app-ferry/compile V=s
 
 ## 4. 安装
 
-以 **x86_64 固件**（软路由、虚拟机、多数云主机）为主线；包名以实际产物为准：ipk 是 `luci-app-ferry_1.0.0-1_all.ipk`，apk 是 `luci-app-ferry-1.0.0-r1.apk`（以 `ls dist/apk` 为准）。三条分支的命令都是“上传 → 装包 → 跑一次 uci-defaults → 打开开关”。
+以 **x86_64 固件**（软路由、虚拟机、多数云主机）为主线；包名以实际产物为准：ipk 是 `luci-app-ferry_1.0.0-r2_all.ipk`，apk 是 `luci-app-ferry-1.0.0-r2.apk`（以 `ls dist/apk` 为准）。三条分支的命令都是“上传 → 装包 → 跑一次 uci-defaults → 打开开关”。
 
 ### 4.1 OpenWRT apk 分支（main / snapshot）
 
@@ -193,11 +193,11 @@ uci commit ferry
 
 ```sh
 # PC 端
-scp dist/ipk/luci-app-ferry_1.0.0-1_all.ipk root@192.168.1.1:/tmp/
+scp dist/ipk/luci-app-ferry_1.0.0-r2_all.ipk root@192.168.1.1:/tmp/
 
 # 路由器
 opkg update
-opkg install /tmp/luci-app-ferry_1.0.0-1_all.ipk
+opkg install /tmp/luci-app-ferry_1.0.0-r2_all.ipk
 sh /etc/uci-defaults/50-ferry
 uci set ferry.main.enabled='1'
 uci commit ferry
@@ -209,9 +209,9 @@ uci commit ferry
 包格式仍是 ipk，命令与 4.2 完全一致：
 
 ```sh
-scp dist/ipk/luci-app-ferry_1.0.0-1_all.ipk root@192.168.1.1:/tmp/
+scp dist/ipk/luci-app-ferry_1.0.0-r2_all.ipk root@192.168.1.1:/tmp/
 opkg update
-opkg install /tmp/luci-app-ferry_1.0.0-1_all.ipk
+opkg install /tmp/luci-app-ferry_1.0.0-r2_all.ipk
 sh /etc/uci-defaults/50-ferry
 uci set ferry.main.enabled='1' && uci commit ferry
 /etc/init.d/ferry restart
@@ -833,6 +833,10 @@ iptables -t nat -S | grep PM_
 **离线回归**
 
 `tests/` 下 5 个脚本在当前源码上重跑，合计 119 项断言全 PASS：`test-dnsmasq.sh` 26、`test-firewall.sh` 21、`test-uninstall.sh` 26、`test-rules.sh` 26、`test-generate.sh` 20。
+
+**LuCI 类加载器契约（`tests/test-luci-contract.mjs`）**
+
+`node tests/test-luci-contract.mjs` 用最小化的 `Class.extend` / `isSubclass` 模拟 LuCI 的 `L.require()`：把每个 `resources/ferry/*.js` 与 `view/ferry/*.js` 当 factory 求值，断言返回的是 constructor（不是普通对象/Promise），再实例化并断言对外 API 可调用（如 `presets.buildRules('daily')` 返回 9 条、`links.parse('ss://…')` 返回 1 个节点）。同时静态拦截直接使用 `form.Select` 的写法（24.10.4 起已并入 `form.ListValue`）。这一层是 `node --check` 覆盖不到的“语义契约”盲区。
 
 **配置生成与内核自检（x86_64 二进制）**
 

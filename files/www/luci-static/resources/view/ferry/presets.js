@@ -53,8 +53,7 @@ return view.extend({
 			E('p', { class: 'cbi-section-descr' },
 				'一键套用一组规则开关、默认策略与建议运行模式。预设只改当前激活档案的规则与策略，' +
 				'不会删除或重排已导入的节点；应用后仍可在「分流规则」页继续微调。' +
-				'当前档案：' + (this.profile ? this.profile.name : '（无）')),
-			cards
-		]);
+				'当前档案：' + (this.profile ? this.profile.name : '（无）'))
+		].concat(cards));
 	}
 });

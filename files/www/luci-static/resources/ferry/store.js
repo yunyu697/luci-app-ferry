@@ -1,4 +1,5 @@
 'use strict';
+'require baseclass';
 'require fs';
 'require uci';
 'require rpc';
@@ -475,7 +476,7 @@ function readKernelConfig() {
 	});
 }
 
-return {
+return baseclass.extend({
 	files: {
 		nodes: NODES_FILE, profiles: PROFILES_FILE, status: STATUS_FILE
 	},
@@ -499,4 +500,4 @@ return {
 	status: status,
 	readKernelConfig: readKernelConfig,
 	esc: esc
-};
+});

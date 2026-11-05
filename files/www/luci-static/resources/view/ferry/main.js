@@ -10,6 +10,8 @@ return view.extend({
 
 	render: function() {
 		var m, s, o;
+		/* LuCI 24.10.4 起旧的下拉类已并入 form.ListValue（默认 widget=select） */
+		var Select = form.Select || form.ListValue;
 
 		m = new form.Map('ferry', _('Ferry 透明代理网关'),
 			_('把 mihomo 或 sing-box 作为路由器上的透明代理内核，为整个局域网提供自动代理。' +
@@ -25,14 +27,14 @@ return view.extend({
 		o.rmempty = false;
 		o.default = '0';
 
-		o = s.option(form.Select, 'kernel', _('代理内核'),
+		o = s.option(Select, 'kernel', _('代理内核'),
 			_('同一时间只运行一个内核。切换内核会自动重新生成对应格式的配置。'));
 		o.value('mihomo', _('mihomo（Clash Meta）'));
 		o.value('singbox', _('sing-box'));
 		o.rmempty = false;
 		o.default = 'mihomo';
 
-		o = s.option(form.Select, 'mode', _('运行模式'),
+		o = s.option(Select, 'mode', _('运行模式'),
 			_('TPROXY：TCP+UDP 透明代理，推荐；TUN：虚拟网卡接管，兼容性最好；REDIRECT：仅 TCP。'));
 		o.value('tproxy', _('TPROXY（TCP + UDP，推荐）'));
 		o.value('tun', _('TUN（虚拟网卡）'));
@@ -40,7 +42,7 @@ return view.extend({
 		o.rmempty = false;
 		o.default = 'tproxy';
 
-		o = s.option(form.Select, 'deploy', _('部署形态'),
+		o = s.option(Select, 'deploy', _('部署形态'),
 			_('主路由：接管全部 LAN 流量；旁路由：不接管本机转发，由上游网关指向本机；' +
 			  '客户端：不开启透明代理，只生成配置并监听混合端口。'));
 		o.value('router', _('主路由（接管全部 LAN）'));
@@ -74,14 +76,14 @@ return view.extend({
 			_('改写 dnsmasq 上游为内核 DNS 监听端口，避免路由器自身解析泄漏；TUN 模式由内核自动接管。'));
 		o.default = '1';
 
-		o = s.option(form.Select, 'dns_mode', _('DNS 增强模式'),
+		o = s.option(Select, 'dns_mode', _('DNS 增强模式'),
 			_('fake-ip 兼容性更好、解析更快；redir-host 更适合需要真实 IP 的场景。'));
 		o.value('fake-ip', 'fake-ip');
 		o.value('redir-host', 'redir-host');
 		o.depends('kernel', 'mihomo');
 		o.default = 'fake-ip';
 
-		o = s.option(form.Select, 'log_level', _('日志级别'));
+		o = s.option(Select, 'log_level', _('日志级别'));
 		o.value('silent', _('silent（静默）'));
 		o.value('error', _('error'));
 		o.value('warning', _('warning'));
@@ -116,7 +118,7 @@ return view.extend({
 		s.anonymous = true;
 		s.addremove = false;
 
-		o = s.option(form.Select, 'final_policy', _('默认策略'),
+		o = s.option(Select, 'final_policy', _('默认策略'),
 			_('未被任何分流规则命中时的处理方式。分类规则请到「分流规则」页调整。'));
 		o.value('proxy', _('走代理（MATCH,PROXY / final=proxy）'));
 		o.value('direct', _('直连（MATCH,DIRECT / final=direct）'));
@@ -152,7 +154,7 @@ return view.extend({
 		o.depends('mode', 'redirect');
 		o.default = '1';
 
-		o = s.option(form.Select, 'tun_stack', _('TUN 协议栈'),
+		o = s.option(Select, 'tun_stack', _('TUN 协议栈'),
 			_('mihomo TUN 模式使用的协议栈；sing-box 固定使用 mixed。'));
 		o.value('system', 'system');
 		o.value('gvisor', 'gvisor');
@@ -161,7 +163,7 @@ return view.extend({
 		o.depends('mode', 'tun');
 		o.default = 'system';
 
-		o = s.option(form.Select, 'firewall_backend', _('接管实现'),
+		o = s.option(Select, 'firewall_backend', _('接管实现'),
 			_('auto 会在系统支持 nftables 时优先使用 nftables，否则回退 iptables。'));
 		o.value('auto', _('auto（推荐）'));
 		o.value('nft', 'nftables');

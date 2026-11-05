@@ -1,4 +1,5 @@
 'use strict';
+'require baseclass';
 /* Ferry 分享链接解析：vmess / vless / ss / ssr / trojan / hysteria2 / tuic
  * 输出统一内部结构，再由 store.js 编译成 nodes.lst，供 shell 映射到两种内核。 */
 
@@ -257,7 +258,7 @@ function shortUri(u) {
 	return u.length > 32 ? u.slice(0, 28) + '…' : u;
 }
 
-return {
+return baseclass.extend({
 	parseOne: parseOne,
 	parse: function(text) {
 		var nodes = [], errors = [];
@@ -279,4 +280,4 @@ return {
 	tlsOf: function(n) {
 		return n.tls || n.type === 'trojan' || n.type === 'hysteria2' || n.type === 'tuic';
 	}
-};
+});

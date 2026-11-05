@@ -97,9 +97,8 @@ return view.extend({
 			table.appendChild(E('table', { class: 'cbi-section-table' }, [
 				E('tr', { class: 'cbi-section-table-titles' }, [
 					E('th', {}, '优先级'), E('th', {}, '分类'), E('th', {}, '启用'), E('th', {}, '目标策略'), E('th', {}, '排序')
-				]),
-				rows
-			]));
+				])
+			].concat(rows)));
 		}
 		refresh();
 
