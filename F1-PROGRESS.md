@@ -189,7 +189,7 @@ LuCI 保存与 `uci commit` 发生在 reload 触发之前，所以事务开始�
 - 验收脚本依赖 WSL 内的 Linux QEMU（`-enable-kvm`、`-display none`）；`qemu-img` 在部分 WSL 里缺失，
   需 `QEMUIMG_BIN=/tmp/qu/root/usr/bin/qemu-img`（`apt-get download qemu-utils` + `dpkg -x`）或自行安装 qemu-utils。
 
-## r5 候选（仅出包，未打 tag、未发布）
+## r5 发布（v1.0.0-r5，已发布）
 
 ### 加固内容（UCI 读取失败不再让页面整体失败）
 
@@ -214,11 +214,27 @@ LuCI 保存与 `uci commit` 发生在 reload 触发之前，所以事务开始�
   失败项均为 nft/网络/并发时序类环境问题，与本次纯 JS 改动无关（改动文件 `node --check` 全部通过）。
 - shellcheck：本机未安装（`NOT_INSTALLED`），未执行。
 
-### 候选包
+### 发布结果（2026-11-06）
 
-- `luci-app-ferry_1.0.0-r5_all.ipk`：84256 字节，
-  sha256 `e981fa879bffd5867bcea841698ed6d794faa331aa8e93f612064871a78bf602`
-- `luci-app-ferry-1.0.0-r5.apk`：84130 字节，
-  sha256 `9b3552f6160364733b1cdd40f7beea0a6729838330e3b16c24c8597cf60cbf9e`
-- 两包各 31 个文件，`diff -r` **NO_DIFF**；与当前源码逐文件 `cmp` **ALL_MATCH**。
-- QEMU smoke：本轮**未跑**（受本轮工具调用预算限制，需完整起停两台虚机）；不作为已通过证据。
+- 提交：`8db3483`（`main` 已推送，`bd000c7..8db3483` fast-forward，未改写历史）
+- 标签：注释标签 `v1.0.0-r5` → `8db3483`
+- Release：<https://github.com/yunyu697/luci-app-ferry/releases/tag/v1.0.0-r5>
+  - `isDraft=false`，`Latest`；附件 3 个，远端 digest 与本地一致
+- 包（由 `8db3483` 源码在 WSL 内重建，31 文件，`diff -r` NO_DIFF，与源码逐文件 `cmp` ALL_MATCH）：
+  - `luci-app-ferry_1.0.0-r5_all.ipk`：84256 字节，
+    sha256 `438404b1b00ed173ea4380e3c979b7a8154b440cd0e88e3e896d13d43228a373`
+  - `luci-app-ferry-1.0.0-r5.apk`：84126 字节，
+    sha256 `d27fbd034e70f023ea1c39b0d9a71fab41ebf2f7dac7939de5d6ec15a571407a`
+  - 与上一轮报告的 r5 候选包哈希不同：ipk 大小一致但 gzip 头内嵌构建时间；apk 由 `mkpkg` 写入
+    会话/文件时间戳，字节数也有 4 字节差异。内容与 `8db3483` 源码一致（`cmp` ALL_MATCH），
+    差异属打包环境时间戳，不是内容变更。
+- 回归（本轮实测）：`tests/test-diag.sh` **PASS=49 FAIL=0**；LuCI 模块契约 **12/12**
+- QEMU smoke（OpenWrt 24.10.4 x86_64，headless，`--suite smoke`）：**PASS=78 FAIL=2**
+  - 2 个失败均在安装前网络预检：`00-router-net.sh` 的 WAN TCP 探测（`Failed to send request: Operation not permitted`）、
+    `client-00-client-net.sh` 的客户端出网 ping；同期 ICMP ping 正常，ferry 安装/服务/DNS/TPROXY/流量/
+    临时关闭/诊断包断言全部通过 → 判为 QEMU slirp 环境类。
+  - 佐证：同一提交、同源更早一次运行为 **PASS=80 FAIL=0**（`run-r5-smoke-2.out`）。
+- LuCI 主页面渲染：本轮**未验证**。尝试在 headless guest 内注入 SSH 公钥失败（`Permission denied (publickey,password)`），
+  随脚本退出虚机，未取得带登录会话的 DOM；不以截图替代，不记为通过。部分证据：LuCI 模块契约 12/12。
+- 事实：未使用 OpenWrt 官方 SDK / buildroot（自建 staging + `build_ipk.py` + `apk mkpkg`）；OpenWrt 侧未签名。
+
