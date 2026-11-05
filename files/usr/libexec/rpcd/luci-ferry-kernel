@@ -1,0 +1,46 @@
+#!/bin/sh
+# rpcd 后端：对象 luci-ferry-kernel（mihomo / sing-box 内核管理）
+# rpcd 脚本协议：$1 为 "list" 或 "call"；"call" 时 $2 才是方法名。
+# 参数为 JSON，从 stdin 传入；结果输出 JSON。
+K=/usr/lib/ferry/kernel.sh
+
+case "$1" in
+	list)
+		cat <<'EOF'
+{
+  "status": {},
+  "versions": { "kernel": "", "prerelease": "" },
+  "start": {
+    "op": "", "kernel": "", "version": "", "urls": "", "file": "",
+    "sha256": "", "expect_version": "", "mirror": "",
+    "allow_unverified": "", "activate": "", "restart": "", "force": ""
+  },
+  "job": {},
+  "preview": { "kernel": "", "version": "" },
+  "remove": { "kernel": "", "version": "" },
+  "mirrors": {},
+  "mirror_set": { "json": "" },
+  "mirror_test": { "name": "" }
+}
+EOF
+		;;
+	call)
+		case "$2" in
+			status) "$K" status ;;
+			versions) "$K" versions ;;
+			start) "$K" start ;;
+			job) "$K" job ;;
+			preview) "$K" preview ;;
+			remove) "$K" remove ;;
+			mirrors) "$K" mirrors ;;
+			mirror_set) "$K" mirror-set ;;
+			mirror_test) "$K" mirror-test ;;
+			*)
+				echo '{"ok":false,"error":"unknown method"}'
+				;;
+		esac
+		;;
+	*)
+		echo '{"ok":false,"error":"unknown method"}'
+		;;
+esac

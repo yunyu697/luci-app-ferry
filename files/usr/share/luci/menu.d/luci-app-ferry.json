@@ -64,5 +64,16 @@
 		"depends": {
 			"acl": [ "luci-app-ferry" ]
 		}
+	},
+	"admin/services/ferry/kernel": {
+		"title": "内核",
+		"order": 66,
+		"action": {
+			"type": "view",
+			"path": "ferry/kernel"
+		},
+		"depends": {
+			"acl": [ "luci-app-ferry" ]
+		}
 	}
 }

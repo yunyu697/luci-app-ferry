@@ -70,6 +70,18 @@ pm_mihomo_check() {
 	"$bin" -t -d "$PM_MIHOMO_DIR" -f "$cfg" >/dev/null 2>&1
 }
 
+# 内核自检输出（原样回显给 UI，便于用户复核）
+pm_kernel_check_text() { # kernel cfg
+	local bin out
+	bin=$(pm_kernel_bin)
+	[ -x "$bin" ] || { echo "内核不可执行：$bin"; return 0; }
+	case "$1" in
+		singbox) out=$( pm_timeout 30 "$bin" check -c "$2" -D "$PM_SINGBOX_DIR" 2>&1 ) ;;
+		*)       out=$( pm_timeout 30 "$bin" -t -d "$PM_MIHOMO_DIR" -f "$2" 2>&1 ) ;;
+	esac
+	printf '%s' "$out" | tail -n 20
+}
+
 # 把「一行一个 JSON」的文件拼成数组元素
 pm_jsonl_join() {
 	local file="$1" first=1 line
@@ -240,17 +252,58 @@ pm_gen_mihomo() {
 			echo "  - MATCH,PROXY"
 		fi
 	} > "$cfg.tmp"
-	mv "$cfg.tmp" "$cfg"
 
-	if pm_mihomo_check "$cfg"; then
-		pm_log "已生成 mihomo 配置：$cfg"
-	else
-		pm_warn "mihomo 配置自检未通过：${cfg}（请查看内核日志）"
+	# 门禁：先对临时文件跑内核自检，通过后才原子替换；不通过不落位
+	if ! pm_mihomo_check "$cfg.tmp"; then
+		pm_warn "mihomo 配置自检未通过（未落位，保留旧配置）：$(pm_kernel_check_text mihomo "$cfg.tmp")"
+		rm -f "$cfg.tmp"
+		return 1
 	fi
+	mv "$cfg.tmp" "$cfg"
+	pm_log "已生成 mihomo 配置并通过自检：$cfg"
 	return 0
 }
 
 # ---------------- sing-box ----------------
+
+# sing-box 配置 schema 跨版本变化，必须按版本选模板。
+# 矩阵（每个区间都用真实二进制跑过 `sing-box check`，见 README）：
+#   A: 1.8.x – 1.10.x  DNS servers 用 address；规则用 outbound；特殊出站 block/dns；TUN 用 inet4_address
+#   B: 1.11.x           DNS servers 用 address；规则用 action；TUN 用 address；无 default_domain_resolver
+#   C: 1.12.x – 1.13.x  同 B，且可用 default_domain_resolver
+#   D: >= 1.14.x        DNS servers 用 type/server；规则用 action；TUN 用 address
+pm_sb_semver() {
+	local out
+	out=$(pm_timeout 8 "$(pm_kernel_bin)" version 2>&1)
+	case "$out" in
+		*[0-9].[0-9]*) ;;
+		*) out=$(pm_timeout 8 "$(pm_kernel_bin)" --version 2>&1) ;;
+	esac
+	printf '%s' "$out" | grep -o -m1 -E 'v?[0-9]+\.[0-9]+\.[0-9]+' | head -1 | sed 's/^v//'
+}
+
+pm_sb_bucket() {
+	local v maj min
+	v=$(pm_sb_semver)
+	case "$v" in
+		''|*[!0-9.]*) echo unknown; return 0 ;;
+	esac
+	maj=${v%%.*}
+	rest=${v#*.}
+	min=${rest%%.*}
+	if [ "$maj" -lt 1 ] || { [ "$maj" = 1 ] && [ "$min" -lt 8 ]; }; then
+		echo unsupported; return 0
+	fi
+	if [ "$maj" -gt 1 ] || [ "$min" -ge 14 ]; then
+		echo D
+	elif [ "$min" -ge 12 ]; then
+		echo C
+	elif [ "$min" -eq 11 ]; then
+		echo B
+	else
+		echo A
+	fi
+}
 
 pm_sb_inbounds_build() {
 	local f="$PM_RUN_DIR/sb-inbounds.jsonl" eff_mode="$PM_MODE" listen='0.0.0.0' mix="$PM_MIXED_PORT"
@@ -276,7 +329,11 @@ pm_sb_inbounds_build() {
 			fi
 			;;
 		tun)
-			printf '{"type":"tun","tag":"tun-in","address":["172.19.0.1/30"],"mtu":1500,"auto_route":%s,"strict_route":false,"stack":"mixed","auto_redirect":false}\n' "$(pm_tun_autoroute)" >> "$f"
+			if [ "$(pm_sb_bucket)" = A ]; then
+				printf '{"type":"tun","tag":"tun-in","inet4_address":"172.19.0.1/30","mtu":1500,"auto_route":%s,"strict_route":false,"stack":"mixed"}\n' "$(pm_tun_autoroute)" >> "$f"
+			else
+				printf '{"type":"tun","tag":"tun-in","address":["172.19.0.1/30"],"mtu":1500,"auto_route":%s,"strict_route":false,"stack":"mixed","auto_redirect":false}\n' "$(pm_tun_autoroute)" >> "$f"
+			fi
 			;;
 	esac
 	if [ "$mix" != 0 ]; then
@@ -305,8 +362,17 @@ pm_sb_selector() {
 pm_gen_singbox() {
 	local dir="$PM_SINGBOX_DIR"
 	local cfg="$dir/config.json"
-	local lvl
+	local lvl bucket
 	lvl=$(pm_log_level_singbox)
+	bucket=$(pm_sb_bucket)
+	PM_SB_BUCKET="$bucket"
+	case "$bucket" in
+		A|B|C|D) ;;
+		*)
+			pm_warn "sing-box $(pm_sb_semver) 不在支持矩阵内（仅适配 1.8.0 及以上，按 A/B/C/D 区间），已拒绝生成配置；可继续使用上一条已验证配置"
+			return 1
+			;;
+	esac
 	mkdir -p "$dir"
 
 	pm_singbox_nodes
@@ -315,12 +381,22 @@ pm_gen_singbox() {
 
 	{
 		echo '{"type":"direct","tag":"direct"}'
+		# 区间 A（≤1.10）没有 route 规则 action：DNS 劫持与拦截只能走特殊出站；
+		# 这两个出站 1.11 起弃用、1.12 起 check 报错，所以只给 A 输出
+		if [ "$bucket" = A ]; then
+			echo '{"type":"block","tag":"block"}'
+			echo '{"type":"dns","tag":"dns-out"}'
+		fi
 		cat "$PM_RUN_DIR/sb-outbounds.jsonl"
 		pm_sb_selector
 	} > "$PM_RUN_DIR/sb-outbounds-all.jsonl"
 
 	{
-		echo '{"protocol":"dns","action":"hijack-dns"}'
+		if [ "$bucket" = A ]; then
+			echo '{"protocol":"dns","outbound":"dns-out"}'
+		else
+			echo '{"protocol":"dns","action":"hijack-dns"}'
+		fi
 		echo '{"ip_is_private":true,"outbound":"direct"}'
 		local cidr
 		for cidr in $PM_BYPASS_CIDR $PM_BYPASS_IP; do
@@ -340,8 +416,13 @@ pm_gen_singbox() {
 		echo "  \"log\": { \"level\": \"$lvl\", \"timestamp\": true },"
 		echo "  \"dns\": {"
 		echo "    \"servers\": ["
-		echo "      { \"tag\": \"dns-direct\", \"type\": \"udp\", \"server\": \"223.5.5.5\" },"
-		echo "      { \"tag\": \"dns-cn\", \"type\": \"udp\", \"server\": \"119.29.29.29\" }"
+		if [ "$bucket" = D ]; then
+			echo "      { \"tag\": \"dns-direct\", \"type\": \"udp\", \"server\": \"223.5.5.5\" },"
+			echo "      { \"tag\": \"dns-cn\", \"type\": \"udp\", \"server\": \"119.29.29.29\" }"
+		else
+			echo "      { \"tag\": \"dns-direct\", \"address\": \"223.5.5.5\" },"
+			echo "      { \"tag\": \"dns-cn\", \"address\": \"119.29.29.29\" }"
+		fi
 		echo "    ],"
 		echo "    \"final\": \"dns-direct\","
 		echo "    \"strategy\": \"prefer_ipv4\""
@@ -356,7 +437,10 @@ pm_gen_singbox() {
 		echo "  ],"
 		echo "  \"route\": {"
 		echo "    \"auto_detect_interface\": true,"
-		echo "    \"default_domain_resolver\": \"dns-direct\","
+		# default_domain_resolver 1.12 起才可用，A/B 输出会被 check 拒绝
+		case "$bucket" in
+			C|D) echo "    \"default_domain_resolver\": \"dns-direct\"," ;;
+		esac
 		if [ -s "$PM_RUN_DIR/sb-rulesets.jsonl" ]; then
 			echo "    \"rule_set\": ["
 			pm_jsonl_join "$PM_RUN_DIR/sb-rulesets.jsonl"
@@ -371,13 +455,15 @@ pm_gen_singbox() {
 		echo "  }"
 		echo "}"
 	} > "$cfg.tmp"
-	mv "$cfg.tmp" "$cfg"
 
-	if pm_singbox_check "$cfg"; then
-		pm_log "已生成 sing-box 配置：$cfg"
-	else
-		pm_warn "sing-box 配置自检未通过：${cfg}（请查看内核日志）"
+	# 门禁：`sing-box check` 不通过就不落位、不重启服务，输出原样回显
+	if ! pm_singbox_check "$cfg.tmp"; then
+		pm_warn "sing-box 配置自检未通过（区间 $bucket，未落位，保留旧配置）：$(pm_kernel_check_text singbox "$cfg.tmp")"
+		rm -f "$cfg.tmp"
+		return 1
 	fi
+	mv "$cfg.tmp" "$cfg"
+	pm_log "已生成 sing-box 配置（区间 $bucket）并通过自检：$cfg"
 	return 0
 }
 
@@ -436,13 +522,37 @@ pm_prepare() {
 			fi
 			pm_warn "没有可用的 sing-box 配置，改为生成最小骨架"
 		fi
-		pm_gen_singbox
+		# 生成失败（未适配版本 / 自检不过）时：能沿用上一次已验证的配置就沿用，
+		# 否则直接失败，绝不把未通过自检的配置交给服务启动
+		if ! pm_gen_singbox; then
+			local prev="$PM_SINGBOX_DIR/config.json"
+			if [ -s "$prev" ] && pm_singbox_check "$prev"; then
+				pm_warn "sing-box 未生成新配置，继续使用上一次已验证的配置：$prev"
+				PM_RUNTIME_CONFIG="$prev"
+				pm_status_write
+				return 0
+			fi
+			PM_RUNTIME_CONFIG=''
+			pm_status_write
+			return 1
+		fi
 		PM_RUNTIME_CONFIG="$PM_SINGBOX_DIR/config.json"
 		pm_status_write
 		return 0
 	fi
 
-	pm_gen_mihomo
+	if ! pm_gen_mihomo; then
+		local prevm="$PM_MIHOMO_DIR/config.yaml"
+		if [ -s "$prevm" ] && pm_mihomo_check "$prevm"; then
+			pm_warn "mihomo 未生成新配置，继续使用上一次已验证的配置：$prevm"
+			PM_RUNTIME_CONFIG="$prevm"
+			pm_status_write
+			return 0
+		fi
+		PM_RUNTIME_CONFIG=''
+		pm_status_write
+		return 1
+	fi
 	PM_RUNTIME_CONFIG="$PM_MIHOMO_DIR/config.yaml"
 	pm_status_write
 	return 0

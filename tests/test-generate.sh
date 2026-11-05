@@ -127,7 +127,10 @@ fake_bin() {
 	mkdir -p "$T/bin-real"
 	cat > "$T/bin-real/kernel" <<'EOF'
 #!/bin/sh
-# 测试用内核桩：check 一律成功，实际校验由 MIHOMO_TEST_BIN 承担
+# 测试用内核桩：声明受支持的 sing-box 版本，check 一律成功（真实校验由 MIHOMO_TEST_BIN / SINGBOX_TEST_BIN 承担）
+case "$1" in
+	version|--version) echo "sing-box version 1.14.4"; exit 0 ;;
+esac
 exit 0
 EOF
 	chmod +x "$T/bin-real/kernel"

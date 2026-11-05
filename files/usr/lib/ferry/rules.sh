@@ -260,6 +260,16 @@ pm_sb_outbound_for() {
 	esac
 }
 
+# sing-box 区间 A（≤1.10）没有 route 规则 action 语法：reject 只能走特殊出站 block；
+# 区间 B/C/D（≥1.11）用 action。区间由 generate.sh 的 pm_gen_singbox 写入 PM_SB_BUCKET。
+pm_sb_reject_rule() { # 规则字段片段（不含首尾花括号）
+	if [ "${PM_SB_BUCKET:-A}" = A ]; then
+		printf '{%s,"outbound":"block"}\n' "$1"
+	else
+		printf '{%s,"action":"reject"}\n' "$1"
+	fi
+}
+
 pm_singbox_custom_rules() {
 	local target="$1" t kind value rest
 	[ -f "$PM_CUSTOM_LST" ] || return 0
@@ -267,9 +277,9 @@ pm_singbox_custom_rules() {
 		[ -n "$value" ] || continue
 		if [ "$target" = reject ]; then
 			case "$kind" in
-				domain) printf '{"domain":["%s"],"action":"reject"}\n' "$value" ;;
-				suffix) printf '{"domain_suffix":["%s"],"action":"reject"}\n' "$value" ;;
-				ip|ip6) printf '{"ip_cidr":["%s"],"action":"reject"}\n' "$value" ;;
+				domain) pm_sb_reject_rule "\"domain\":[\"$value\"]" ;;
+				suffix) pm_sb_reject_rule "\"domain_suffix\":[\"$value\"]" ;;
+				ip|ip6) pm_sb_reject_rule "\"ip_cidr\":[\"$value\"]" ;;
 			esac
 		else
 			t=$(pm_sb_outbound_for "$target")
@@ -310,7 +320,7 @@ pm_singbox_rules_render() {
 			tag="rs-$geo"
 			printf '{"type":"local","tag":"%s","format":"binary","path":"%s"}\n' "$tag" "$f" >> "$rulesets"
 			if [ "$target" = reject ]; then
-				printf '{"rule_set":"%s","action":"reject"}\n' "$tag" >> "$rules"
+				pm_sb_reject_rule "\"rule_set\":\"$tag\"" >> "$rules"
 			else
 				printf '{"rule_set":"%s","outbound":"%s"}\n' "$tag" "$(pm_sb_outbound_for "$target")" >> "$rules"
 			fi

@@ -46,7 +46,12 @@ config ferry 'main'
 	option config_path ''
 
 	# 内核二进制路径，留空则自动使用 /usr/bin/mihomo 或 /usr/bin/sing-box
+	# （若设置了 bin_path，内核管理页不会覆盖该路径）
 	option bin_path ''
+
+	# 内核下载默认源（仅“内核”页使用）：github 或 mirrors.json 里的镜像名
+	# 首次安装由页面选择；自动更新默认不开启，也不提供静默更新
+	option kernel_mirror 'github'
 
 	# 日志级别：silent | error | warning | info | debug
 	option log_level 'info'

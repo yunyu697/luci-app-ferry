@@ -3,6 +3,9 @@
 		"description": "Grant access to Ferry configuration, node store and profiles",
 		"read": {
 			"uci": [ "ferry" ],
+			"ubus": {
+				"luci-ferry-kernel": [ "list", "status", "versions", "job", "mirrors", "mirror_test", "preview" ]
+			},
 			"file": {
 				"/etc/ferry/nodes.json": [ "read" ],
 				"/etc/ferry/profiles.json": [ "read" ],
@@ -21,7 +24,8 @@
 		"write": {
 			"uci": [ "ferry" ],
 			"ubus": {
-				"service": [ "reload", "list" ]
+				"service": [ "reload", "list" ],
+				"luci-ferry-kernel": [ "list", "status", "versions", "job", "start", "remove", "mirrors", "mirror_set", "mirror_test", "preview" ]
 			},
 			"file": {
 				"/etc/ferry/nodes.json": [ "write" ],

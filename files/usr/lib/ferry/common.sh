@@ -2,11 +2,13 @@
 # Ferry 公共函数：配置读取、路径、日志、DNS 衔接、profile 迁移
 # 仅使用 BusyBox ash 兼容语法
 
-[ -f /lib/functions.sh ] && . /lib/functions.sh
+# 设备上固定 /lib/functions.sh；离线测试可用 PM_FUNCTIONS_SH 注入 config_* 替身
+PM_FUNCTIONS_SH=${PM_FUNCTIONS_SH:-/lib/functions.sh}
+[ -f "$PM_FUNCTIONS_SH" ] && . "$PM_FUNCTIONS_SH"
 
 PM_RUN_DIR=${PM_RUN_DIR:-/var/etc/ferry}
-PM_MIHOMO_DIR=/etc/mihomo
-PM_SINGBOX_DIR=/etc/sing-box
+PM_MIHOMO_DIR=${PM_MIHOMO_DIR:-/etc/mihomo}
+PM_SINGBOX_DIR=${PM_SINGBOX_DIR:-/etc/sing-box}
 
 # 持久化目录：节点、profile、规则编译产物（与 UCI 分离）
 # 允许环境变量覆盖，仅用于离线测试；设备上保持默认值
@@ -59,6 +61,17 @@ pm_pkg_installed() {
 		opkg) opkg list-installed 2>/dev/null | grep -q "^$name " ;;
 		*)    return 1 ;;
 	esac
+}
+
+# 精简固件不一定带 timeout（busybox 未编译该 applet），退化为直接执行
+pm_timeout() {
+	local s="$1"
+	shift
+	if command -v timeout >/dev/null 2>&1; then
+		timeout "$s" "$@"
+	else
+		"$@"
+	fi
 }
 
 # 给出等价的本机安装命令（文档/状态页复用）
@@ -191,9 +204,9 @@ pm_kernel_bin() {
 	if [ -n "$PM_BIN_PATH" ]; then
 		echo "$PM_BIN_PATH"
 	elif [ "$PM_KERNEL" = singbox ]; then
-		echo /usr/bin/sing-box
+		echo "${PM_BIN_DIR:-/usr/bin}/sing-box"
 	else
-		echo /usr/bin/mihomo
+		echo "${PM_BIN_DIR:-/usr/bin}/mihomo"
 	fi
 }
 

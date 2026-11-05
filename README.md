@@ -668,6 +668,61 @@ $(eval $(call BuildPackage,mihomo-bin))
 
 然后把 `luci-app-ferry` 的 `DEPENDS` 加上 `+mihomo-bin`（sing-box 同理，但需要先解包 tar.gz）。
 
+### 6.3 内核管理（LuCI「内核」页签，1.0.0-r3 起）
+
+除「用户自行放置」与「独立二进制包」之外，插件新增内核管理页签，负责**下载/导入 → 校验 → 原子替换 → 切换/回滚 → 卸载**。仍然**不内置任何内核二进制**：二进制由用户从上游获取，插件只做校验、落位与切换。
+
+**数据目录**
+
+| 路径 | 作用 |
+| --- | --- |
+| `/etc/ferry/kernels/<mihomo\|singbox>/<tag>/<bin>` | 已安装版本（持久化，重启保留） |
+| `/etc/ferry/kernels/<kernel>/active` → `<tag>` | 当前启用版本 |
+| `/etc/ferry/kernels/<kernel>/previous` → `<tag>` | 回滚目标（上一版本） |
+| `/usr/bin/mihomo`、`/usr/bin/sing-box` | 指向 `active` 的符号链接（运行路径不变） |
+| `/etc/ferry/kernels/mirrors.json` | 可编辑镜像列表（名称 / 示例 URL / 是否可用） |
+| `/var/etc/ferry/kernel-job.json` | 作业进度（phase/message/bytes/done/ok/code） |
+| `/var/etc/ferry/config-check-report.txt` | 最近一次配置自检的落盘结果（含内核原始输出） |
+
+**下载与校验**
+
+- 源可选：官方 GitHub（默认）/ 已启用镜像 / 自定义 URL；页面显示**实际使用的源**与耗时。
+- 换源**不放宽校验**：无论走哪个源，最终文件都必须匹配用户在页面上填写的**官方 SHA-256**（上游 release 未提供校验文件，故由用户粘贴官方发布页/上游 README 中给出的摘要）。
+- 仅允许 `https://`（本机回环 `http://127.0.0.1` 仅供离线测试）；不做自动测速轮询，镜像测速需手动点一次（1MB 取样）。
+- 校验失败**不落位**：下载到临时目录，校验通过后才解压、`chmod 0755`、再在同一文件系统内 `rename` 进版本目录。
+- 支持本地导入（离线场景），同样必须提供 SHA-256。
+- 默认不启用任何第三方镜像；`mirrors.json` 里镜像初始为「未启用」，需用户自行打开。
+
+**切换与回滚**
+
+一键 mihomo ↔ sing-box，或同内核多版本切换。切换前 `preview` 会返回目标内核、版本、架构匹配、配置格式差异（`format_change`）与是否需要重新生成，UI 必须显式确认后才执行。执行顺序：
+
+```
+停服务 → 原子替换 /usr/bin/<bin> → 写 active/previous 指针 + UCI kernel
+        → 按目标内核版本重新生成配置 → 内核自身 check → 启动服务 → 校验进程存活
+```
+
+任一步失败（`ERR_CONFIG_CHECK` / `ERR_START` / `ERR_LINK` …）自动回滚原内核 + 原配置 + 原运行状态，并把失败原因与内核原始输出回显到页面。回滚（`rollback`）只需把 `previous` 指回并重走同一流程；卸载只允许删**非当前**版本，且只删 `kernels/` 下的版本目录，不动 `/etc/config/ferry` 与用户节点的其他文件；升级/卸载插件本身也不会删除 `/etc/ferry/kernels`（见 4.7）。
+
+**sing-box 配置版本矩阵**
+
+生成器读取实际二进制的 `sing-box version` 选择模板，不按用户手填的版本号猜：
+
+| 区间 | 版本范围 | 关键差异 |
+| --- | --- | --- |
+| A | 1.8.x – 1.10.x | 无 `route.actions`；DNS 劫持/拦截依赖特殊出站 `{"type":"block"}` 与 `{"type":"dns"}`；无 `default_domain_resolver`；TUN 用 `inet4_address` |
+| B | 1.11.x | 引入 `route` 规则 `action`；`block`/`dns` 出站开始弃用；TUN 仍用 `inet4_address` |
+| C | 1.12.x – 1.13.x | `block`/`dns` 出站已移除（check 报错）；可用 `default_domain_resolver`；`rule_set` 走 `type: remote` + `format` |
+| D | ≥ 1.14.x | DNS servers 用 `type` + `server`；TUN 用 `address`（`inet4_address` 弃用）；更严格的字段校验 |
+
+不在矩阵内（<1.8.0 或无法解析版本）时**明确提示「未适配版本」并拒绝生成配置**，不会静默套用旧模板；失败时保留上一条已验证配置。
+
+生成后必须通过内核自身门禁：sing-box `sing-box check -c <cfg> -D <cfg 目录>`，mihomo `mihomo -t -d <dir> -f <cfg>`；输出原样写入 `config-check-report.txt`，不通过不落位、不重启。
+
+**许可证**
+
+mihomo（GPL-3.0）与 sing-box（GPL-3.0）均为独立上游项目；插件仅下载**用户指定 URL** 的文件并在本地校验，不打包、不再分发其二进制，因此本插件自身仍为 **GPL-2.0**（见 `LICENSE`）。页面对此有明确提示，用户需自行确认上游许可证与当地法规。
+
 ---
 
 ## 7. 关键实现
@@ -818,6 +873,38 @@ iptables -t nat -S | grep PM_
 | OpenWrt 24.10.4 | ipk | 启用服务 → 重启 → 停用 | 12 项 PASS（重启后 dnsmasq 接管仍成立，停用后上游还原） |
 | ImmortalWrt 25.12.0（kernel 6.12.87，apk-tools 3.0.5） | apk | `apk add --allow-untrusted` → 服务启动 → 菜单 → `apk del` | 28 项 PASS |
 | ImmortalWrt 25.12.0 | apk | 重启自愈 + 卸载断言 | 21 项 PASS（pre-deinstall 标记文件被写出） |
+| OpenWrt 24.10.4 | ipk | 内核管理：全新安装 mihomo 1.18.8 → 切 sing-box 1.8.14/1.10.7/1.11.0/1.14.4 → 回滚 → 卸非当前版本 → 跨内核切回 mihomo → 切 mihomo 1.19.33 | 12 节 PASS（见下方明细） |
+| ImmortalWrt 25.12.0 | apk | 内核管理：全新安装 mihomo 1.19.33 → 切 sing-box 1.10.7 → 切 mihomo 1.18.8 → 回滚 1.19.33 → 卸非当前版本 → `apk del` 保留内核文件 | 6 节 PASS |
+
+### 9.1.1 内核管理真机明细（QEMU x86_64，真实上游二进制）
+
+两台虚拟机均在**全新状态**开始（`/etc/ferry/kernels` 为空、无 `/usr/bin/mihomo`），内核包通过「本地导入」或「ghproxy 镜像下载」进入，SHA-256 全部按官方值校验。
+
+| 步骤 | 结果（OpenWrt 24.10.4） |
+| --- | --- |
+| 安装 mihomo 1.18.8 compatible（activate） | `ok=true`，`active=1.18.8`，`arch_match=true`，`mihomo -t` rc=0，进程 pid 存活 |
+| 安装 sing-box 1.8.14（不启用） | `ok=true`，`active` 仍为 mihomo 1.18.8（不误切换） |
+| 切到 sing-box 1.8.14 | `ok=true`，`sb_bucket=A`，`sing-box check` rc=0，进程 pid 存活 |
+| 切到 sing-box 1.10.7 | `ok=true`，`sb_bucket=A`，check rc=0 |
+| 切到 sing-box 1.11.0 | `ok=true`，`sb_bucket=B`，check rc=0 |
+| 切到 sing-box 1.14.4（musl 静态包） | `ok=true`，`sb_bucket=D`，check rc=0 |
+| 回滚 sing-box | `ok=true`，回到上一版本 1.11.0（`active=1.11.0`，bucket=B） |
+| 卸非当前版本 1.8.14 | `ok=true`，目录只剩 1.10.7/1.11.0/1.14.4 + `active` |
+| 跨内核切回 mihomo 1.18.8 | `ok=true`，`mihomo -t` rc=0，pid 存活；sing-box 进程退出 |
+| 安装并切到 mihomo 1.19.33 compatible | `ok=true`，`active=1.19.33`，check rc=0 |
+| 镜像测速（ghproxy，手动 6 秒取样） | `ok=true，elapsed=6s，bytes≈876KB` |
+| 镜像真实换源安装 sing-box 1.14.4 | `ok=true，源=ghproxy，74s`，落位 `sha256=8f7c5f06…a12057ca`（与官方一致） |
+
+ImmortalWrt 25.12.0（apk）同一脚本的 `imm` 模式全流程 PASS：mihomo 1.19.33 → sing-box 1.10.7（bucket=A，check rc=0）→ 切回 mihomo 1.19.33 → 切 1.18.8 → 回滚 1.19.33 → 卸非当前版本 → `apk del luci-app-ferry` 后 `/etc/ferry/kernels/mihomo/{1.18.8,1.19.33,active,previous}` 完整保留。
+
+**测试环境差异（不是产品缺陷）**：两台 VM 使用 QEMU 精简内核，缺少 `nf_tables` 模块，`nft` 加载接管规则会报 `did you mean table 'fw4'`，因此「流量接管」类断言在这两台 VM 上不成立；内核进程、配置生成与 `check` 门禁均正常。另：镜像自带的 busybox 缺少 `od` 与 `timeout`，这暴露了两个真实兼容性问题（见下方「本轮修复」），已修入源码并在两台 VM 复验。
+
+**本轮真机暴露并修复的问题**：
+- `generate.sh` 在版本探测/自检里直接调用 `timeout`，精简固件没有该命令 → `sing-box` 版本解析为空 → 生成器误判「未适配版本」，切换全部失败。已改为 `pm_timeout` 退化实现（无 `timeout` 时直接执行）。
+- 首次安装时 `/etc/ferry/kernels` 尚不存在，`df -k` 失败导致状态页显示 `free_kb=0`、并可能误报空间不足。已改为向上找到已存在父目录再测。
+- 非当前内核的版本仍被「不能卸载当前启用的版本」拦截（因为该内核的 `active` 指针还指向它）。已改为仅拦截**当前 UCI 内核**的启用版本，并在删除该指针目标时同步清理 `active` 指针与 `/usr/bin` 链接。
+- 镜像测速原先依赖 `timeout` 限制整包下载，未限时环境下会拖到 30s+ 导致 ubus 调用超时。已改为后台取样 6 秒后终止。
+
 
 断言覆盖：procd 服务启动/停止与进程退出、菜单与 ACL JSON 就位并可被 `jsonfilter` 解析、prerm/pre-deinstall 实际执行（在包内 `uninstall.sh` 插入标记文件后卸载，标记被写出）、nft 表与 iptables 兼容链清空、TPROXY 策略路由删除、dnsmasq 上游恢复到原始值、`/etc/ferry` 与 `/etc/config/ferry` 按预期保留。
 
@@ -832,7 +919,9 @@ iptables -t nat -S | grep PM_
 
 **离线回归**
 
-`tests/` 下 5 个脚本在当前源码上重跑，合计 119 项断言全 PASS：`test-dnsmasq.sh` 26、`test-firewall.sh` 21、`test-uninstall.sh` 26、`test-rules.sh` 26、`test-generate.sh` 20。
+`tests/` 下 6 个脚本在当前源码上重跑，合计 174 项断言全 PASS：`test-dnsmasq.sh` 26、`test-firewall.sh` 21、`test-uninstall.sh` 26、`test-rules.sh` 26、`test-generate.sh` 20、`test-kernel.sh` 55（15 节）。
+
+其中 `test-kernel.sh` 用本机 `http.server` 充当**下载源（mock，非外网）**，配合真实 `sing-box` / `mihomo` 二进制覆盖：全新安装与激活、安装不激活、同内核切换、回滚、跨内核切换、卸载非当前版本（含 active 指针清理）、SHA-256 不匹配不落位、缺校验需显式确认、架构不匹配拒绝、未适配版本拒绝、版本矩阵 A/B/C/D 模板字段、`sing-box check` / `mihomo -t` 门禁、作业进度写入。**mock 与真机分开标注**：这一套属于离线 mock；真机结果见 9.1.1。
 
 **LuCI 类加载器契约（`tests/test-luci-contract.mjs`）**
 
@@ -863,7 +952,7 @@ iptables -t nat -S | grep PM_
 
 - TPROXY/TUN 的**真实客户端流量转发**：QEMU 里只断言了规则、策略路由、进程与配置，没有真实终端跑流量。
 - ARM/MIPS 等非 x86_64 架构；本包本身 `Architecture: all`，但内核二进制需自行匹配架构，未实测。
-- sing-box 路径的端到端运行（配置 `check` 通过，未在设备上实际接管流量）。
+- sing-box 路径已在 QEMU 上实际切换并启动（1.8.14 / 1.10.7 / 1.11.0 / 1.14.4 各自 `check` 通过、进程存活），但**真实终端流量**仍未验证。
 - 真实手机/电视/游戏机等终端接入；旁路由真实拓扑连通性；节点延迟测试未实现。
 - 上游订阅与规则集在真实网络下的下载行为（离线测试用本地缓存）。
 - apk 签名/信任链：发布包未签名，必须 `--allow-untrusted`。

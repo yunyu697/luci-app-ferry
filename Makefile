@@ -17,7 +17,7 @@ include $(TOPDIR)/rules.mk
 
 PKG_NAME:=luci-app-ferry
 PKG_VERSION:=1.0.0
-PKG_RELEASE:=2
+PKG_RELEASE:=3
 
 PKG_LICENSE:=GPL-2.0-only
 PKG_MAINTAINER:=yunyu697
@@ -93,6 +93,11 @@ define Package/luci-app-ferry/install
 	$(INSTALL_BIN) ./files/usr/lib/ferry/generate.sh $(1)/usr/lib/ferry/generate.sh
 	$(INSTALL_BIN) ./files/usr/lib/ferry/firewall.sh $(1)/usr/lib/ferry/firewall.sh
 	$(INSTALL_BIN) ./files/usr/lib/ferry/uninstall.sh $(1)/usr/lib/ferry/uninstall.sh
+	$(INSTALL_BIN) ./files/usr/lib/ferry/kernel.sh $(1)/usr/lib/ferry/kernel.sh
+
+	# 内核管理 rpcd 后端
+	$(INSTALL_DIR) $(1)/usr/libexec/rpcd
+	$(INSTALL_BIN) ./files/usr/libexec/rpcd/luci-ferry-kernel $(1)/usr/libexec/rpcd/luci-ferry-kernel
 
 	# 节点/profile 持久化目录（节点与 profile 不入 UCI）
 	$(INSTALL_DIR) $(1)/etc/ferry/rules-cache/mihomo
@@ -119,6 +124,8 @@ define Package/luci-app-ferry/install
 		$(1)/www/luci-static/resources/view/ferry/deploy.js
 	$(INSTALL_DATA) ./files/www/luci-static/resources/view/ferry/profiles.js \
 		$(1)/www/luci-static/resources/view/ferry/profiles.js
+	$(INSTALL_DATA) ./files/www/luci-static/resources/view/ferry/kernel.js \
+		$(1)/www/luci-static/resources/view/ferry/kernel.js
 
 	$(INSTALL_DIR) $(1)/www/luci-static/resources/ferry
 	$(INSTALL_DATA) ./files/www/luci-static/resources/ferry/links.js \
@@ -127,6 +134,8 @@ define Package/luci-app-ferry/install
 		$(1)/www/luci-static/resources/ferry/preset-defs.js
 	$(INSTALL_DATA) ./files/www/luci-static/resources/ferry/store.js \
 		$(1)/www/luci-static/resources/ferry/store.js
+	$(INSTALL_DATA) ./files/www/luci-static/resources/ferry/kernels.js \
+		$(1)/www/luci-static/resources/ferry/kernels.js
 endef
 
 # 卸载清理。

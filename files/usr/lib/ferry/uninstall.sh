@@ -2,8 +2,9 @@
 # Ferry 一键清理：停止服务、移除接管规则与策略路由、还原 dnsmasq 上游。
 #
 # 用法：
-#   /usr/lib/ferry/uninstall.sh            保留用户数据（节点/profile/规则缓存）
-#   /usr/lib/ferry/uninstall.sh --purge    同时删除 /etc/ferry 下的用户数据
+#   /usr/lib/ferry/uninstall.sh                保留用户数据（节点/profile/规则缓存/内核版本库）
+#   /usr/lib/ferry/uninstall.sh --purge        删除用户数据，但保留内核版本库
+#   /usr/lib/ferry/uninstall.sh --purge-kernels 连同内核版本库一起删除（显式选择）
 #
 # 幂等：可重复执行。优先复用包内的 common.sh/firewall.sh（与启动路径逻辑一致）；
 # 包文件已被删除时退回内置的最小清理逻辑，仍可手动执行。
@@ -33,7 +34,13 @@ PM_IP_MARK=1
 PM_IP_ROUTE_TABLE=100
 
 PURGE=0
-[ "${1:-}" = "--purge" ] && PURGE=1
+PURGE_KERNELS=0
+for arg in "$@"; do
+	case "$arg" in
+		--purge) PURGE=1 ;;
+		--purge-kernels) PURGE=1; PURGE_KERNELS=1 ;;
+	esac
+done
 
 info() { echo "[ferry] $*"; }
 
@@ -146,9 +153,23 @@ cleanup_state() {
 	rm -rf "$PM_RUN_DIR" 2>/dev/null
 	if [ "$PURGE" = 1 ]; then
 		info "删除 $PM_CONF_DIR 下的用户数据（节点、profile、规则缓存、状态）"
-		rm -rf "$PM_CONF_DIR" 2>/dev/null
+		# 内核二进制是用户自行下载的资产：默认不删，只有 --purge-kernels 才删
+		# （不整体 rm -rf，避免误删 kernels/ 与用户编辑过的 mirrors.json）
+		local f
+		for f in nodes.json profiles.json status.json nodes.lst rules.lst custom.lst; do
+			rm -f "$PM_CONF_DIR/$f" 2>/dev/null
+		done
+		rm -rf "$PM_CONF_DIR/config" "$PM_CONF_DIR/rules-cache" "$PM_CONF_DIR/dnsmasq-backup" 2>/dev/null
+		if [ "$PURGE_KERNELS" = 1 ]; then
+			info "按显式选择删除内核版本库 $PM_CONF_DIR/kernels"
+			rm -rf "$PM_CONF_DIR/kernels" "$PM_CONF_DIR/mirrors.json" 2>/dev/null
+		else
+			info "保留内核版本库 $PM_CONF_DIR/kernels（如需删除请显式执行 --purge-kernels）"
+			# 没有内核版本库时目录里已无可保留内容，直接清掉空壳目录
+			[ -d "$PM_CONF_DIR/kernels" ] || rm -rf "$PM_CONF_DIR" 2>/dev/null
+		fi
 	else
-		info "保留 $PM_CONF_DIR（节点/profile/规则缓存）；彻底清理请执行 --purge"
+		info "保留 $PM_CONF_DIR（节点/profile/规则缓存/内核版本库）；彻底清理请执行 --purge"
 	fi
 	return 0
 }

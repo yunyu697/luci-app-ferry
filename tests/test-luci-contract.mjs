@@ -99,22 +99,86 @@ const fileMap = {
 	'ferry.preset-defs': join(resDir, 'ferry/preset-defs.js'),
 	'ferry.store': join(resDir, 'ferry/store.js'),
 	'ferry.links': join(resDir, 'ferry/links.js'),
+	'ferry.kernels': join(resDir, 'ferry/kernels.js'),
 	'view.ferry.main': join(resDir, 'view/ferry/main.js'),
 	'view.ferry.nodes': join(resDir, 'view/ferry/nodes.js'),
 	'view.ferry.rules': join(resDir, 'view/ferry/rules.js'),
 	'view.ferry.presets': join(resDir, 'view/ferry/presets.js'),
 	'view.ferry.deploy': join(resDir, 'view/ferry/deploy.js'),
-	'view.ferry.profiles': join(resDir, 'view/ferry/profiles.js')
+	'view.ferry.profiles': join(resDir, 'view/ferry/profiles.js'),
+	'view.ferry.kernel': join(resDir, 'view/ferry/kernel.js')
+};
+
+/* rpc.declare 必须返回可调用函数（真实 LuCI 里就是 uhttpd 的 rpc 代理） */
+const rpc = {
+	declare(def) {
+		const fn = (...args) => Promise.resolve({});
+		fn.__def__ = def;
+		return fn;
+	}
+};
+
+/* poll 资源模块：add() 返回 boolean */
+const poll = {
+	added: [],
+	add(fn, interval) { poll.added.push({ fn, interval }); return true; },
+	remove(fn) { poll.added = poll.added.filter(x => x.fn !== fn); return true; }
 };
 
 const stubs = {
 	'view': view,
 	'fs': stub('fs'),
 	'uci': stub('uci'),
-	'rpc': stub('rpc'),
+	'rpc': rpc,
+	'poll': poll,
 	'ui': stub('ui'),
 	'form': stub('form')
 };
+
+/* ---------- 最小 DOM：让 view.render() 能真的跑一遍 ---------- */
+
+function node(tagName) {
+	const n = {
+		tagName,
+		attrs: {},
+		children: [],
+		listeners: {},
+		get firstChild() { return this.children.length ? this.children[0] : null; },
+		appendChild(c) { this.children.push(c); return c; },
+		removeChild(c) {
+			const i = this.children.indexOf(c);
+			if (i >= 0) this.children.splice(i, 1);
+			return c;
+		},
+		addEventListener(type, fn) { (this.listeners[type] = this.listeners[type] || []).push(fn); }
+	};
+	return n;
+}
+
+/* LuCI 的 E() 不展开嵌套数组：这里对嵌套数组直接报错，避免漏掉真实渲染问题 */
+function E(tag, attrs, children) {
+	const n = node(tag);
+	for (const k of Object.keys(attrs || {}))
+		n.attrs[k] = attrs[k];
+	for (const c of (children || [])) {
+		if (c === null || c === undefined)
+			continue;
+		if (Array.isArray(c)) {
+			n.__nestedArray__ = true;
+			continue;
+		}
+		n.appendChild(typeof c === 'object' ? c : String(c));
+	}
+	return n;
+}
+
+const documentStub = {
+	getElementById: () => null,
+	querySelectorAll: () => [],
+	createElement: (t) => node(t)
+};
+
+globalThis.E = E;
 
 /* ---------- 模拟 L.require ---------- */
 
@@ -172,7 +236,7 @@ function load(name) {
 
 	let cls;
 	try {
-		cls = factory({}, {}, L, ...deps);
+		cls = factory({}, documentStub, L, ...deps);
 	}
 	catch (e) {
 		fail(`"${name}" 求值时抛错：${e.message}\n  in ${file}`);
@@ -212,7 +276,10 @@ for (const name of Object.keys(fileMap)) {
 expectApi('ferry.preset-defs', [ 'CATEGORIES', 'PRESETS', 'findPreset', 'buildRules' ]);
 expectApi('ferry.store', [ 'files', 'loadNodes', 'saveNodes', 'compile', 'applyPreset', 'status', 'esc' ]);
 expectApi('ferry.links', [ 'parse', 'parseOne', 'b64d', 'tlsOf' ]);
-for (const v of [ 'main', 'nodes', 'rules', 'presets', 'deploy', 'profiles' ])
+expectApi('ferry.kernels', [ 'callStatus', 'callVersions', 'callStart', 'callPreview', 'callRemove',
+	'callMirrors', 'callMirrorSet', 'callMirrorTest', 'callJob',
+	'bucketOf', 'bucketInfo', 'matrixText', 'fmtBytes', 'shortSha', 'errText', 'archFamily', 'archMatch' ]);
+for (const v of [ 'main', 'nodes', 'rules', 'presets', 'deploy', 'profiles', 'kernel' ])
 	expectApi(`view.ferry.${v}`, [ 'load', 'render' ]);
 
 /* 行为断言：契约不只是“类型对”，API 还得真能跑 */
@@ -244,9 +311,61 @@ catch (e) {
 	fail(`links 行为断言失败：${e.message}`);
 }
 
+/* 行为断言：sing-box 配置矩阵（边界必须与 generate.sh 的 pm_sb_bucket 一致） */
+try {
+	const K = instances['ferry.kernels'];
+	const cases = [
+		[ '1.8.14', 'A' ], [ '1.10.7', 'A' ], [ '1.11.0', 'B' ], [ '1.12.0', 'C' ],
+		[ '1.13.1', 'C' ], [ '1.14.4', 'D' ], [ 'v1.11.1', 'B' ], [ '1.7.0', null ],
+		[ '', null ], [ 'abc', null ]
+	];
+	let bad = 0;
+	for (const [ v, want ] of cases) {
+		const got = K.bucketOf(v);
+		if (got !== want) {
+			bad++;
+			fail(`kernels.bucketOf('${v}') = ${got}，期望 ${want}`);
+		}
+	}
+	if (!bad)
+		console.log(`PASS: kernels.bucketOf 覆盖 ${cases.length} 个版本样本（A/B/C/D 与不支持）`);
+	if (K.bucketInfo('1.8.14').dns !== 'address' || K.bucketInfo('1.14.4').dns !== 'type')
+		fail('kernels.bucketInfo() 的 DNS 字段与矩阵不一致');
+	else
+		console.log('PASS: kernels.bucketInfo() DNS 字段（A=address / D=type）');
+	if (!K.archMatch('amd64', '386') || !K.archMatch('armv7', 'arm') || K.archMatch('amd64', 'arm64'))
+		fail('kernels.archMatch() 架构家族判断错误');
+	else
+		console.log('PASS: kernels.archMatch() 架构家族判断');
+}
+catch (e) {
+	fail(`kernels 行为断言失败：${e.message}`);
+}
+
+/* 真实渲染路径：调用 view.render()（view.extend 出来的实例，而不只是看类型） */
+try {
+	const viewK = instances['view.ferry.kernel'];
+	const tree = viewK.render({
+		uci_kernel: 'mihomo', uci_kernel_norm: 'mihomo', arch: 'amd64',
+		active: 'v1.19.33', active_version: '1.19.33', active_size: 12000000,
+		active_arch: 'amd64', arch_match: true, running: false,
+		bin_path: '/usr/bin/mihomo', config_path: '/etc/mihomo/config.yaml',
+		config_compatible: true, free_kb: 100000, installed: [], job: null
+	});
+	if (!tree || !tree.tagName)
+		fail('view.ferry.kernel.render() 未返回 DOM 节点');
+	else if (tree.__nestedArray__)
+		fail('view.ferry.kernel.render() 出现嵌套数组（LuCI 的 E() 不会展开）');
+	else
+		console.log(`PASS: view.ferry.kernel.render() -> <${tree.tagName}> ${tree.children.length} 个子节点`);
+}
+catch (e) {
+	fail(`view.ferry.kernel.render() 抛错：${e.message}`);
+}
+
 /* ---------- 静态守卫：已被 LuCI 24.10.4 移除的 form.Select ---------- */
 
-for (const f of [ 'main', 'nodes', 'rules', 'presets', 'deploy', 'profiles' ]) {
+for (const f of [ 'main', 'nodes', 'rules', 'presets', 'deploy', 'profiles', 'kernel' ]) {
 	const src = readFileSync(fileMap[`view.ferry.${f}`], 'utf8');
 	const m = /form\.Select(?!\s*\|\|)/.exec(src);
 	if (m) {
