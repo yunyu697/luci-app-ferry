@@ -188,3 +188,37 @@ LuCI 保存与 `uci commit` 发生在 reload 触发之前，所以事务开始�
 - QEMU 的 socket LAN 不支持断线重连：断电重启用例需要同时重启 router 与 client 两台虚机。
 - 验收脚本依赖 WSL 内的 Linux QEMU（`-enable-kvm`、`-display none`）；`qemu-img` 在部分 WSL 里缺失，
   需 `QEMUIMG_BIN=/tmp/qu/root/usr/bin/qemu-img`（`apt-get download qemu-utils` + `dpkg -x`）或自行安装 qemu-utils。
+
+## r5 候选（仅出包，未打 tag、未发布）
+
+### 加固内容（UCI 读取失败不再让页面整体失败）
+
+- `ferry/store.js`：新增 `isInterruption(err)` 与 `loadConfig()`。
+  - 中断判定：`name === 'AbortError'` 或消息含 `ERR_ABORTED|aborted|cancelled|canceled|Failed to fetch`；
+  - 真实失败：先等 600ms 重试一次 `uci.load('ferry')`，仍失败才返回 `{ok:false,interrupted:false}`；
+  - `loadConfig()` 永不 reject，调用方不再需要自行 catch。
+- `view/ferry/main.js`：`load()` 改为 `store.loadConfig()`；真实失败时渲染顶部提示
+  （「配置读取失败，已用空白状态启动，可点重试」）+ 重试按钮（`location.reload()`），表单骨架照常渲染；
+  导航中断（`interrupted:true`）不弹提示。
+- `view/ferry/deploy.js`、`view/ferry/rules.js`：`uci.load('ferry')` 统一改为 `store.loadConfig()`。
+- `view/ferry/presets.js`：按要求不改（其 `load()` 已有 `.catch` 回退）。
+- `store.js` 内部 `uci.load` 仍保留在写操作（activate/saveActiveProfile/setActiveNodes）路径中：
+  写前必须成功读到 UCI，失败应抛给已有 action 错误处理，故不吞异常。
+
+### 回归
+
+- `tests/test-diag.sh`（原有的 49/0 套）：**PASS=49 FAIL=0**。
+- `tests/test-luci-contract.mjs`：**PASS (12 个模块通过 LuCI 类加载器契约)**。
+- 其余 shell 套件：dnsmasq 24/2、firewall 16/5、generate 20/0、rules 26/0、uninstall 26/0、
+  transaction 48/1、kernel 2 项失败（镜像下载 ERR_NETWORK）、mgmt-bypass 21/0。
+  失败项均为 nft/网络/并发时序类环境问题，与本次纯 JS 改动无关（改动文件 `node --check` 全部通过）。
+- shellcheck：本机未安装（`NOT_INSTALLED`），未执行。
+
+### 候选包
+
+- `luci-app-ferry_1.0.0-r5_all.ipk`：84256 字节，
+  sha256 `e981fa879bffd5867bcea841698ed6d794faa331aa8e93f612064871a78bf602`
+- `luci-app-ferry-1.0.0-r5.apk`：84130 字节，
+  sha256 `9b3552f6160364733b1cdd40f7beea0a6729838330e3b16c24c8597cf60cbf9e`
+- 两包各 31 个文件，`diff -r` **NO_DIFF**；与当前源码逐文件 `cmp` **ALL_MATCH**。
+- QEMU smoke：本轮**未跑**（受本轮工具调用预算限制，需完整起停两台虚机）；不作为已通过证据。

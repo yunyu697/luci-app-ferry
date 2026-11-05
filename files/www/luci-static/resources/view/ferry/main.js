@@ -2,14 +2,31 @@
 'require view';
 'require form';
 'require uci';
+'require ferry.store as store';
 
 return view.extend({
 	load: function() {
-		return uci.load('ferry');
+		return store.loadConfig();
 	},
 
-	render: function() {
+	render: function(cfg) {
 		var m, s, o;
+		cfg = cfg || { ok: false, interrupted: true };
+
+		/* 配置读取失败（非导航中断）：给可见提示 + 重试，页面骨架仍然渲染 */
+		var notice = null;
+		if (!cfg.ok && !cfg.interrupted) {
+			notice = E('div', { class: 'cbi-section-error', style: 'margin-bottom:12px' }, [
+				E('p', {}, _('配置读取失败，已用空白状态启动，可点重试。')),
+				E('button', {
+					class: 'cbi-button cbi-button-apply',
+					click: function() {
+						window.location.reload();
+					}
+				}, _('重试'))
+			]);
+		}
+
 		/* LuCI 24.10.4 起旧的下拉类已并入 form.ListValue（默认 widget=select） */
 		var Select = form.Select || form.ListValue;
 
@@ -181,6 +198,7 @@ return view.extend({
 		o.default = _('保存并应用后，可用 SSH 执行 /etc/init.d/ferry status 查看状态，' +
 			'logread -e ferry 查看日志。');
 
-		return m.render();
+		var node = m.render();
+		return notice ? E('div', {}, [ notice, node ]) : node;
 	}
 });

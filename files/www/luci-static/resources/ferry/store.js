@@ -29,6 +29,40 @@ function nowIso() {
 	return new Date().toISOString().replace(/\.\d+Z$/, 'Z');
 }
 
+/* ---------------- 配置加载（uci） ----------------
+   导航打断（XHR abort / 页面切换）与真实失败的区分：
+   - AbortError，或消息含 ERR_ABORTED / aborted / cancelled / Failed to fetch → 中断
+   - 其余（RPC 返回错误、超时、权限）→ 真实失败
+   真实失败先等 600ms 再重试一次，避免把切换瞬间的中断误报为错误。 */
+function isInterruption(err) {
+	var name = err && err.name ? String(err.name) : '';
+	var msg = err && err.message ? String(err.message) : String(err || '');
+	return name === 'AbortError' ||
+		/ERR_ABORTED|aborted|cancelled|canceled|Failed to fetch/i.test(msg);
+}
+
+function loadConfig() {
+	return uci.load('ferry').then(function() {
+		return { ok: true, interrupted: false };
+	}).catch(function(err) {
+		if (isInterruption(err))
+			return { ok: false, interrupted: true, error: err };
+		return new Promise(function(resolve) {
+			setTimeout(function() {
+				uci.load('ferry').then(function() {
+					resolve({ ok: true, interrupted: false });
+				}, function(err2) {
+					resolve({
+						ok: false,
+						interrupted: isInterruption(err2),
+						error: err2
+					});
+				});
+			}, 600);
+		});
+	});
+}
+
 function esc(v) {
 	return String(v == null ? '' : v)
 		.replace(/\\/g, '\\\\')
@@ -499,5 +533,6 @@ return baseclass.extend({
 	reloadService: reloadService,
 	status: status,
 	readKernelConfig: readKernelConfig,
+	loadConfig: loadConfig,
 	esc: esc
 });

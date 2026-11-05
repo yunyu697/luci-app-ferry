@@ -49,7 +49,7 @@ return view.extend({
 		return Promise.all([
 			store.activeProfile().catch(function() { return { profile: null }; }),
 			store.status(),
-			uci.load('ferry'),
+			store.loadConfig(),
 			store.readKernelConfig()
 		]);
 	},

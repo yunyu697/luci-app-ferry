@@ -46,7 +46,7 @@ return view.extend({
 		return Promise.all([
 			store.activeProfile().catch(function() { return { profile: null, db: null }; }),
 			store.status(),
-			uci.load('ferry')
+			store.loadConfig()
 		]);
 	},
 
