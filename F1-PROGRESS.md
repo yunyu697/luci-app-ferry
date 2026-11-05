@@ -50,6 +50,24 @@
   - 回滚只在“应用前内核在运行”时拉起服务，避免把原本停着的服务擅自启动
   - dnsmasq reload 与旧实例抢 DHCP socket 导致崩溃循环 → 恢复/接管改为 stop-等待-启动的硬重启
 
+### r4 一致性复核（通过）
+
+- ipk 31 个文件 / apk 31 个文件；`diff -r` 内容 **NO_DIFF**；与当前源码逐文件 `cmp` **ALL_MATCH**。
+- ipk：83605 字节，sha256 `4507eeeae6c5ada157b638d5ae268910b0c8b273da245fe304eef7dcd0b65da6`
+- apk：83485 字节，sha256 `83a34f6bf6626e62bb240378a0b2b45f9a4ae8f0beec06b1911b684a069fc139`
+
+### r4 发布状态（已发出）
+
+- commit：`47758ab F1：配置回滚保护、临时关闭、诊断包与真机验收（v1.0.0-r4）`
+- 远端 main 已更新到 `47758ab`（`git push` 被服务端 `fatal error in commit_refs_rules` 拒绝，
+  改用 GitHub API PATCH ref 完成；探测分支已删除）
+- tag：`v1.0.0-r4`（注释标签，远端 object `b3e9a89` → commit `47758ab`）
+- Release：**已发布（Latest）** https://github.com/yunyu697/luci-app-ferry/releases/tag/v1.0.0-r4
+  附件：ipk / apk / SHA256SUMS，远端 digest 与本地一致。
+- 过程异常：`gh release create` 首次返回 HTTP 502、重试 HTTP 500，但已生成草稿 Release；
+  `gh release upload` 成功；`gh release edit --draft=false` 返回 HTTP 502，但最终状态确认为
+  `isDraft=false`（已发布）。
+
 ## 下一步（按顺序）
 
 1. **ImmortalWrt 25.12.2 + apk 冒烟（收尾）**：仅剩 tproxy kmod 一个根因。用官方 `kmods/<kver>/`
