@@ -11,6 +11,8 @@ touch /etc/ferry/.keep 2>/dev/null
 
 # 开机自启（enabled=0 时 start 会直接跳过，不会真的启动内核）
 /etc/init.d/ferry enable >/dev/null 2>&1
+# 事务看门狗独立于 ferry 服务，必须常驻（被杀后由 procd 拉起）
+[ -x /etc/init.d/ferry-watchdog ] && /etc/init.d/ferry-watchdog enable >/dev/null 2>&1
 
 # 清空 LuCI 索引缓存，让新菜单/视图立即可见（不影响用户配置）
 rm -f /tmp/luci-indexcache* 2>/dev/null

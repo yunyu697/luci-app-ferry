@@ -9,6 +9,7 @@ USE_PROCD=1
 . /usr/lib/ferry/rules.sh
 . /usr/lib/ferry/generate.sh
 . /usr/lib/ferry/firewall.sh
+. /usr/lib/ferry/transaction.sh
 
 pm_start_kernel() {
 	local bin cfg
@@ -35,6 +36,25 @@ start_service() {
 	PM_RUNTIME_CONFIG=''
 	pm_load
 
+	# 崩溃/断电兜底：启动时发现未确认事务，先还原到快照基线，再按旧配置启动
+	# 事务内部的 stop/start（PM_TXN_SKIP=1）必须跳过，否则会把刚写入的待确认事务当成崩溃残留回滚掉
+	if [ "$PM_TXN_SKIP" != 1 ] && pt_pending_exists; then
+		pm_log "检测到未确认的应用事务，启动时自动还原" warning
+		# 刚开机不可能有还原进程在跑，清掉断电残留的锁
+		if [ "$(cut -d. -f1 /proc/uptime 2>/dev/null || echo 999)" -lt 120 ]; then
+			rm -rf "$PM_TXN_LOCK"
+		fi
+		pt_rollback "startup-detect" instart
+		PM_RUNTIME_CONFIG=''
+		pm_load
+	fi
+
+	# 临时关闭标记优先：重启后也保持关闭，直到用户点“恢复”
+	if pt_tmp_off_active; then
+		pm_log "处于「临时关闭代理」状态，跳过启动（恢复请执行 ferry-txnctl enable）"
+		return 0
+	fi
+
 	if [ "$PM_ENABLED" != 1 ]; then
 		pm_log "服务未启用（ferry.main.enabled=0），跳过启动"
 		return 0
@@ -55,6 +75,10 @@ start_service() {
 	if pm_fw_up; then
 		pm_dnsmasq_apply
 		pm_status_write
+		# 正常启动（非事务内部）时，把当前配置记为“已确认基线”，供首次回滚使用
+		if [ "$PM_TXN_SKIP" != 1 ]; then
+			pt_save_baseline
+		fi
 		if pm_is_client; then
 			pm_log "客户端形态已就绪：mixed 端口 $PM_MIXED_PORT"
 		else
@@ -78,8 +102,61 @@ stop_service() {
 }
 
 reload_service() {
-	stop
-	start
+	pm_load
+
+	# 内部还原流程重启时不再创建新事务
+	if [ "$PM_TXN_SKIP" = 1 ]; then
+		stop
+		start
+		return $?
+	fi
+
+	if pt_tmp_off_active; then
+		# 临时关闭期间保存配置：保持关闭，等用户显式恢复
+		PM_TXN_SKIP=1 stop
+		pm_log "临时关闭状态下的配置已保存，服务保持关闭"
+		return 0
+	fi
+
+	# 应用事务：先写快照（含当前 nft/ip/dnsmasq/进程状态），再 stop/start
+	if ! pt_begin "apply"; then
+		pm_log "事务快照失败，仍执行应用但不提供自动回滚" err
+		stop
+		start
+		return $?
+	fi
+
+	# 事务内部的 stop/start 不能触发“启动时检测 pending 自动还原”
+	PM_TXN_SKIP=1 stop
+	PM_TXN_SKIP=1 start
+	local rc=$?
+	PM_TXN_SKIP=''
+
+	# start_service 返回非 0，或内核进程没起来，都视为应用失败并立即回滚
+	if [ "$rc" -eq 0 ] && [ "$PM_ENABLED" = 1 ] && ! pm_is_client; then
+		local i=0
+		while [ "$i" -lt 5 ]; do
+			pgrep -f "$(pm_kernel_bin)" >/dev/null 2>&1 && break
+			sleep 1
+			i=$((i + 1))
+		done
+		pgrep -f "$(pm_kernel_bin)" >/dev/null 2>&1 || rc=1
+	fi
+
+	if [ "$rc" -ne 0 ]; then
+		pm_log "应用失败（rc=$rc），立即按快照还原" err
+		pt_rollback "apply-failed" full
+		return "$rc"
+	fi
+
+	pt_arm "apply"
+
+	# 看门狗正常情况下由 procd 常驻；这里兜底确保它存在
+	if [ -x /etc/init.d/ferry-watchdog ] && ! pgrep -f /usr/lib/ferry/watchdog.sh >/dev/null 2>&1; then
+		/etc/init.d/ferry-watchdog start >/dev/null 2>&1
+	fi
+	pm_log "应用完成，等待用户确认（$(pt_timeout) 秒）"
+	return 0
 }
 
 service_triggers() {
@@ -118,12 +195,22 @@ status_service() {
 		echo "install_hint: $(pm_pkg_install_hint '<包文件>.ipk')"
 	fi
 	# 依赖快速自检：只提示缺失，不阻止服务运行（iptables 兼容栈刻意非硬依赖）
-	local dep missing
+	# 按“能力”判断而不是包名：OpenWrt 的 nft 包名有 nftables / nftables-json / nftables-no-json 等变体
+	local missing
 	missing=''
-	for dep in nftables ip-full uclient-fetch; do
-		pm_pkg_installed "$dep" || missing="$missing $dep"
-	done
+	command -v nft >/dev/null 2>&1 || missing="$missing nftables"
+	command -v ip >/dev/null 2>&1 || missing="$missing ip-full"
+	command -v uclient-fetch >/dev/null 2>&1 || missing="$missing uclient-fetch"
 	[ -z "$missing" ] || echo "missing_deps:$missing"
+
+	if pt_pending_exists; then
+		echo "transaction: pending confirm (id=$(pt_meta_get id) left=$(($(pt_meta_get deadline) - $(pt_now)))s)"
+	else
+		echo "transaction: none"
+	fi
+	if pt_tmp_off_active; then
+		echo "temporary: off (use ferry-txnctl enable)"
+	fi
 
 	if [ -f "$(pm_dnsmasq_backup_dir)/server" ]; then
 		echo "dnsmasq: upstream rewritten to 127.0.0.1#$PM_DNS_PORT"

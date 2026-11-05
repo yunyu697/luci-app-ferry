@@ -15,7 +15,7 @@ pm_bypass_elements() {
 		out='127.0.0.0/8,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,169.254.0.0/16,100.64.0.0/10,224.0.0.0/4,240.0.0.0/4'
 	fi
 
-	for item in $PM_BYPASS_CIDR $PM_BYPASS_IP; do
+	for item in ${PM_BYPASS_CIDR:-} ${PM_BYPASS_IP:-}; do
 		[ -n "$item" ] || continue
 		has_colon=0
 		case "$item" in *:*) has_colon=1 ;; esac
@@ -26,6 +26,29 @@ pm_bypass_elements() {
 			continue
 		fi
 		out="$out,$item"
+	done
+	echo "$out"
+}
+
+# 管理口网段：来自 common.sh 的 PM_MGMT_CIDRS（LAN 网段 + 路由器自身地址）。
+# 独立成集合，规则写死且永远排在任何接管规则之前；用户 bypass 配置无法移除。
+pm_mgmt_elements() {
+	local fam="$1" item out='' has_colon
+	for item in $PM_MGMT_CIDRS; do
+		[ -n "$item" ] || continue
+		has_colon=0
+		case "$item" in *:*) has_colon=1 ;; esac
+		if [ "$fam" = ip ] && [ "$has_colon" = 1 ]; then
+			continue
+		fi
+		if [ "$fam" = ip6 ] && [ "$has_colon" = 0 ]; then
+			continue
+		fi
+		if [ -n "$out" ]; then
+			out="$out,$item"
+		else
+			out="$item"
+		fi
 	done
 	echo "$out"
 }
@@ -46,22 +69,31 @@ pm_lanif_elements() {
 # 生成 nft 规则文件： $1=ip|ip6  $2=表名  $3=输出文件
 pm_nft_build() {
 	local fam="$1" table="$2" file="$3"
-	local daddr setname dtype
+	local daddr setname dtype mgname mgelem
 
 	if [ "$fam" = ip6 ]; then
 		daddr='ip6 daddr'
 		setname='bypass6'
 		dtype='ipv6_addr'
+		mgname='mgmt6'
 	else
 		daddr='ip daddr'
 		setname='bypass4'
 		dtype='ipv4_addr'
+		mgname='mgmt4'
 	fi
+	mgelem=$(pm_mgmt_elements "$fam")
 
 	{
 		printf 'table %s %s {\n' "$fam" "$table"
 		printf '\tset %s {\n\t\ttype %s\n\t\tflags interval\n\t\tauto-merge\n\t\telements = { %s }\n\t}\n' \
 			"$setname" "$dtype" "$(pm_bypass_elements "$fam")"
+		# 管理口集合：硬编码，空集合不输出
+		if [ -n "$mgelem" ]; then
+			printf '\t# mgmt: management subnet/router address, never captured\n'
+			printf '\tset %s {\n\t\ttype %s\n\t\tflags interval\n\t\tauto-merge\n\t\telements = { %s }\n\t}\n' \
+				"$mgname" "$dtype" "$mgelem"
+		fi
 		printf '\tset lanif {\n\t\ttype ifname\n\t\telements = { %s }\n\t}\n' "$(pm_lanif_elements)"
 
 		# 1) DNS 劫持：局域网 53 -> 内核 DNS 监听端口（仅内核自带 DNS 时启用）
@@ -78,6 +110,9 @@ pm_nft_build() {
 			printf '\tchain tproxy_prerouting {\n'
 			printf '\t\ttype filter hook prerouting priority -150; policy accept;\n'
 			printf '\t\tiifname != @lanif return\n'
+			if [ -n "$mgelem" ]; then
+				printf '\t\t%s @%s return\n' "$daddr" "$mgname"
+			fi
 			printf '\t\t%s @%s return\n' "$daddr" "$setname"
 			if pm_dns_local; then
 				printf '\t\tudp dport 53 return\n'
@@ -90,6 +125,9 @@ pm_nft_build() {
 			printf '\tchain redir_prerouting {\n'
 			printf '\t\ttype nat hook prerouting priority -100; policy accept;\n'
 			printf '\t\tiifname != @lanif return\n'
+			if [ -n "$mgelem" ]; then
+				printf '\t\t%s @%s return\n' "$daddr" "$mgname"
+			fi
 			printf '\t\t%s @%s return\n' "$daddr" "$setname"
 			printf '\t\tmeta l4proto tcp redirect to :%s\n' "$PM_PROXY_PORT"
 			printf '\t}\n'
@@ -98,6 +136,9 @@ pm_nft_build() {
 				printf '\tchain quic_guard {\n'
 				printf '\t\ttype filter hook prerouting priority -150; policy accept;\n'
 				printf '\t\tiifname != @lanif return\n'
+				if [ -n "$mgelem" ]; then
+					printf '\t\t%s @%s return\n' "$daddr" "$mgname"
+				fi
 				printf '\t\t%s @%s return\n' "$daddr" "$setname"
 				printf '\t\tiifname @lanif udp dport 443 reject\n'
 				printf '\t}\n'
@@ -114,6 +155,15 @@ pm_nft_up() {
 	local f6="$PM_RUN_DIR/ferry-v6.nft"
 	local err
 	mkdir -p "$PM_RUN_DIR"
+
+	# TPROXY 依赖内核模块；缺失时给出明确原因，而不是把 nft 的 ENOENT 抛给用户
+	if [ "$PM_MODE" = tproxy ]; then
+		modprobe nft_tproxy 2>/dev/null
+		if ! grep -q '^nft_tproxy' /proc/modules 2>/dev/null; then
+			pm_log "TPROXY 无法启用：缺少内核模块 kmod-nft-tproxy（安装该模块后重试）" err
+			return 1
+		fi
+	fi
 
 	nft delete table ip "$PM_NFT_TABLE" 2>/dev/null
 	pm_nft_build ip "$PM_NFT_TABLE" "$f4" || return 1
@@ -154,6 +204,18 @@ pm_ipt_chain_down() {
 	return 0
 }
 
+# iptables 路径的管理口 RETURN：先于任何接管规则插入
+pm_ipt_mgmt_rules() {
+	local table="$1" chain="$2" iface item
+	for iface in $PM_LAN_IFACES; do
+		for item in $PM_MGMT_CIDRS; do
+			[ -n "$item" ] || continue
+			case "$item" in *:*) continue ;; esac
+			iptables -t "$table" -A "$chain" -i "$iface" -d "$item" -j RETURN 2>/dev/null
+		done
+	done
+}
+
 pm_ipt_up() {
 	local iface item
 
@@ -182,7 +244,13 @@ pm_ipt_up() {
 	fi
 
 	if [ "$PM_MODE" = tproxy ]; then
+		modprobe xt_TPROXY 2>/dev/null
+		if ! grep -q '^xt_TPROXY' /proc/modules 2>/dev/null; then
+			pm_log "TPROXY 无法启用：缺少内核模块 xt_TPROXY（kmod-ipt-tproxy）" err
+			return 1
+		fi
 		iptables -t mangle -N PM_TPROXY
+		pm_ipt_mgmt_rules mangle PM_TPROXY
 		for iface in $PM_LAN_IFACES; do
 			for item in $(pm_builtin_bypass4_list) $PM_BYPASS_CIDR $PM_BYPASS_IP; do
 				[ -n "$item" ] || continue
@@ -203,6 +271,7 @@ pm_ipt_up() {
 		iptables -t mangle -I PREROUTING 1 -j PM_TPROXY
 	elif [ "$PM_MODE" = redirect ]; then
 		iptables -t nat -N PM_REDIR
+		pm_ipt_mgmt_rules nat PM_REDIR
 		for iface in $PM_LAN_IFACES; do
 			for item in $(pm_builtin_bypass4_list) $PM_BYPASS_CIDR $PM_BYPASS_IP; do
 				[ -n "$item" ] || continue
@@ -216,6 +285,7 @@ pm_ipt_up() {
 
 		if [ "$PM_BLOCK_QUIC" = 1 ]; then
 			iptables -t mangle -N PM_QUIC
+			pm_ipt_mgmt_rules mangle PM_QUIC
 			for iface in $PM_LAN_IFACES; do
 				for item in $(pm_builtin_bypass4_list) $PM_BYPASS_CIDR $PM_BYPASS_IP; do
 					[ -n "$item" ] || continue

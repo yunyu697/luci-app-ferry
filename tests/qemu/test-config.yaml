@@ -1,0 +1,19 @@
+# F1 QEMU 验收专用内核配置：direct 出站 + fake-ip，不连接任何真实机场订阅
+mixed-port: 7891
+tproxy-port: 7890
+allow-lan: true
+bind-address: '*'
+mode: rule
+log-level: info
+ipv6: false
+dns:
+  enable: true
+  listen: 0.0.0.0:1053
+  enhanced-mode: fake-ip
+  fake-ip-range: 198.18.0.1/16
+  fake-ip-filter:
+    - 'lan'
+  nameserver:
+    - 223.5.5.5
+rules:
+  - MATCH,DIRECT

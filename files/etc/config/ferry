@@ -91,3 +91,7 @@ config ferry 'main'
 
 	# 所有规则都不匹配时的默认策略：proxy | direct
 	option final_policy 'proxy'
+
+	# 应用配置后的确认倒计时（秒）：30-180，默认 60
+	# 到期未在 LuCI 点“确认保留”，自动还原到应用前快照
+	option rollback_timeout '60'

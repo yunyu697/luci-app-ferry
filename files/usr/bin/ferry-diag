@@ -1,0 +1,329 @@
+#!/bin/sh
+# Ferry 诊断包：收集网络/内核/接管/日志证据，脱敏后打成单个 tar.gz
+#
+#   ferry-diag                 生成 /tmp/ferry-diag-*.tar.gz 并打印路径
+#   ferry-diag --json          输出 JSON（供 rpcd/LuCI 使用）
+#   ferry-diag --base64        只输出 tar.gz 的 base64（供 LuCI 下载）
+#   ferry-diag --out DIR       指定输出目录（默认 /tmp）
+#
+# 脱敏规则：
+#   - 订阅/节点 URL：保留 scheme + host，路径与 query 全部替换为 /***
+#   - password / uuid / token / secret / psk / auth / private_key 等字段值替换为 ***
+#   - PEM 私钥整段删除并替换为 [REDACTED PRIVATE KEY]
+
+FERRY_LIB_DIR=${FERRY_LIB_DIR:-/usr/lib/ferry}
+. "$FERRY_LIB_DIR/common.sh" 2>/dev/null
+. "$FERRY_LIB_DIR/transaction.sh" 2>/dev/null
+
+OUT_DIR=/tmp
+JSON=0
+B64=0
+
+while [ "$#" -gt 0 ]; do
+	case "$1" in
+		--json) JSON=1 ;;
+		--base64) B64=1 ;;
+		--out) shift; OUT_DIR=${1:-/tmp} ;;
+		--out=*) OUT_DIR=${1#--out=} ;;
+		*) ;;
+	esac
+	shift
+done
+
+pm_load >/dev/null 2>&1 || true
+
+BASE="ferry-diag-$(date '+%Y%m%d-%H%M%S')"
+WORK="${TMPDIR:-/tmp}/ferry-diag.$$"
+ROOT="$WORK/$BASE"
+mkdir -p "$ROOT" || exit 1
+
+# ---------------------------------------------------------------------------
+# 脱敏
+# ---------------------------------------------------------------------------
+_redact_keys() {
+	local k line ere
+	# -E：OpenWrt 24.10 busybox sed 支持；不支持时退回基本正则（仅 JSON/UCI）
+	ere=0
+	echo x | sed -E 's/x/y/' >/dev/null 2>&1 && ere=1
+	while IFS= read -r line; do
+		for k in password uuid token secret psk auth private_key private-key key_password auth_str authstr; do
+			if [ "$ere" = 1 ]; then
+				line=$(printf '%s\n' "$line" | sed -E \
+					-e "s/(\"$k\"[[:space:]]*:[[:space:]]*)\"[^\"]*\"/\\1\"***\"/g" \
+					-e "s/(option[[:space:]]+$k[[:space:]]+')[^']*/\\1***/g" \
+					-e "s/(list[[:space:]]+$k[[:space:]]+')[^']*/\\1***/g" \
+					-e "s/(^|[[:space:]])$k:[[:space:]]*[^,}[:space:]]+/\\1$k: ***/g")
+			else
+				line=$(printf '%s\n' "$line" | sed \
+					-e "s/\\(\"$k\"[[:space:]]*:[[:space:]]*\"\\)[^\"]*\"/\\1***\"/g" \
+					-e "s/\\(option[[:space:]]+$k[[:space:]]+'\\)[^']*'/\\1***'/g" \
+					-e "s/\\(list[[:space:]]+$k[[:space:]]+'\\)[^']*'/\\1***'/g")
+			fi
+		done
+		printf '%s\n' "$line"
+	done
+}
+
+redact_text() {
+	# 1) URL 只保留 scheme + host
+	awk '{
+		s = $0
+		out = ""
+		while (match(s, /(https?|hysteria2|hysteria|tuic|ss|ssr|trojan|vmess|vless|socks5):\/\/[^ "'\''<>]+/)) {
+			url = substr(s, RSTART, RLENGTH)
+			rest = substr(url, index(url, "://") + 3)
+			at = index(rest, "@")
+			if (at > 0) rest = substr(rest, at + 1)
+			host = rest
+			p = index(rest, "/")
+			if (p > 0) host = substr(rest, 1, p - 1)
+			q = index(host, "?")
+			if (q > 0) host = substr(host, 1, q - 1)
+			out = out substr(s, 1, RSTART - 1) substr(url, 1, index(url, "://") + 2) host "/***"
+			s = substr(s, RSTART + RLENGTH)
+		}
+		print out s
+	}' | _redact_keys | awk '
+		/-----BEGIN [A-Z ]*PRIVATE KEY-----/ { print "[REDACTED PRIVATE KEY]"; skip = 1; next }
+		/-----END [A-Z ]*PRIVATE KEY-----/ { skip = 0; next }
+		!skip { print }
+	'
+}
+
+redact_file() {
+	local src="$1" dst="$2"
+	if [ -f "$src" ]; then
+		redact_text < "$src" > "$dst" 2>/dev/null || : > "$dst"
+	else
+		: > "$dst"
+	fi
+}
+
+# ---------------------------------------------------------------------------
+# 1. 系统与固件
+# ---------------------------------------------------------------------------
+{
+	echo "generated=$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+	echo "hostname=$(hostname 2>/dev/null)"
+	echo "uname=$(uname -a 2>/dev/null)"
+	echo "----- /etc/openwrt_release -----"
+	cat /etc/openwrt_release 2>/dev/null
+	echo "----- /etc/os-release -----"
+	cat /etc/os-release 2>/dev/null
+	echo "----- package manager -----"
+	echo "pkgmgr=$(pm_pkgmgr 2>/dev/null || echo none)"
+	case "$(pm_pkgmgr 2>/dev/null)" in
+		opkg) opkg list-installed 2>/dev/null | grep -E '^(luci-app-ferry|nftables|ip-full|mihomo|sing-box) ' ;;
+		apk) apk info -v 2>/dev/null | grep -E '^(luci-app-ferry|nftables|ip-full|mihomo|sing-box)-' ;;
+	esac
+	echo "----- kernel build info -----"
+	uname -r 2>/dev/null
+	zcat /proc/config.gz 2>/dev/null | grep -E 'CONFIG_NFT_TPROXY|CONFIG_NF_TABLES|CONFIG_NFT_NAT|CONFIG_TUN' || echo "no /proc/config.gz"
+} > "$ROOT/system.txt" 2>&1
+
+# ---------------------------------------------------------------------------
+# 2. 相关 UCI（脱敏）
+# ---------------------------------------------------------------------------
+uci -q export ferry 2>/dev/null | redact_text > "$ROOT/uci-ferry.txt"
+uci -q show 'dhcp.@dnsmasq[0]' 2>/dev/null | redact_text > "$ROOT/uci-dnsmasq.txt"
+uci -q show network 2>/dev/null | grep -E '^network\.lan' | redact_text > "$ROOT/uci-network-lan.txt"
+redact_file "$PM_NODES_FILE" "$ROOT/nodes.redacted.json"
+redact_file "$PM_PROFILES_FILE" "$ROOT/profiles.redacted.json"
+[ -f "$PM_ACTIVE_FILE" ] && cp "$PM_ACTIVE_FILE" "$ROOT/active.txt" 2>/dev/null
+
+# ---------------------------------------------------------------------------
+# 3. 接管规则与路由
+# ---------------------------------------------------------------------------
+{
+	echo "\$ nft list ruleset"
+	nft list ruleset 2>&1
+} > "$ROOT/nft-ruleset.txt" 2>&1
+{
+	echo "\$ nft list table ip $PM_NFT_TABLE"
+	nft list table ip "$PM_NFT_TABLE" 2>&1
+	echo "\$ nft list table ip6 $PM_NFT_TABLE6"
+	nft list table ip6 "$PM_NFT_TABLE6" 2>&1
+} > "$ROOT/nft-ferry.txt" 2>&1
+{
+	echo "\$ ip rule show"; ip rule show 2>&1
+	echo "\$ ip route show table $PM_IP_ROUTE_TABLE"; ip route show table "$PM_IP_ROUTE_TABLE" 2>&1
+	echo "\$ ip -6 rule show"; ip -6 rule show 2>&1
+	echo "\$ ip -6 route show table $PM_IP_ROUTE_TABLE"; ip -6 route show table "$PM_IP_ROUTE_TABLE" 2>&1
+	echo "\$ ip -4 addr"; ip -4 addr 2>&1
+	echo "\$ ip -6 addr"; ip -6 addr 2>&1
+} > "$ROOT/ip-routing.txt" 2>&1
+{
+	echo "\$ iptables -t mangle -S"
+	iptables -t mangle -S 2>&1
+	echo "\$ iptables -t nat -S"
+	iptables -t nat -S 2>&1
+} > "$ROOT/iptables.txt" 2>&1
+
+# ---------------------------------------------------------------------------
+# 4. 内核版本与配置自检
+# ---------------------------------------------------------------------------
+{
+	echo "kernel=${PM_KERNEL} mode=${PM_MODE} deploy=${PM_DEPLOY}"
+	echo "bin=$(pm_kernel_bin)"
+	echo "mgmt_bypass=${PM_MGMT_CIDRS}"
+	echo "----- version -----"
+	if [ "$PM_KERNEL" = singbox ]; then
+		pm_timeout 10 "$(pm_kernel_bin)" version 2>&1
+	else
+		pm_timeout 10 "$(pm_kernel_bin)" -v 2>&1
+	fi
+	echo "----- config check -----"
+	if [ "$PM_KERNEL" = singbox ]; then
+		cfg="${PM_RUNTIME_CONFIG:-$PM_SINGBOX_DIR/config.json}"
+		[ -s "$cfg" ] || cfg="$PM_SINGBOX_DIR/config.json"
+		pm_timeout 25 "$(pm_kernel_bin)" check -D "$PM_SINGBOX_DIR" -c "$cfg" 2>&1
+	else
+		cfg="${PM_RUNTIME_CONFIG:-$PM_MIHOMO_DIR/config.yaml}"
+		[ -s "$cfg" ] || cfg="$PM_MIHOMO_DIR/config.yaml"
+		pm_timeout 25 "$(pm_kernel_bin)" -t -d "$PM_MIHOMO_DIR" -f "$cfg" 2>&1
+	fi
+	echo "[rc=$?]"
+} > "$ROOT/kernel-check.txt" 2>&1
+redact_file "$PM_MIHOMO_DIR/config.yaml" "$ROOT/config-mihomo.redacted.yaml"
+redact_file "$PM_SINGBOX_DIR/config.json" "$ROOT/config-singbox.redacted.json"
+{
+	for f in "$PM_MIHOMO_DIR"/*.key "$PM_MIHOMO_DIR"/*.pem "$PM_MIHOMO_DIR"/*.crt \
+	         "$PM_SINGBOX_DIR"/*.key "$PM_SINGBOX_DIR"/*.pem "$PM_SINGBOX_DIR"/*.crt; do
+		[ -f "$f" ] || continue
+		echo "== $f =="
+		redact_text < "$f" 2>/dev/null
+	done
+} > "$ROOT/certs.redacted.txt" 2>&1
+
+# ---------------------------------------------------------------------------
+# 5. 日志尾部
+# ---------------------------------------------------------------------------
+{
+	echo "\$ logread -e ferry"
+	logread -e ferry 2>/dev/null | tail -n 200
+	echo "----- fallback grep -----"
+	logread 2>/dev/null | grep -i ferry | tail -n 200
+	echo "----- /var/log/ferry* -----"
+	for f in /var/log/ferry*; do
+		[ -f "$f" ] || continue
+		echo "== $f =="
+		tail -n 100 "$f" 2>/dev/null
+	done
+} 2>&1 | redact_text > "$ROOT/logs.txt"
+
+# ---------------------------------------------------------------------------
+# 6. DNS / 连通性
+# ---------------------------------------------------------------------------
+{
+	echo "\$ nslookup example.com (system resolver)"
+	pm_timeout 8 nslookup example.com 2>&1
+	if command -v dig >/dev/null 2>&1; then
+		echo "\$ dig +short example.com"
+		pm_timeout 8 dig +short +time=3 +tries=1 example.com 2>&1
+		echo "\$ dig +short example.com @127.0.0.1 -p $PM_DNS_PORT"
+		pm_timeout 8 dig +short +time=3 +tries=1 -p "$PM_DNS_PORT" @127.0.0.1 example.com 2>&1
+	fi
+	echo "\$ ping -c 2 -W 2 223.5.5.5"
+	pm_timeout 10 ping -c 2 -W 2 223.5.5.5 2>&1
+	if command -v curl >/dev/null 2>&1; then
+		echo "\$ curl http://www.baidu.com"
+		pm_timeout 10 curl -sS -m 6 -o /dev/null -w 'http_code=%{http_code}\n' http://www.baidu.com 2>&1
+	else
+		echo "\$ uclient-fetch http://www.baidu.com"
+		pm_timeout 10 uclient-fetch -T 6 -O /dev/null http://www.baidu.com 2>&1
+	fi
+} > "$ROOT/network.txt" 2>&1
+
+# ---------------------------------------------------------------------------
+# 7. 能力探测
+# ---------------------------------------------------------------------------
+{
+	echo "nft=$(command -v nft 2>/dev/null)"
+	echo "iptables=$(command -v iptables 2>/dev/null)"
+	echo "ip=$(command -v ip 2>/dev/null)"
+	echo "dig=$(command -v dig 2>/dev/null)"
+	echo "curl=$(command -v curl 2>/dev/null)"
+	echo "mihomo=$(command -v mihomo 2>/dev/null)"
+	echo "sing-box=$(command -v sing-box 2>/dev/null)"
+	echo "----- nft table list -----"
+	nft list tables 2>&1
+	echo "----- iptables TPROXY target -----"
+	grep -w TPROXY /proc/net/ip_tables_targets 2>/dev/null || echo "not found"
+	echo "----- nf modules -----"
+	lsmod 2>/dev/null | grep -E 'nf_tables|nft_|tproxy|tun|xt_TPROXY' || echo "lsmod unavailable/empty"
+	echo "----- dnsmasq upstream -----"
+	uci -q get "$PM_DNSMASQ_SECTION.server" 2>/dev/null || echo none
+	uci -q get "$PM_DNSMASQ_SECTION.noresolv" 2>/dev/null || echo none
+	echo "----- dnsmasq backup -----"
+	ls -la "$(pm_dnsmasq_backup_dir)" 2>/dev/null || echo none
+} > "$ROOT/capability.txt" 2>&1
+
+# ---------------------------------------------------------------------------
+# 8. 事务状态
+# ---------------------------------------------------------------------------
+{
+	"${PM_TXNCTL:-/usr/bin/ferry-txnctl}" status 2>/dev/null || pt_status_json
+	echo "----- pending meta -----"
+	cat "$PM_TXN_PENDING/meta" 2>/dev/null || echo none
+	echo "----- pending snapshot files -----"
+	ls -la "$PM_TXN_PENDING" 2>/dev/null || true
+	echo "----- rollback evidence -----"
+	for f in "$PM_TXN_DIR"/evidence-*.txt; do
+		[ -f "$f" ] || continue
+		echo "== ${f##*/} =="
+		cat "$f" 2>/dev/null
+	done
+	echo "----- tmp-off -----"
+	cat "$PM_TMP_OFF_DIR/meta" 2>/dev/null || echo none
+	cat "$PM_TMP_OFF_DIR/evidence.txt" 2>/dev/null || true
+	echo "----- history (tail) -----"
+	tail -n 20 "$PM_TXN_HISTORY" 2>/dev/null || true
+} | redact_text > "$ROOT/transaction.txt" 2>/dev/null
+
+# ---------------------------------------------------------------------------
+# 打包
+# ---------------------------------------------------------------------------
+{
+	echo "Ferry diagnostic bundle"
+	echo "base=$BASE"
+	echo "files:"
+	for f in "$ROOT"/*; do
+		[ -f "$f" ] || continue
+		name=${f##*/}
+		if command -v sha256sum >/dev/null 2>&1; then
+			sum=$(sha256sum "$f" 2>/dev/null | awk '{print $1}')
+		else
+			sum=$(md5sum "$f" 2>/dev/null | awk '{print $1}')
+		fi
+		printf '  %-36s %8s  %s\n' "$name" "$(wc -c < "$f" 2>/dev/null | tr -d ' ')" "${sum:-n/a}"
+	done
+} > "$ROOT/manifest.txt" 2>&1
+
+mkdir -p "$OUT_DIR" || OUT_DIR=/tmp
+ARCHIVE="$OUT_DIR/$BASE.tar.gz"
+tar -czf "$ARCHIVE" -C "$WORK" "$BASE" 2>/dev/null || {
+	echo "diagnostic bundle failed"
+	rm -rf "$WORK"
+	exit 1
+}
+SIZE=$(wc -c < "$ARCHIVE" 2>/dev/null | tr -d ' ')
+SHA=$(sha256sum "$ARCHIVE" 2>/dev/null | awk '{print $1}')
+
+if [ "$B64" = 1 ]; then
+	if command -v base64 >/dev/null 2>&1; then
+		base64 "$ARCHIVE"
+	else
+		echo "base64 applet missing" >&2
+		rm -rf "$WORK"
+		exit 2
+	fi
+elif [ "$JSON" = 1 ]; then
+	printf '{"ok":true,"path":"%s","size":%s,"sha256":"%s"}\n' "$ARCHIVE" "${SIZE:-0}" "${SHA:-}"
+else
+	echo "archive=$ARCHIVE"
+	echo "size=${SIZE:-0}"
+	[ -n "$SHA" ] && echo "sha256=$SHA"
+fi
+
+rm -rf "$WORK"
+exit 0

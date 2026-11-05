@@ -163,6 +163,13 @@ return view.extend({
 		o.depends('mode', 'tun');
 		o.default = 'system';
 
+		o = s.option(form.Value, 'rollback_timeout', _('应用确认倒计时'),
+			_('保存并应用后进入待确认状态，倒计时内未在「安全与诊断」页点确认，' +
+			  '自动还原到应用前的 DNS、nft、策略路由与 UCI 配置。范围 30-180 秒。'));
+		o.datatype = 'range(30,180)';
+		o.default = '60';
+		o.rmempty = false;
+
 		o = s.option(Select, 'firewall_backend', _('接管实现'),
 			_('auto 会在系统支持 nftables 时优先使用 nftables，否则回退 iptables。'));
 		o.value('auto', _('auto（推荐）'));

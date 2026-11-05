@@ -161,6 +161,16 @@ make package/luci-app-ferry/compile V=s
 
 `PKGARCH:=all` 只代表**包内容**（shell/JS/UCI）与 CPU 架构无关，不代表内置内核二进制与架构无关——本包不内置内核。
 
+> **TPROXY 内核模块**：`kmod-nft-tproxy` 在部分固件（如官方 x86_64）不在默认 feeds 里，
+> 而在 `.../targets/x86/64/kmods/<kernel-version>/` 目录下。缺模块时 `ferry` 会拒绝安装
+> 接管规则并保持局域网直连，日志明确报「缺少内核模块 kmod-nft-tproxy」。手工补装：
+>
+> ```sh
+> echo "src/gz openwrt_kmods https://downloads.openwrt.org/releases/<ver>/targets/x86/64/kmods/<6.x.y-1-hash>" \
+>   >> /etc/opkg/customfeeds.cfg
+> opkg update && opkg install kmod-nft-tproxy
+> ```
+
 ### 3.4 apk 的命名约束（已写进 Makefile 注释）
 
 - `PKG_NAME` 必须全小写、只含 `[a-z0-9.+_-]`，所以是 `luci-app-ferry`。
@@ -801,6 +811,79 @@ table ip ferry {
 - 劫持规则只匹配 `iifname @lanif`，**路由器自身发起的查询来自 output 链，不会被再次劫持**。
 - mihomo 的 DNS 上游查询由内核自己发出（路由器本机流量），不会命中 prerouting，因此不会形成环路。
 - dnsmasq 上游指向 `127.0.0.1#1053` 后，`noresolv=1` 同时生效，避免继续使用 `resolv.conf` 里的公共 DNS。
+
+### 7.5 事务与回滚保护（1.0.0-r4 起）
+
+**应用即进入待确认态**。`ferry reload`（LuCI 保存 / CLI）内部顺序：
+
+```
+pt_begin（快照 + meta） → stop → start（PM_TXN_SKIP=1，避免自检误判）
+→ pt_arm（pending，deadline=now+rollback_timeout） → 等待确认
+```
+
+- 倒计时默认 **60s**，`ferry.main.rollback_timeout` 可设 **30–180**。
+- LuCI「安全」页每秒轮询 `/usr/libexec/rpcd/luci-ferry-safety status`，显示剩余时间；
+  **确认保留** → `pt_confirm`（pending 移入 `confirmed-<id>`，并刷新 `baseline.uci`）；
+  **立即回滚** → `pt_rollback manual`。
+- 超时 → 逐项还原：dnsmasq 原生上游、`table ip/ip6 ferry`、`ip rule`（fwmark 1 → table 100
+  及其 `local default dev lo`）、本次事务写过的 UCI 键、内核进程（按应用前是否运行决定）。
+  **只动 ferry 自己拥有的对象**：用户自建 nft 表/链、非 ferry 的 ip rule、第三方服务不受影响。
+- 回滚源是 `/etc/ferry/txn/baseline.uci`（最近一次“确认保留”的 ferry 配置全量导出）。
+  原因：uci commit 先于 reload，pending 快照里已是新值，直接回快照等于没回滚。
+- 并发保护：`/etc/ferry/txn/lock`（`mkdir` 原子 + 时间戳，超时可抢占），LuCI 与 CLI 同时操作
+  不会触发双重回滚。
+- 审计：`history.log` 每次记录 `reason`（`timeout` / `manual` / `apply-failed` / `startup-detect` /
+  `before-disable`），并把回滚前后状态写入 `evidence-<id>.txt`。
+
+**看门狗（独立 procd 服务）**
+
+`/etc/init.d/ferry-watchdog` 不依附主服务，运行 `/usr/lib/ferry/watchdog.sh`，
+`respawn 3600 5 5`，脚本每秒调用 `pt_check`（到点即 `pt_rollback timeout`）。
+
+为什么在 OpenWrt 上可靠：
+
+1. **不依赖控制面**：没有浏览器/SSH 会话也照常计时，因为计时进程由 procd 守护。
+2. **被杀可自愈**：procd 在 5s 后拉起；若被反复杀，主服务重启/开机时 `start_service`
+   检测到 pending 未确认 → `startup-detect` 回滚后再启动。
+3. **断电可恢复**：pending 的 `meta`、快照和 `baseline.uci` 都在 `/etc/ferry`（overlay 持久化），
+   重启后仍然存在；`/etc/init.d/ferry start` 先检测并回滚，业务不会带着未确认配置上线。
+4. `PM_TXN_SKIP=1` 只在事务自身的 stop/start 内部生效，避免把自己的 pending 当成崩溃残留。
+
+三条崩溃路径的 QEMU 真机用例见 §9.3。
+
+### 7.6 临时关闭代理
+
+- `ferry-txnctl disable`（LuCI「安全」页同按钮）：先把未确认事务按超时回滚，避免关闭后被看门狗
+  拉回；然后把当前形态快照到 `/etc/ferry/tmp-off/`（含 `meta`/`evidence.txt`），再
+  **停内核 → 撤 nft/iptables 接管 → dnsmasq 完整回原生上游**（`server` 与 `noresolv` 一起还原）。
+- 语义是“完整关闭”，不允许半关：DNS 若仍指向 `127.0.0.1#1053` 而内核已停，解析会超时，
+  比不关闭更难排查。
+- `ferry-txnctl enable`：删标记后按同一 UCI 配置重新 `start`，并写 `restore-evidence.txt`
+  供与关闭前对比；失败时返回非 0 且状态里 `disabled=false` 但服务未就绪，需查日志。
+- 断言（QEMU，真实流量）：关闭后 `dnsmasq server=223.5.5.5`、`nft` ferry 表为 0、客户端解析
+  真实 IP 且 HTTP 200；恢复后 `7890` / `127.0.0.1#1053` 回归、客户端重新拿到 fake-ip。
+
+### 7.7 诊断包（`ferry-diag`）
+
+入口：LuCI「安全」页按钮 + CLI `ferry-diag`（可选 `--out DIR`），产出单个 `tar.gz`。
+
+内容（20 项）：`system.txt`（固件/内核/包版本）、`capability.txt`（nft/iptables/模块探测）、
+`uci-ferry.txt` / `uci-dnsmasq.txt` / `uci-network-lan.txt`、`nft-ruleset.txt` + `nft-ferry.txt`、
+`ip-routing.txt`、`iptables.txt`、`kernel-check.txt`（`sing-box check` / `mihomo -t` 结果）、
+`network.txt`（dig/ping/curl）、`logs.txt`（最近日志尾部）、`transaction.txt`（pending/history）、
+`config-mihomo.redacted.yaml`、`config-singbox.redacted.json`、`nodes.redacted.json`、
+`profiles.redacted.json`、`certs.redacted.txt`、`manifest.txt`（文件清单 + SHA-256）。
+
+脱敏规则：
+
+| 类型 | 处理 |
+| --- | --- |
+| 订阅 URL | 保留 scheme+host，路径与 query 变 `/***`（`https://sub.example.com/***`） |
+| JSON/UCI/YAML 敏感键（`password`/`uuid`/`token`/`secret`/`auth`/`psk`…） | 值替换为 `***` |
+| PEM 私钥块 | 整段替换为 `[REDACTED PRIVATE KEY]` |
+
+测试断言：对生成包内所有文本 `grep` 植入的原始凭据，必须零命中（`tests/test-diag.sh` PASS=49，
+QEMU 内 PASS=24/0）。
 
 ---
 

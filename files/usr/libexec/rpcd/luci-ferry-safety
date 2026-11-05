@@ -1,0 +1,48 @@
+#!/bin/sh
+# rpcd 后端：应用事务、临时关闭、诊断包
+# rpcd 脚本协议：$1 为 "list" 或 "call"；"call" 时 $2 才是方法名。
+case "$1" in
+	list)
+		cat <<'EOF'
+{
+  "status": {},
+  "confirm": {},
+  "rollback": {},
+  "disable": {},
+  "enable": {},
+  "diag": {},
+  "diag_download": {}
+}
+EOF
+		;;
+	call)
+		export PM_TXN_QUIET=1
+		case "$2" in
+			status) /usr/bin/ferry-txnctl status ;;
+			confirm) /usr/bin/ferry-txnctl confirm ;;
+			rollback) /usr/bin/ferry-txnctl rollback ;;
+			disable) /usr/bin/ferry-txnctl disable ;;
+			enable) /usr/bin/ferry-txnctl enable ;;
+			diag)
+				if [ -x /usr/bin/ferry-diag ]; then
+					/usr/bin/ferry-diag --json
+				else
+					echo '{"ok":false,"error":"ferry-diag missing"}'
+				fi
+				;;
+			diag_download)
+				if [ -x /usr/bin/ferry-diag ]; then
+					/usr/bin/ferry-diag --base64
+				else
+					echo '{"ok":false,"error":"ferry-diag missing"}'
+				fi
+				;;
+			*)
+				echo '{"ok":false,"error":"unknown method"}'
+				;;
+		esac
+		;;
+	*)
+		echo '{"ok":false,"error":"unknown method"}'
+		;;
+esac

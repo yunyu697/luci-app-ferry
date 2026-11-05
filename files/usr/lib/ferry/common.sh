@@ -141,6 +141,7 @@ pm_load() {
 	config_get_bool PM_RULE_UPDATE main rule_update       1
 	config_get      PM_FINAL      main final_policy       proxy
 	config_get      PM_PROFILE    main profile            ''
+	config_get      PM_ROLLBACK_TIMEOUT main rollback_timeout 60
 
 	# 宽容处理非法枚举值
 	case "$PM_KERNEL" in
@@ -175,6 +176,10 @@ pm_load() {
 	[ -n "$PM_LAN_IFACE" ] || PM_LAN_IFACE=$(pm_detect_lan_iface)
 	PM_LAN_IFACES=$PM_LAN_IFACE
 
+	# 管理口永久 bypass：LAN 接口所在网段 + 路由器自身地址（含 IPv6）。
+	# 结果由 firewall.sh 写进独立 mgmt 集合，用户配置无法覆盖。
+	PM_MGMT_CIDRS=$(pm_mgmt_cidrs)
+
 	# UCI 的 profile 字段优先；兼容旧迁移只写了 active 文件的情况
 	PM_PROFILE_ID=$PM_PROFILE
 	if [ -z "$PM_PROFILE_ID" ] && [ -f "$PM_ACTIVE_FILE" ]; then
@@ -189,8 +194,8 @@ pm_load() {
 	return 0
 }
 
-pm_is_client() { [ "$PM_DEPLOY" = client ]; }
-pm_is_bypass() { [ "$PM_DEPLOY" = bypass ]; }
+pm_is_client() { [ "${PM_DEPLOY:-}" = client ]; }
+pm_is_bypass() { [ "${PM_DEPLOY:-}" = bypass ]; }
 
 pm_detect_lan_iface() {
 	local d
@@ -200,8 +205,75 @@ pm_detect_lan_iface() {
 	echo "$d"
 }
 
+# IPv4 点分地址 + 前缀 -> 网络 CIDR（纯整数运算，兼容 busybox awk）
+pm_ipv4_cidr() {
+	echo "$1 $2" | awk '{
+		split($1, a, ".")
+		p = $2 + 0
+		if (p < 0 || p > 32) p = 32
+		size = 2 ^ (32 - p)
+		n = ((a[1] * 256 + a[2]) * 256 + a[3]) * 256 + a[4]
+		base = int(n / size) * size
+		printf "%d.%d.%d.%d/%d\n", int(base / 16777216) % 256, int(base / 65536) % 256, int(base / 256) % 256, base % 256, p
+	}'
+}
+
+# 点分 netmask -> 前缀长度
+pm_netmask_prefix() {
+	echo "$1" | awk -F. '{
+		p = 0
+		for (i = 1; i <= 4; i++) {
+			v = $i + 0
+			while (v > 0) { p += v % 2; v = int(v / 2) }
+		}
+		print p
+	}'
+}
+
+# 输出空格分隔的管理口 CIDR（IPv4 + IPv6）
+pm_mgmt_cidrs() {
+	local iface out='' raw addr pfx net ip4 nv
+	iface=$PM_LAN_IFACE
+	[ -n "$iface" ] || iface=br-lan
+
+	if command -v ip >/dev/null 2>&1; then
+		raw=$(ip -4 -o addr show dev "$iface" 2>/dev/null | awk '$3 == "inet" { print $4 }')
+		for addr in $raw; do
+			ip4=${addr%/*}
+			pfx=${addr#*/}
+			[ "$pfx" = "$addr" ] && pfx=32
+			net=$(pm_ipv4_cidr "$ip4" "$pfx")
+			case " $out " in *" $net "*) ;; *) out="$out $net" ;; esac
+		done
+
+		raw=$(ip -6 -o addr show dev "$iface" scope global 2>/dev/null | awk '$3 == "inet6" { print $4 }')
+		for addr in $raw; do
+			case " $out " in *" $addr "*) ;; *) out="$out $addr" ;; esac
+		done
+	fi
+
+	# ip 命令不可用（极简固件）：退回 UCI 的 ipaddr/netmask，至少保住路由器自身地址
+	if [ -z "$out" ]; then
+		ip4=$(uci -q get network.lan.ipaddr 2>/dev/null)
+		nv=$(uci -q get network.lan.netmask 2>/dev/null)
+		if [ -n "$ip4" ]; then
+			case "$ip4" in */*) out="$out $ip4" ;; *)
+				pfx=32
+				[ -n "$nv" ] && pfx=$(pm_netmask_prefix "$nv")
+				net=$(pm_ipv4_cidr "$ip4" "$pfx")
+				out="$out $net"
+				;;
+			esac
+		fi
+	fi
+
+	# 最后兜底：路由器 LAN 地址总是 /32 进入 bypass，即使网段识别失败
+	echo "$out" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//'
+	return 0
+}
+
 pm_kernel_bin() {
-	if [ -n "$PM_BIN_PATH" ]; then
+	if [ -n "${PM_BIN_PATH:-}" ]; then
 		echo "$PM_BIN_PATH"
 	elif [ "$PM_KERNEL" = singbox ]; then
 		echo "${PM_BIN_DIR:-/usr/bin}/sing-box"
@@ -415,6 +487,13 @@ pm_dnsmasq_backup_dir() {
 	echo "$PM_CONF_DIR/dnsmasq-backup"
 }
 
+# 原始上游的“只读记录”：每次从干净配置采集时刷新，还原时只读不删。
+# 一次性备份（dnsmasq-backup）会被还原消耗；崩溃点恰好落在“已消耗未补采”时，
+# 没有这份记录就只能把本工具写入的 127.0.0.1#port 误当原始值（导致临时关闭后 DNS 半关）。
+pm_dnsmasq_native_record_dir() {
+	echo "$PM_CONF_DIR/dnsmasq-native"
+}
+
 # 是否是本工具自己写入的上游值（127.0.0.1#port / [::1]#port）
 pm_dnsmasq_is_own_server() {
 	printf '%s\n' "$1" | grep -Eq '^(127\.0\.0\.1|\[::1\]|::1)#[0-9]+$'
@@ -502,6 +581,19 @@ pm_dnsmasq_reload() {
 	return 0
 }
 
+# 硬重启：先等旧实例真正退出再拉起，避免“found already running DHCP-server”导致的崩溃循环
+pm_dnsmasq_restart() {
+	local i=0
+	[ -x "$PM_DNSMASQ_INIT" ] || return 0
+	"$PM_DNSMASQ_INIT" stop >/dev/null 2>&1
+	while [ $i -lt 10 ] && pgrep -x dnsmasq >/dev/null 2>&1; do
+		sleep 1
+		i=$((i+1))
+	done
+	"$PM_DNSMASQ_INIT" start >/dev/null 2>&1
+	return 0
+}
+
 # 旧版本把备份写在 tmpfs；迁移到持久化目录并清理旧文件
 pm_dnsmasq_migrate_legacy_backup() {
 	local bakdir legacy="$PM_RUN_DIR/dnsmasq.server.bak"
@@ -523,8 +615,9 @@ pm_dnsmasq_apply() {
 	[ -f "$PM_DHCP_FILE" ] || return 0
 	uci -q get "$PM_DNSMASQ_SECTION" >/dev/null 2>&1 || return 0
 
-	local bakdir tmp need_capture=0
+	local bakdir native tmp need_capture=0
 	bakdir=$(pm_dnsmasq_backup_dir)
+	native=$(pm_dnsmasq_native_record_dir)
 	mkdir -p "$bakdir" "$PM_RUN_DIR"
 	pm_dnsmasq_migrate_legacy_backup
 
@@ -533,46 +626,80 @@ pm_dnsmasq_apply() {
 	# 如果已经含本工具写入值（重启/崩溃后重入），只在缺备份时补记，绝不覆盖旧备份
 	if ! pm_dnsmasq_has_own_server; then
 		need_capture=1
-	elif [ ! -f "$bakdir/server" ]; then
+	elif [ ! -s "$bakdir/server" ]; then
+		# 0 字节备份（断电时数据未落盘）等同没有备份，必须重新采集/补记
 		need_capture=1
 	fi
 
 	if [ "$need_capture" = 1 ]; then
-		tmp="$PM_RUN_DIR/dnsmasq.current"
-		# 用 uci show：列表值输出为 'a' 'b'（引号空格分隔）。按引号边界拆成一行一条，
-		# 否则整串会被当成一个上游值写回。uci get 则会把多值挤成 "a b" 一行，无法区分坏值。
-		uci -q show "$PM_DNSMASQ_SECTION.server" 2>/dev/null | \
-			sed -e "s/^[^=]*=//" -e "s/' '/|/g" -e "s/^'//" -e "s/'$//" | \
-			tr '|' '\n' > "$tmp" || : > "$tmp"
-		pm_dnsmasq_filter_servers "$tmp" "$bakdir/server"
-		uci -q get "$PM_DNSMASQ_SECTION.noresolv" > "$bakdir/noresolv" 2>/dev/null || : > "$bakdir/noresolv"
-		rm -f "$tmp"
+		if pm_dnsmasq_has_own_server; then
+			# 当前配置只剩本工具写入值（还原已消费备份后又在崩溃点重入）：
+			# 不能把自身值当原始值，用最近一次记录的原始上游补回备份；
+			# 连记录都没有时宁可没有备份，也不要写一份空备份污染后续还原
+			if [ -s "$native/server" ]; then
+				cp "$native/server" "$bakdir/server" 2>/dev/null
+				[ -f "$native/noresolv" ] && cp "$native/noresolv" "$bakdir/noresolv" 2>/dev/null
+				pm_log "dnsmasq 原始上游备份缺失，已用最近一次原始上游记录补回"
+			else
+				rm -f "$bakdir/server" "$bakdir/noresolv"
+				pm_log "dnsmasq 原始上游未知（无备份、无记录），跳过捕获" warning
+			fi
+		else
+			tmp="$PM_RUN_DIR/dnsmasq.current"
+			# 用 uci show：列表值输出为 'a' 'b'（引号空格分隔）。按引号边界拆成一行一条，
+			# 否则整串会被当成一个上游值写回。uci get 则会把多值挤成 "a b" 一行，无法区分坏值。
+			uci -q show "$PM_DNSMASQ_SECTION.server" 2>/dev/null | \
+				sed -e "s/^[^=]*=//" -e "s/' '/|/g" -e "s/^'//" -e "s/'$//" | \
+				tr '|' '\n' > "$tmp" || : > "$tmp"
+			pm_dnsmasq_filter_servers "$tmp" "$bakdir/server"
+			uci -q get "$PM_DNSMASQ_SECTION.noresolv" > "$bakdir/noresolv" 2>/dev/null || : > "$bakdir/noresolv"
+			rm -f "$tmp"
+			if [ ! -s "$bakdir/server" ] && [ -s "$native/server" ]; then
+				# 当前配置没有显式上游（例如它已被上一次还原清空）时，不要用空值覆盖
+				# 已记录的原始上游，否则后续“临时关闭/回滚”会没有可还原的目标，变成 DNS 半关
+				pm_log "当前 dnsmasq 无显式上游，保留已记录的原始上游：$(tr '\n' ' ' < "$native/server")" warning
+				cp "$native/server" "$bakdir/server" 2>/dev/null
+				cp "$native/noresolv" "$bakdir/noresolv" 2>/dev/null
+			else
+				mkdir -p "$native"
+				cp "$bakdir/server" "$native/server" 2>/dev/null
+				cp "$bakdir/noresolv" "$native/noresolv" 2>/dev/null
+			fi
+	fi
+	# 断电保护：原始上游记录先落盘，再改 dnsmasq，
+	# 否则硬断电会留下 0 字节备份，后续临时关闭/回滚就没有可还原目标
+	sync
 	fi
 
 	uci -q delete "$PM_DNSMASQ_SECTION.server"
 	uci -q add_list "$PM_DNSMASQ_SECTION.server=127.0.0.1#$PM_DNS_PORT"
 	uci -q set "$PM_DNSMASQ_SECTION.noresolv=1"
 	uci -q commit dhcp
-	pm_dnsmasq_reload
+	pm_dnsmasq_restart
 	pm_log "dnsmasq 上游已指向 127.0.0.1#$PM_DNS_PORT"
 	return 0
 }
 
 pm_dnsmasq_restore() {
-	local bakdir src filtered sv nv
+	local bakdir native src nvsrc filtered sv nv
 	bakdir=$(pm_dnsmasq_backup_dir)
+	native=$(pm_dnsmasq_native_record_dir)
 	# 升级后若只在旧的 /var 里留有备份，先迁移再做恢复
 	if [ -f "$PM_RUN_DIR/dnsmasq.server.bak" ]; then
 		mkdir -p "$bakdir"
 		pm_dnsmasq_migrate_legacy_backup
 	fi
+	# 优先一次性备份；备份缺失或为空（崩溃点已消费）时退回只读原始记录
 	src="$bakdir/server"
-	[ -f "$src" ] || return 0
+	[ -s "$src" ] || src="$native/server"
+	[ -s "$src" ] || return 0
 	[ -f "$PM_DHCP_FILE" ] || return 0
 	uci -q get "$PM_DNSMASQ_SECTION" >/dev/null 2>&1 || return 0
 
 	# 写回前先过滤：本工具写入的值不能当原始值；旧版本污染的备份也能被纠正
-	filtered="$bakdir/server.sanitized"
+	# 过滤结果写到 tmpfs（备份目录可能已被上一次还原删除）
+	mkdir -p "$PM_RUN_DIR"
+	filtered="$PM_RUN_DIR/dnsmasq.server.sanitized"
 	pm_dnsmasq_filter_servers "$src" "$filtered"
 
 	# 备份非空但全部无法识别：宁可保留现状并告警，也不覆盖用户配置
@@ -580,6 +707,9 @@ pm_dnsmasq_restore() {
 		rm -f "$filtered"
 		pm_log "dnsmasq 备份 $src 内容无法识别，为避免覆盖用户配置跳过恢复，请手动检查 $PM_DHCP_FILE" err
 		return 1
+	# 断电保护：原始上游记录先落盘，再改 dnsmasq，
+	# 否则硬断电会留下 0 字节备份，后续临时关闭/回滚就没有可还原目标
+	sync
 	fi
 
 	uci -q delete "$PM_DNSMASQ_SECTION.server"
@@ -587,18 +717,28 @@ pm_dnsmasq_restore() {
 		[ -n "$sv" ] && uci -q add_list "$PM_DNSMASQ_SECTION.server=$sv"
 	done < "$filtered"
 
+	nvsrc="$bakdir/noresolv"
+	[ "$src" = "$bakdir/server" ] || nvsrc="$native/noresolv"
 	nv=''
-	[ -f "$bakdir/noresolv" ] && nv=$(tr -d '\r\n' < "$bakdir/noresolv" 2>/dev/null)
+	[ -f "$nvsrc" ] && nv=$(tr -d '\r\n' < "$nvsrc" 2>/dev/null)
 	case "$nv" in
 		1|0) uci -q set "$PM_DNSMASQ_SECTION.noresolv=$nv" ;;
 		*)   uci -q delete "$PM_DNSMASQ_SECTION.noresolv" ;;
 	esac
 
 	uci -q commit dhcp
-	pm_dnsmasq_reload
+	pm_dnsmasq_restart
 
-	rm -f "$filtered" "$src" "$bakdir/noresolv"
-	rmdir "$bakdir" 2>/dev/null
+	rm -f "$filtered"
+	# 只消费一次性备份；原始记录长期保留，供崩溃点/再次接管使用
+	if [ "$src" = "$bakdir/server" ]; then
+		# 消费备份前先把内容补进只读记录，避免下次接管时“既无备份也无记录”
+		mkdir -p "$native"
+		cp "$src" "$native/server" 2>/dev/null
+		[ -f "$bakdir/noresolv" ] && cp "$bakdir/noresolv" "$native/noresolv" 2>/dev/null
+		rm -f "$bakdir/server" "$bakdir/noresolv"
+		rmdir "$bakdir" 2>/dev/null
+	fi
 	pm_log "已恢复 dnsmasq 原始上游配置"
 	return 0
 }

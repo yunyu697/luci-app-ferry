@@ -17,7 +17,7 @@ include $(TOPDIR)/rules.mk
 
 PKG_NAME:=luci-app-ferry
 PKG_VERSION:=1.0.0
-PKG_RELEASE:=3
+PKG_RELEASE:=4
 
 PKG_LICENSE:=GPL-2.0-only
 PKG_MAINTAINER:=yunyu697
@@ -82,6 +82,7 @@ define Package/luci-app-ferry/install
 
 	$(INSTALL_DIR) $(1)/etc/init.d
 	$(INSTALL_BIN) ./files/etc/init.d/ferry $(1)/etc/init.d/ferry
+	$(INSTALL_BIN) ./files/etc/init.d/ferry-watchdog $(1)/etc/init.d/ferry-watchdog
 
 	$(INSTALL_DIR) $(1)/etc/uci-defaults
 	$(INSTALL_BIN) ./files/etc/uci-defaults/50-ferry $(1)/etc/uci-defaults/50-ferry
@@ -94,10 +95,18 @@ define Package/luci-app-ferry/install
 	$(INSTALL_BIN) ./files/usr/lib/ferry/firewall.sh $(1)/usr/lib/ferry/firewall.sh
 	$(INSTALL_BIN) ./files/usr/lib/ferry/uninstall.sh $(1)/usr/lib/ferry/uninstall.sh
 	$(INSTALL_BIN) ./files/usr/lib/ferry/kernel.sh $(1)/usr/lib/ferry/kernel.sh
+	$(INSTALL_BIN) ./files/usr/lib/ferry/transaction.sh $(1)/usr/lib/ferry/transaction.sh
+	$(INSTALL_BIN) ./files/usr/lib/ferry/watchdog.sh $(1)/usr/lib/ferry/watchdog.sh
 
-	# 内核管理 rpcd 后端
+	# 事务/诊断 CLI
+	$(INSTALL_DIR) $(1)/usr/bin
+	$(INSTALL_BIN) ./files/usr/bin/ferry-txnctl $(1)/usr/bin/ferry-txnctl
+	$(INSTALL_BIN) ./files/usr/bin/ferry-diag $(1)/usr/bin/ferry-diag
+
+	# rpcd 后端（内核管理 / 事务与诊断）
 	$(INSTALL_DIR) $(1)/usr/libexec/rpcd
 	$(INSTALL_BIN) ./files/usr/libexec/rpcd/luci-ferry-kernel $(1)/usr/libexec/rpcd/luci-ferry-kernel
+	$(INSTALL_BIN) ./files/usr/libexec/rpcd/luci-ferry-safety $(1)/usr/libexec/rpcd/luci-ferry-safety
 
 	# 节点/profile 持久化目录（节点与 profile 不入 UCI）
 	$(INSTALL_DIR) $(1)/etc/ferry/rules-cache/mihomo
@@ -126,6 +135,8 @@ define Package/luci-app-ferry/install
 		$(1)/www/luci-static/resources/view/ferry/profiles.js
 	$(INSTALL_DATA) ./files/www/luci-static/resources/view/ferry/kernel.js \
 		$(1)/www/luci-static/resources/view/ferry/kernel.js
+	$(INSTALL_DATA) ./files/www/luci-static/resources/view/ferry/safety.js \
+		$(1)/www/luci-static/resources/view/ferry/safety.js
 
 	$(INSTALL_DIR) $(1)/www/luci-static/resources/ferry
 	$(INSTALL_DATA) ./files/www/luci-static/resources/ferry/links.js \

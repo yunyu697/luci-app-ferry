@@ -1,0 +1,37 @@
+#!/bin/sh
+# Ferry 事务/临时开关 CLI
+#   ferry-txnctl status    当前 pending / 临时关闭状态（JSON）
+#   ferry-txnctl confirm   确认保留本次应用
+#   ferry-txnctl rollback  立即回滚本次应用
+#   ferry-txnctl disable   临时关闭代理（停内核、撤接管、DNS 回原生）
+#   ferry-txnctl enable    恢复关闭前的接管形态
+
+FERRY_LIB_DIR=${FERRY_LIB_DIR:-/usr/lib/ferry}
+. "$FERRY_LIB_DIR/common.sh" 2>/dev/null
+. "$FERRY_LIB_DIR/transaction.sh" 2>/dev/null
+
+[ -f "$FERRY_LIB_DIR/common.sh" ] || { echo '{"ok":false,"error":"missing common.sh"}'; exit 1; }
+pm_load >/dev/null 2>&1 || true
+
+case "$1" in
+	status)
+		pt_status_json
+		;;
+	confirm)
+		pt_confirm
+		;;
+	rollback)
+		pt_rollback "manual" full
+		echo '{"ok":true,"pending":false}'
+		;;
+	disable)
+		pt_tmp_disable
+		;;
+	enable)
+		pt_tmp_enable
+		;;
+	*)
+		echo '{"ok":false,"error":"usage: ferry-txnctl status|confirm|rollback|disable|enable"}'
+		exit 1
+		;;
+esac

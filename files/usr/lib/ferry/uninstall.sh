@@ -59,6 +59,12 @@ stop_service() {
 		"$PM_INIT_SCRIPT" stop >/dev/null 2>&1
 		"$PM_INIT_SCRIPT" disable >/dev/null 2>&1
 		rm -f "$PM_RC_DIR/S99ferry" "$PM_RC_DIR/K10ferry" 2>/dev/null
+		# 事务看门狗也取消，避免卸载后残留进程
+		if [ -x /etc/init.d/ferry-watchdog ]; then
+			/etc/init.d/ferry-watchdog stop >/dev/null 2>&1
+			/etc/init.d/ferry-watchdog disable >/dev/null 2>&1
+		fi
+		rm -rf "$PM_CONF_DIR/txn" "$PM_CONF_DIR/tmp-off" 2>/dev/null
 		return 0
 	fi
 	# init 脚本已不在（例如包已卸掉后手工补清理）：直接结束内核进程
@@ -159,7 +165,7 @@ cleanup_state() {
 		for f in nodes.json profiles.json status.json nodes.lst rules.lst custom.lst; do
 			rm -f "$PM_CONF_DIR/$f" 2>/dev/null
 		done
-		rm -rf "$PM_CONF_DIR/config" "$PM_CONF_DIR/rules-cache" "$PM_CONF_DIR/dnsmasq-backup" 2>/dev/null
+		rm -rf "$PM_CONF_DIR/config" "$PM_CONF_DIR/rules-cache" "$PM_CONF_DIR/dnsmasq-backup" "$PM_CONF_DIR/dnsmasq-native" 2>/dev/null
 		if [ "$PURGE_KERNELS" = 1 ]; then
 			info "按显式选择删除内核版本库 $PM_CONF_DIR/kernels"
 			rm -rf "$PM_CONF_DIR/kernels" "$PM_CONF_DIR/mirrors.json" 2>/dev/null
