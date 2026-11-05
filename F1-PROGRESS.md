@@ -229,12 +229,45 @@ LuCI 保存与 `uci commit` 发生在 reload 触发之前，所以事务开始�
     会话/文件时间戳，字节数也有 4 字节差异。内容与 `8db3483` 源码一致（`cmp` ALL_MATCH），
     差异属打包环境时间戳，不是内容变更。
 - 回归（本轮实测）：`tests/test-diag.sh` **PASS=49 FAIL=0**；LuCI 模块契约 **12/12**
-- QEMU smoke（OpenWrt 24.10.4 x86_64，headless，`--suite smoke`）：**PASS=78 FAIL=2**
-  - 2 个失败均在安装前网络预检：`00-router-net.sh` 的 WAN TCP 探测（`Failed to send request: Operation not permitted`）、
-    `client-00-client-net.sh` 的客户端出网 ping；同期 ICMP ping 正常，ferry 安装/服务/DNS/TPROXY/流量/
-    临时关闭/诊断包断言全部通过 → 判为 QEMU slirp 环境类。
-  - 佐证：同一提交、同源更早一次运行为 **PASS=80 FAIL=0**（`run-r5-smoke-2.out`）。
-- LuCI 主页面渲染：本轮**未验证**。尝试在 headless guest 内注入 SSH 公钥失败（`Permission denied (publickey,password)`），
-  随脚本退出虚机，未取得带登录会话的 DOM；不以截图替代，不记为通过。部分证据：LuCI 模块契约 12/12。
+- QEMU smoke（OpenWrt 24.10.4 x86_64，headless，`--suite smoke`）：首跑 **PASS=78 FAIL=2**，复跑 **PASS=80 FAIL=0**
+  - 首跑 2 个失败均在安装前网络预检：`00-router-net.sh` 的 WAN TCP 探测（`Failed to send request: Operation not permitted`）、
+    `client-00-client-net.sh` 的客户端出网 ping；同一次运行中 ferry 安装/服务/DNS/TPROXY/流量/临时关闭/诊断包断言全部通过。
+  - 同提交、同包复跑一次为 **PASS=80 FAIL=0**（`run-r5-smoke-4.out`），确认是 QEMU slirp 环境抖动，不是产品缺陷。
+- LuCI 主页面 DOM 断言（无头浏览器 CDP，仅文本/DOM/控制台，无截图；详见下节）：
+  - 正例 **PASS**；反例「提示 + 重试」**PASS**，但「表单骨架保留」**FAIL**（发现 r5 真实缺陷，定位到 `main.js:201-202`）。
+
 - 事实：未使用 OpenWrt 官方 SDK / buildroot（自建 staging + `build_ipk.py` + `apk mkpkg`）；OpenWrt 侧未签名。
+
+### LuCI 主页面 DOM 断言（2026-11-06 补测，无截图）
+
+环境与登录方式：
+- QEMU 内启动 OpenWrt 24.10.4（x86_64），双网卡：eth0=`net=192.168.1.0/24`（LAN，hostfwd 22/80），eth1=默认 slirp（WAN，DHCP 10.0.2.15）。
+- guest 侧**不使用 SSH**：全部经串口控制台（`tests/qemu/serial_exec.py`）完成——设置 root 密码、
+  `uclient-fetch` 从宿主机 `10.0.2.2:8899` 取包、`opkg install`（`OPKG_RC=0`）、重启 uhttpd/rpcd。
+- 浏览器侧：宿主机 headless Chromium（`--headless=new --remote-debugging-port=9333`），
+  在 LuCI 登录表单填写 `root`/`ferrytest` 提交获得会话，再打开
+  `http://127.0.0.1:8091/cgi-bin/luci/admin/services/ferry`。
+
+正例结果（PASS）：页面标题「Ferry 透明代理网关」、章节「基础设置」、18 个 input / 8 个 select，
+关键字「启用 / 代理内核 / 运行模式 / 部署形态」齐全；无「配置读取失败」提示；
+`Runtime.exceptionThrown`=0，console error/warning=0，log error=0；未出现 `factory yields invalid constructor`。
+
+反例结果（部分 PASS / 核心断言 FAIL）：
+- 触发方式：移除 `/etc/config/ferry`（`uci.load('ferry')` 真实失败）。也试过写入语法错误配置，现象相同。
+- 通过项：出现「配置读取失败，已用空白状态启动，可点重试。」与「重试」按钮。
+- 失败项：表单骨架**没有**保留。`#maincontent` 文本仅 104 字符，表单区域输出 `[object Promise]`，
+  无标题、无任何 select/input（侧栏与主题的 Save 按钮仍在）；并产生 2 条未捕获异常：
+  `RPCError: RPC call to uci/get failed with ubus code 4: Resource not found`。
+- 缺陷定位：`files/www/luci-static/resources/view/ferry/main.js:201-202`
+
+```js
+var node = m.render();
+return notice ? E('div', {}, [ notice, node ]) : node;
+```
+
+  `m.render()` 返回 Promise；正常分支直接返回（LuCI 会 await），失败分支把 Promise 塞进 `E()`，
+  于是渲染成 `[object Promise]` 且表单丢失。修复方向（r6 待办，本轮未改生产代码）：
+  `return node.then(function(n){ return E('div', {}, [ notice, n ]); });`
+- 配置还原：`cp /tmp/ferry.bak /etc/config/ferry` 后复测正例 PASS，页面恢复正常。
+
 
