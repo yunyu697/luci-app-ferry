@@ -27,7 +27,7 @@
 			"uci": [ "ferry" ],
 			"ubus": {
 				"service": [ "reload", "list" ],
-				"luci-ferry-kernel": [ "list", "status", "versions", "job", "start", "remove", "mirrors", "mirror_set", "mirror_test", "preview" ],
+				"luci-ferry-kernel": [ "list", "status", "versions", "job", "start", "remove", "mirrors", "mirror_set", "mirror_test", "source_set", "store_set", "preview" ],
 				"luci-ferry-safety": [ "status", "confirm", "rollback", "disable", "enable", "diag", "diag_download" ],
 				"luci-ferry-upgrade": [ "status", "snapshot", "verify", "restore", "prep", "remove" ]
 			},

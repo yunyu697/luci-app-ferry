@@ -59,6 +59,8 @@ return view.extend({
 			st: st || {},
 			versions: null,
 			versionsErr: '',
+			versionsLoading: false,
+			mirrorsErr: '',
 			job: (st && st.job) ? st.job : null,
 			selKernel: (st && st.uci_kernel_norm) || 'mihomo',
 			selVersion: '',
@@ -385,7 +387,16 @@ return view.extend({
 						if (state.pollFn) { poll.remove(state.pollFn); state.pollFn = null; }
 						refreshStatus();
 					}
-				}).catch(function() {});
+				}).catch(function(e) {
+					state.pollErrs = (state.pollErrs || 0) + 1;
+					if (state.pollErrs >= 3) {
+						if (state.pollFn) { poll.remove(state.pollFn); state.pollFn = null; }
+						state.busy = false;
+						state.job = { phase: 'error', done: true,
+							message: '任务状态读取失败：' + ((e && e.message) || e) };
+						renderJob();
+					}
+				});
 			};
 			poll.add(state.pollFn, 1);
 			state.pollFn();
@@ -435,7 +446,9 @@ return view.extend({
 				});
 
 			var verSel = select(
-				[ [ '', state.versions ? '— 选择版本 —' : '（内置清单加载中…）', !state.selUrl ] ].concat(
+				[ [ '', state.versions ? '— 选择版本 —'
+					: (state.versionsLoading ? '（内置清单加载中…）'
+					: (state.versionsErr ? '（清单加载失败，见下方错误）' : '（未加载，点“获取版本清单”）')), !state.selUrl ] ].concat(
 					(state.versions || []).map(function(v) {
 						return [ v.url, v.version + (v.prerelease ? '（预发布）' : '') + '  ' + v.asset
 							+ (v.size ? '  ' + K.fmtBytes(v.size) : ''), state.selUrl === v.url ];
@@ -572,27 +585,52 @@ return view.extend({
 				+ 'SHA-256 不匹配、架构不符、glibc 依赖、磁盘不足都会直接失败且不落位，旧版本保留可回滚。'
 				+ ((state.versionsMeta && state.versionsMeta.unavailable)
 					? '已隐藏 ' + state.versionsMeta.unavailable + ' 条源上不可用的资产（审计标记 dead，不展示以免点了才失败）。' : '')));
-			if (state.versionsErr) add(boxInstall, warn(state.versionsErr));
+			if (state.versionsErr)
+				add(boxInstall, E('div', { 'class': 'cbi-value' }, [
+					E('div', { 'class': 'cbi-value-field' }, [
+						warn('版本清单读取失败：' + state.versionsErr), ' ',
+						button('重试', 'cbi-button-neutral', function() { loadVersions(); })
+					])
+				]));
 		}
 
+		// 所有后端调用都加 5s 上限：rpcd 未重载 / 后端异常时也必须落到错误态，
+		// 不允许界面停在「加载中」（r10 起）。
+		function rpcTimeout(p, ms, what) {
+			return new Promise(function(resolve, reject) {
+				var done = false;
+				var timer = setTimeout(function() {
+					if (done) return;
+					done = true;
+					reject(new Error(what + '超时（' + (ms / 1000) + 's 无响应）：后端未就绪或 rpcd 未重载，'
+						+ '请执行 /etc/init.d/rpcd restart 后重试'));
+				}, ms);
+				p.then(function(v) { if (done) return; done = true; clearTimeout(timer); resolve(v); },
+					function(e) { if (done) return; done = true; clearTimeout(timer); reject(e); });
+			});
+		}
+
+		// 版本清单来自包内置清单：纯离线，必须与镜像源/网络状态无关
 		function loadVersions(silent) {
 			state.versionsErr = '';
-			if (!state.mirrors) { loadMirrors(function() { loadVersions(silent); }); return; }
+			state.versionsLoading = true;
 			if (!silent) ui.addNotification(null, E('p', {}, [ '正在读取 ' + state.selKernel + ' 版本清单…' ]), 'info');
-			K.callVersions(state.selKernel, state.prerelease ? 1 : 0).then(function(r) {
-				if (!r || !r.ok) { state.versions = null; state.versionsErr = (r && r.error) || '获取失败'; }
-				else {
-					state.versions = r.versions || [];
-					state.versionsErr = '';
-					state.versionsMeta = { arch: r.arch, variants: r.variants, generated: r.generated, list: r.list,
-						unavailable: r.unavailable || 0 };
-					if (!state.selUrl && state.versions.length) {
-						state.selUrl = state.versions[0].url;
-						state.curSize = state.versions[0].size || 0;
+			rpcTimeout(K.callVersions(state.selKernel, state.prerelease ? 1 : 0), 5000, '读取版本清单')
+				.then(function(r) {
+					if (!r || !r.ok) { state.versions = null; state.versionsErr = (r && r.error) || '获取失败'; }
+					else {
+						state.versions = r.versions || [];
+						state.versionsErr = '';
+						state.versionsMeta = { arch: r.arch, variants: r.variants, generated: r.generated, list: r.list,
+							unavailable: r.unavailable || 0 };
+						if (!state.selUrl && state.versions.length) {
+							state.selUrl = state.versions[0].url;
+							state.curSize = state.versions[0].size || 0;
+						}
 					}
-				}
-				renderInstall();
-			}).catch(function(e) { state.versionsErr = '' + e; renderInstall(); });
+				})
+				.catch(function(e) { state.versions = null; state.versionsErr = (e && e.message) || ('' + e); })
+				.then(function() { state.versionsLoading = false; renderInstall(); });
 		}
 
 		function startInstall(args) {
@@ -607,11 +645,17 @@ return view.extend({
 		}
 
 		function loadMirrors(cb) {
-			K.callMirrors().then(function(r) {
-				state.mirrors = (r && r.ok) ? r.mirrors : { mirrors: [] };
-				renderMirrors(); renderInstall();
-				if (cb) cb();
-			});
+			state.mirrorsErr = '';
+			rpcTimeout(K.callMirrors(), 5000, '读取镜像源')
+				.then(function(r) {
+					state.mirrors = (r && r.ok) ? r.mirrors : { mirrors: [] };
+					if (r && !r.ok) state.mirrorsErr = r.error || '镜像源读取失败';
+				})
+				.catch(function(e) {
+					state.mirrors = { mirrors: [] };
+					state.mirrorsErr = (e && e.message) || ('' + e);
+				})
+				.then(function() { renderMirrors(); renderInstall(); if (cb) cb(); });
 		}
 
 		function renderMirrors() {
@@ -632,11 +676,21 @@ return view.extend({
 							? { text: '可用，' + r.elapsed + 's / ' + K.fmtBytes(r.bytes) }
 							: { text: '不可用（rc=' + ((r && r.rc) || '?') + '）' };
 						renderMirrors();
+					}).catch(function(e) {
+						state.mirrorMsg[m.name] = { text: '检测失败：' + ((e && e.message) || e) };
+						renderMirrors();
 					});
 				});
 				return [ m.label || m.name, m.name, prefix, enabled, E('span', {}, [ testOut, ' ', testBtn || '' ]) ];
 			});
 			add(boxMirrors, table([ '名称', '标识', '前缀', '启用', '可用性' ], rows));
+			if (state.mirrorsErr)
+				add(boxMirrors, E('div', { 'class': 'cbi-value' }, [
+					E('div', { 'class': 'cbi-value-field' }, [
+						warn('镜像源读取失败：' + state.mirrorsErr), ' ',
+						button('重试', 'cbi-button-neutral', function() { loadMirrors(); })
+					])
+				]));
 			add(boxMirrors, E('div', { 'class': 'cbi-value' }, [
 				E('div', { 'class': 'cbi-value-field' }, [
 					button('保存镜像设置', 'cbi-button-apply', function() {
@@ -653,6 +707,8 @@ return view.extend({
 							if (!r || !r.ok) { ui.addNotification(null, E('p', {}, [ (r && r.error) || '保存失败' ]), 'danger'); return; }
 							ui.addNotification(null, E('p', {}, [ '镜像设置已保存' ]), 'info');
 							loadMirrors();
+						}).catch(function(e) {
+							ui.addNotification(null, E('p', {}, [ '保存失败：' + ((e && e.message) || e) ]), 'danger');
 						});
 					}),
 					' ',
@@ -690,7 +746,9 @@ return view.extend({
 		renderInstallTable();
 		renderInstall();
 		renderJob();
-		loadMirrors(function() { loadVersions(true); });
+		// 内置版本清单必须离线可得；镜像源失败不能连坐版本列表
+		loadVersions(true);
+		loadMirrors();
 
 		if (state.st.job && state.st.job.phase && !state.st.job.done)
 			startPoll();

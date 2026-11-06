@@ -2,7 +2,36 @@
 # rpcd 后端：对象 luci-ferry-kernel（mihomo / sing-box 内核管理）
 # rpcd 脚本协议：$1 为 "list" 或 "call"；"call" 时 $2 才是方法名。
 # 参数为 JSON，从 stdin 传入；结果输出 JSON。
+#
+# 所有调用都经过 watchdog：后端超过 PMK_RPC_TIMEOUT 秒未返回时，
+# 直接回 {"ok":false,...} 而不是让 ubus/前端无限等待（r10 起）。
 K=/usr/lib/ferry/kernel.sh
+PMK_RPC_TIMEOUT=${PMK_RPC_TIMEOUT:-20}
+
+run_backend() { # method argfile
+	local m="$1" af="$2" out pid i=0
+	out=$(mktemp "/tmp/.ferry-rpc.XXXXXX" 2>/dev/null) || out="/tmp/.ferry-rpc.$$"
+	# 用 sh 显式执行：即使安装过程丢了可执行位也不会 500
+	sh "$K" "$m" <"$af" >"$out" 2>/dev/null &
+	pid=$!
+	while kill -0 "$pid" 2>/dev/null; do
+		if [ "$i" -ge "$PMK_RPC_TIMEOUT" ]; then
+			kill -9 "$pid" 2>/dev/null
+			echo "{\"ok\":false,\"error\":\"后端 $m 超过 ${PMK_RPC_TIMEOUT}s 未返回（rpcd 或内核后端异常，可执行 ferry-kernel-diag 查看原因）\"}"
+			rm -f "$out"
+			return 0
+		fi
+		sleep 1
+		i=$((i + 1))
+	done
+	wait "$pid" 2>/dev/null
+	if [ -s "$out" ]; then
+		cat "$out"
+	else
+		echo "{\"ok\":false,\"error\":\"后端 $m 没有输出（内核后端可能已崩溃，可执行 ferry-kernel-diag）\"}"
+	fi
+	rm -f "$out"
+}
 
 case "$1" in
 	list)
@@ -27,22 +56,29 @@ case "$1" in
 EOF
 		;;
 	call)
+		if [ ! -f "$K" ]; then
+			echo '{"ok":false,"error":"内核后端缺失：/usr/lib/ferry/kernel.sh（包未完整安装，请重装 luci-app-ferry）"}'
+			exit 0
+		fi
+		argf="/tmp/.ferry-rpc-args.$$"
+		cat >"$argf" 2>/dev/null
 		case "$2" in
-			status) "$K" status ;;
-			versions) "$K" versions ;;
-			start) "$K" start ;;
-			job) "$K" job ;;
-			preview) "$K" preview ;;
-			remove) "$K" remove ;;
-			mirrors) "$K" mirrors ;;
-			mirror_set) "$K" mirror-set ;;
-			mirror_test) "$K" mirror-test ;;
-			source_set) "$K" source-set ;;
-			store_set) "$K" store-set ;;
+			status) run_backend status "$argf" ;;
+			versions) run_backend versions "$argf" ;;
+			start) run_backend start "$argf" ;;
+			job) run_backend job "$argf" ;;
+			preview) run_backend preview "$argf" ;;
+			remove) run_backend remove "$argf" ;;
+			mirrors) run_backend mirrors "$argf" ;;
+			mirror_set) run_backend mirror-set "$argf" ;;
+			mirror_test) run_backend mirror-test "$argf" ;;
+			source_set) run_backend source-set "$argf" ;;
+			store_set) run_backend store-set "$argf" ;;
 			*)
 				echo '{"ok":false,"error":"unknown method"}'
 				;;
 		esac
+		rm -f "$argf"
 		;;
 	*)
 		echo '{"ok":false,"error":"unknown method"}'

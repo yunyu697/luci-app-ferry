@@ -318,43 +318,69 @@ pmk_mirrors_default() { # custom-prefix
 EOF
 }
 
-pmk_mirror_get() { # name field
+# 直接读清单文件里的字段：不触发 pmk_mirrors_init。
+# r7–r9 的迁移分支在 init 里调用 pmk_mirror_get，get 又调用 init，
+# 遇到旧版（无 "version": 2）清单就无限递归，ubus 调用永不返回——
+# 界面上表现为「版本清单一直加载中、镜像源为空、刷新无效」。
+pmk_mirror_raw() { # file name field
 	local line
-	pmk_mirrors_init
+	[ -s "$1" ] || return 0
 	if command -v jsonfilter >/dev/null 2>&1; then
-		jsonfilter -i "$PMK_MIRRORS" -e "@.mirrors[@.name=\"$1\"].$2" 2>/dev/null
+		jsonfilter -i "$1" -e "@.mirrors[@.name=\"$2\"].$3" 2>/dev/null
 		return 0
 	fi
-	# 无 jsonfilter（离线/测试环境）时按行解析默认清单结构，避免镜像被误判为未配置
-	line=$(grep -F "\"name\": \"$1\"" "$PMK_MIRRORS" 2>/dev/null | head -1)
+	# 无 jsonfilter（离线/测试环境）时按行解析，避免镜像被误判为未配置
+	line=$(grep -F "\"name\": \"$2\"" "$1" 2>/dev/null | head -1)
 	[ -n "$line" ] || return 0
-	case "$2" in
+	case "$3" in
 		enabled|official)
-			printf '%s' "$line" | grep -q "\"$2\": true" && echo true || echo false ;;
+			printf '%s' "$line" | grep -q "\"$3\": true" && echo true || echo false ;;
 		*)
-			printf '%s\n' "$line" | sed -n "s/.*\"$2\": \"\([^\"]*\)\".*/\1/p" ;;
+			printf '%s\n' "$line" | sed -n "s/.*\"$3\": \"\([^\"]*\)\".*/\1/p" ;;
 	esac
+}
+
+# 清单文件是否可解析（有 mirrors 数组 + JSON 合法）
+pmk_mirrors_valid() { # file
+	[ -s "$1" ] || return 1
+	grep -q '"mirrors"' "$1" 2>/dev/null || return 1
+	command -v jsonfilter >/dev/null 2>&1 || return 0
+	jsonfilter -i "$1" -t '@' >/dev/null 2>&1
+}
+
+pmk_mirror_get() { # name field
+	[ -s "$PMK_MIRRORS" ] || pmk_mirrors_init
+	pmk_mirror_raw "$PMK_MIRRORS" "$1" "$2"
 }
 
 pmk_mirrors_init() {
 	local old_custom=''
-	mkdir -p "$PMK_STORE"
-	if [ -s "$PMK_MIRRORS" ]; then
+	mkdir -p "$PMK_STORE" 2>/dev/null
+	if pmk_mirrors_valid "$PMK_MIRRORS"; then
 		grep -q '"version": 2' "$PMK_MIRRORS" && return 0
-		# 旧版清单（只有官方+disabled 的 ghproxy）升级为内置多源；
-		# 保留用户填过的自定义前缀，其余按新默认值重建
-		local old_custom
-		old_custom=$(pmk_mirror_get custom prefix | sed 's/[\\"]/ /g')
+		# 旧版（v1）清单升级为内置多源：只保留用户填过的自定义前缀。
+		# 必须直接读文件（pmk_mirror_raw），不能走 pmk_mirror_get（会递归）。
+		old_custom=$(pmk_mirror_raw "$PMK_MIRRORS" custom prefix | sed 's/[\\"]/ /g')
 	fi
-	pmk_mirrors_default "$old_custom" > "$PMK_MIRRORS.tmp" 2>/dev/null &&
-		mv "$PMK_MIRRORS.tmp" "$PMK_MIRRORS"
+	if [ -s "$PMK_MIRRORS" ] && ! pmk_mirrors_valid "$PMK_MIRRORS"; then
+		cp "$PMK_MIRRORS" "$PMK_MIRRORS.broken" 2>/dev/null
+		pmk_log "mirrors.json 语法无效，已备份为 $PMK_MIRRORS.broken 并重建默认清单"
+	fi
+	pmk_mirrors_default "$old_custom" > "$PMK_MIRRORS.tmp" 2>/dev/null || {
+		rm -f "$PMK_MIRRORS.tmp"; return 1; }
+	pmk_mirrors_valid "$PMK_MIRRORS.tmp" || { rm -f "$PMK_MIRRORS.tmp"; return 1; }
+	mv "$PMK_MIRRORS.tmp" "$PMK_MIRRORS" 2>/dev/null || return 1
 	return 0
 }
 
 pmk_mirror_names() {
-	pmk_mirrors_init
-	grep -o '"name"[[:space:]]*:[[:space:]]*"[^"]*"' "$PMK_MIRRORS" 2>/dev/null |
-		sed 's/.*"name"[[:space:]]*:[[:space:]]*"//; s/"$//'
+	local names
+	pmk_mirrors_init >/dev/null 2>&1
+	names=$(grep -o '"name"[[:space:]]*:[[:space:]]*"[^"]*"' "$PMK_MIRRORS" 2>/dev/null |
+		sed 's/.*"name"[[:space:]]*:[[:space:]]*"//; s/"$//')
+	# 清单不可读时退回内置顺序，保证“源列表”不会整块为空
+	[ -n "$names" ] || names=$(printf '%s\n' github ghfast ghproxy jsdelivr custom)
+	echo "$names"
 }
 
 pmk_mirror_enabled() { pmk_mirror_get "$1" enabled; }
@@ -548,14 +574,17 @@ EOF
 }
 
 pmk_api_mirrors() {
-	local sel
+	local sel chain
 	pmk_mirrors_init
-	sel=$(pmk_source_selected)
-	if grep -q '"mirrors"' "$PMK_MIRRORS"; then
-		echo "{\"ok\":true,\"selected\":\"$sel\",\"chain\":\"$(pmk_source_chain "$sel")\",\"mirrors\":$(cat "$PMK_MIRRORS")}"
-	else
-		echo '{"ok":false,"error":"mirrors.json 语法无效"}'
+	# 不允许把坏 JSON 拼进 ubus 回复：那会让前端 RPC 直接 reject，
+	# 表现为「镜像源为空 + 版本清单永远加载中」。坏文件已在 init 里备份并重建。
+	if ! pmk_mirrors_valid "$PMK_MIRRORS"; then
+		echo "{\"ok\":false,\"error\":\"mirrors.json 无法读取或语法无效（已尝试重建，请检查 $PMK_STORE 写权限）\"}"
+		return 0
 	fi
+	sel=$(pmk_source_selected)
+	chain=$(pmk_source_chain "$sel")
+	echo "{\"ok\":true,\"selected\":\"$sel\",\"chain\":\"$(pmk_esc "$chain")\",\"mirrors\":$(cat "$PMK_MIRRORS")}"
 }
 
 pmk_api_mirror_set() {
@@ -563,7 +592,35 @@ pmk_api_mirror_set() {
 	raw=$(pmk_arg json)
 	mkdir -p "$PMK_STORE"
 	printf '%s' "$raw" > "$PMK_MIRRORS.tmp"
-	if jsonfilter -i "$PMK_MIRRORS.tmp" -t '@' >/dev/null 2>&1; then
+	if ! pmk_mirrors_valid "$PMK_MIRRORS.tmp"; then
+		rm -f "$PMK_MIRRORS.tmp"
+		echo '{"ok":false,"error":"JSON 语法无效，未保存"}'
+		return 0
+	fi
+	# 前端只提交 { mirrors: [...] }。必须补回 "version": 2，
+	# 否则存成了 v1 格式，下次读取会再次触发迁移（r7–r9 的递归挂起就是这么来的）。
+	if ! grep -q '"version": 2' "$PMK_MIRRORS.tmp"; then
+		# busybox sed 不支持 GNU 的 0,/re/ 地址，注入会静默失败并把文件存成 v1，
+		# 下次读取又触发迁移 → 用户保存的 enabled/prefix 被重置。这里用 awk 插入。
+		awk 'BEGIN { done = 0 }
+			!done {
+				i = index($0, "{")
+				if (i > 0) {
+					printf "%s\n  \"version\": 2,\n", substr($0, 1, i)
+					rest = substr($0, i + 1)
+					if (rest != "") print rest
+					done = 1
+					next
+				}
+			}
+			{ print }' "$PMK_MIRRORS.tmp" > "$PMK_MIRRORS.tmp2" && mv "$PMK_MIRRORS.tmp2" "$PMK_MIRRORS.tmp"
+	fi
+	if ! grep -q '"version": 2' "$PMK_MIRRORS.tmp"; then
+		rm -f "$PMK_MIRRORS.tmp"
+		echo '{"ok":false,"error":"无法写入 version:2，未保存（避免下次读取触发迁移）"}'
+		return 0
+	fi
+	if pmk_mirrors_valid "$PMK_MIRRORS.tmp"; then
 		mv "$PMK_MIRRORS.tmp" "$PMK_MIRRORS"
 		echo '{"ok":true}'
 	else
@@ -1365,6 +1422,8 @@ pmk_api_job() {
 case "${1:-}" in
 	status) pmk_api_status ;;
 	versions) PMK_ARGS=$(cat); pmk_api_versions ;;
+	# 安装/升级后自愈：迁移旧版 mirrors.json、清理坏文件，输出修复后的清单
+	init-state) pmk_mirrors_init; pmk_api_mirrors ;;
 	mirrors) pmk_api_mirrors ;;
 	mirror-set) PMK_ARGS=$(cat); pmk_api_mirror_set ;;
 	source-set) PMK_ARGS=$(cat); pmk_api_source_set ;;
@@ -1383,4 +1442,4 @@ case "${1:-}" in
 			*) pmk_job_fail ERR_OP "未知操作：$op" 0 ;;
 		esac
 		;;
-esac
+	esac

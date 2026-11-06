@@ -508,3 +508,37 @@ return notice ? E('div', {}, [ notice, node ]) : node;
   先 `ferry-sysupgrade remove`，升级后自愈自动装回；无法宣称 ASU 一步到位。
 - 23.05 环境未覆盖（无该镜像；23.05 也是 opkg，按 24.10 的 opkg 路径实现，未实测）。
 - x86 上内核目录必须外置；内置大内核在 `sysupgrade` 中无法保留（`/boot` 16 MB 硬限制）。
+
+## 1.0.0-r10（覆盖安装后「内置清单加载中 / 镜像源为空 / 刷新无效」）
+
+### 根因（QEMU 实测复现）
+
+- 旧版 `mirrors.json`（r6 及更早，无 `"version": 2`）触发 `pmk_mirrors_init → pmk_mirror_get → pmk_mirrors_init` 无限递归；
+  r9 上 `kernel.sh mirrors` 6 秒不返回，6 秒内出现 301 个 `kernel.sh` 进程，ubus 永不返回。
+- 前端 `loadMirrors` 没有 `catch`，`loadVersions` 被 `!state.mirrors` 门控 → 三块同时为空、永久「加载中」、刷新无效。
+- 全新安装没有旧文件，所以同一份 r9 全新安装正常 → **升级路径旧状态残留 = 证实**。
+- 排除：包缺 `kernels-builtin.tsv`（r9 ipk 37 文件含该文件，34 条可读）、ACL 完全未声明（`status`/`versions`/`mirrors` 均已声明）、浏览器缓存（LuCI 资源 URL 带 `?v=...pkgs_update_time`）。
+
+### 额外命中并修复
+
+- ACL 漏声明 `source_set` / `store_set`（LuCI 会话调用会被拒）。
+- 镜像保存用 GNU `sed 0,/re/` 注入 `version: 2`，busybox 下静默失败 → 文件写回 v1，下次读取触发迁移，用户勾选被重置。改用 `awk`。
+- `ferry-kernel-diag` 的 `generated=` 双前缀；新增 `acl_missing` 自检。
+
+### 实测（QEMU x86_64 / OpenWrt 24.10.4）
+
+- 升级矩阵：r9+v1 现场 HANG 复现；r6/r7/r8/r9(v2) → r10、r10→r10 重装 ×2、fresh r10 全部 PASS（6 条 / 5 条 / v2），`MATRIX_FAIL=0`。
+- 断网：版本清单仍 6 条、镜像 5 条；下载 job `ERR_NETWORK` 并列出已尝试源。
+- 单源 github：`chain=github` 且保存后仍为 v2。
+- tmpfs 256k：`ERR_DISK_FULL`，message 含「可用 0 MB，需要至少 138 MB」。
+- 离线回归：`test-kernel.sh` 145 项 PASS（新增第 25–32 节）；`test-luci-contract.mjs` PASS。
+
+### 出包
+
+- ipk：`luci-app-ferry_1.0.0-r10_all.ipk`，109,693 B，`bd146d826ae3434c74c3d78aa0699ea7d1deee259700a0f99dfb12d06615fae9`
+- apk：`luci-app-ferry-1.0.0-r10.apk`，109,239 B，`31c26b62e4027816765054838b4c45632e03d07f8561c5b9eefffb7e5469c5e0`
+
+### 仍未验证
+
+- 25.12（apk）本轮未重跑安装/升级矩阵（r9 时该路径 PASS；r10 仅改后端/前端资源，包结构同构）。
+- 非 x86_64 架构未实测；架构只影响清单条数，不影响链路。

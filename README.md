@@ -819,6 +819,34 @@ $(eval $(call BuildPackage,mihomo-bin))
 
 生成后必须通过内核自身门禁：sing-box `sing-box check -c <cfg> -D <cfg 目录>`，mihomo `mihomo -t -d <dir> -f <cfg>`；输出原样写入 `config-check-report.txt`，不通过不落位、不重启。
 
+### 6.4 覆盖安装（升级）后的自愈与一键诊断（1.0.0-r10 起）
+
+r5–r9 的覆盖安装有一个致命组合：旧版 `/etc/ferry/kernels/mirrors.json`（r6 及更早写的格式，没有 `"version": 2`）会触发后端迁移分支的**无限递归**（`pmk_mirrors_init → pmk_mirror_get → pmk_mirrors_init`），ubus 调用永不返回；前端 `loadMirrors` 当时没有 `catch`，`loadVersions` 又被 `!state.mirrors` 门控，于是界面永久停在「内置清单加载中」，镜像源与版本清单同时为空，点「刷新源列表」也没有任何反应。全新安装没有旧文件，所以同一份 r9 表现为正常。
+
+r10 起，安装/升级会做以下自愈（`postinst`）：
+
+| 动作 | 说明 |
+| --- | --- |
+| 清 LuCI 索引缓存 | `rm -rf /tmp/luci-indexcache*`，避免旧菜单/模块索引残留 |
+| 按清单删旧文件 | `/usr/lib/ferry/legacy-files.txt` 逐条删除（不猜路径；当前版本无被删文件，清单为空） |
+| 权限自愈 | `chmod` 后端脚本、rpcd 入口与 `kernels-builtin.tsv`（历史升级丢可执行位会让 rpcd 直接失败） |
+| 迁移旧 mirrors.json | `kernel.sh init-state` 把 v1 就地升级为 v2，并保留自定义前缀 |
+| 刷新 rpcd | 先 `reload`，5 秒后后台 `restart rpcd` + `restart uhttpd`，不阻塞本次安装 |
+| 内置清单校验 | 缺失时写系统日志 `WARN 内置版本清单缺失` |
+
+前端同时加了硬性保护：**所有后端调用 5 秒超时**，超时/未知方法/404 都会把原文写进错误态并给「重试」按钮，任何路径都不会停在「加载中」；版本清单只读包内置 `kernels-builtin.tsv`，与镜像源、网络状态完全解耦。
+
+保存镜像列表也不再写回 v1：busybox `sed` 不支持 GNU 的 `0,/re/` 地址，r10 改用 `awk` 补 `"version": 2`，避免「保存一次 → 下次读取触发迁移 → 用户勾选被重置」。
+
+**一键诊断**（随包安装，断网现场可用 `--no-net`）：
+
+```sh
+ferry-kernel-diag            # 全量：环境/空间/依赖/清单/镜像/可达性/最近 job/rpcd 冒烟
+ferry-kernel-diag --no-net   # 跳过网络探测
+```
+
+输出包含：包版本、架构、`kernel_dir` 与挂载/剩余空间、`uclient-fetch`/wget/curl/CA 状态与 HTTPS 探测 rc、内置 TSV 行数与生成日期、各内核可用条数、镜像 `selected`/`chain`、**ACL 漏声明的方法**（`acl_missing`）、每个源的可达性与 HTTP 码/耗时、最近一次 job 的 `phase/code/message` 原文。整段贴回即可定位「列表空」还是「下载失败」。
+
 **许可证**
 
 mihomo（GPL-3.0）与 sing-box（GPL-3.0）均为独立上游项目；插件仅下载**用户指定 URL** 的文件并在本地校验，不打包、不再分发其二进制，因此本插件自身仍为 **GPL-2.0**（见 `LICENSE`）。页面对此有明确提示，用户需自行确认上游许可证与当地法规。
@@ -1081,6 +1109,30 @@ ImmortalWrt 25.12.0（apk）同一脚本的 `imm` 模式全流程 PASS：mihomo 
 
 断言覆盖：procd 服务启动/停止与进程退出、菜单与 ACL JSON 就位并可被 `jsonfilter` 解析、prerm/pre-deinstall 实际执行（在包内 `uninstall.sh` 插入标记文件后卸载，标记被写出）、nft 表与 iptables 兼容链清空、TPROXY 策略路由删除、dnsmasq 上游恢复到原始值、`/etc/ferry` 与 `/etc/config/ferry` 按预期保留。
 
+### 9.1.2 覆盖安装（升级）矩阵（r10，QEMU x86_64 / OpenWrt 24.10.4）
+
+| 路径 | 旧状态构造 | 结果 |
+| --- | --- | --- |
+| r9 + v1 `mirrors.json`（用户故障现场） | r9 安装后写入无 `"version": 2` 的镜像文件 | **复现**：`kernel.sh mirrors` 6 秒不返回（递归进程 301 个）→ 前端永久「加载中」 |
+| r9 → r10 | 同上，直接覆盖安装 | PASS：版本清单 6 条、`list=builtin`、ubus mirrors ok、镜像 5 条、`mirrors.json` 已是 v2、自定义前缀 `my.example` 保留 |
+| r6 → r10 | r6 真实写入 v1 | PASS：6 条 / 5 条 / v2 |
+| r7 → r10 | — | PASS：6 条 / 5 条 / v2 |
+| r8 → r10 | — | PASS：6 条 / 5 条 / v2 |
+| r9 → r10（v2 数据） | — | PASS：6 条 / 5 条 / v2 |
+| r10 → r10 重装 ×2 | 同版本重装（对应「r9→r9」在 r10 下的对照） | PASS：6 条 / 3 条 / v2 / 下载地址可取 |
+| 全新 r10（对照） | 无旧文件 | PASS：6 条 / 5 条 / v2 |
+
+断网与最坏情况（同一 VM，`MATRIX_FAIL=0`）：
+
+| 场景 | 用户看到 | 系统日志/job |
+| --- | --- | --- |
+| GitHub 不可达 + DNS REFUSED（`uclient-fetch` rc=4，0 字节） | 版本清单仍 6 条、镜像 5 条、`chain=github ghfast ghproxy` | job `failed / ERR_NETWORK`，message「所有候选源都下载失败（已尝试：github ghfast ghproxy）；请检查网络/DNS/证书，或改用本地导入」 |
+| 只启用 github 单源 | `selected=auto`、`chain=github` | 保存后 `mirrors.json` 仍是 v2（不再被迁移重置） |
+| `/etc/ferry` 空间不足（tmpfs 256k） | 明确提示需要多少空间 | job `ERR_DISK_FULL`，message「空间不足：/mnt/tiny/kernels 可用 0 MB，需要至少 138 MB…」 |
+| 无 `ca-bundle` / 无 `libustream` | 依赖段标红 + HTTPS 探测 rc≠0 | 下载失败落 `ERR_NETWORK`，不会显示「暂无版本」 |
+
+**r10 命中并修复的真实缺陷**：① 旧 mirrors.json 迁移无限递归（列表空/永久加载中的根因）；② rpcd ACL 漏声明 `source_set`/`store_set`（LuCI 会话调用被拒）；③ 前端无 `catch`/被 `!state.mirrors` 门控（任一 RPC 失败即永久加载中）；④ busybox `sed` 不支持 `0,/re/` 导致镜像保存写回 v1、下次读取触发迁移重置用户勾选；⑤ `ferry-kernel-diag` 的 `generated=` 双前缀与 ACL 覆盖自检缺失。
+
 ### 9.2 静态检查
 
 - 所有 shell 脚本 `sh -n` 通过（init.d、common.sh、nodes.sh、rules.sh、generate.sh、firewall.sh、uci-defaults、`scripts/build.sh`、`scripts/fetch-kernel.sh`）。
@@ -1092,7 +1144,7 @@ ImmortalWrt 25.12.0（apk）同一脚本的 `imm` 模式全流程 PASS：mihomo 
 
 **离线回归**
 
-`tests/` 下 6 个脚本在当前源码上重跑，合计 174 项断言全 PASS：`test-dnsmasq.sh` 26、`test-firewall.sh` 21、`test-uninstall.sh` 26、`test-rules.sh` 26、`test-generate.sh` 20、`test-kernel.sh` 55（15 节）。
+`tests/` 下 6 个脚本在当前源码上重跑，合计 264 项断言全 PASS：`test-dnsmasq.sh` 26、`test-firewall.sh` 21、`test-uninstall.sh` 26、`test-rules.sh` 26、`test-generate.sh` 20、`test-kernel.sh` 145（32 节，含 r10 新增的升级迁移、断网、ACL、前端 404/未知方法/超时反例、镜像保存不写回 v1）。
 
 其中 `test-kernel.sh` 用本机 `http.server` 充当**下载源（mock，非外网）**，配合真实 `sing-box` / `mihomo` 二进制覆盖：全新安装与激活、安装不激活、同内核切换、回滚、跨内核切换、卸载非当前版本（含 active 指针清理）、SHA-256 不匹配不落位、缺校验需显式确认、架构不匹配拒绝、未适配版本拒绝、版本矩阵 A/B/C/D 模板字段、`sing-box check` / `mihomo -t` 门禁、作业进度写入。**mock 与真机分开标注**：这一套属于离线 mock；真机结果见 9.1.1。
 

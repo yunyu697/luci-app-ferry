@@ -539,6 +539,128 @@ case "$out" in *mipsle-softfloat*) pass "mipsle 映射到 mipsle-softfloat 资�
 out=$(sh -c '. "$0"; pmk_variants mihomo' "$SRC/kernel.sh")
 case "$out" in *amd64*) pass "本机变体列表正确：$out" ;; *) fail "变体列表缺项：$out" ;; esac
 
+echo "===== 25. 旧版 mirrors.json（覆盖安装路径）迁移不挂起 ====="
+# r6 及更早写的 mirrors.json 没有 "version": 2；r7–r9 的迁移分支
+# init→pmk_mirror_get→init 无限递归，ubus 调用永不返回（页面永远“加载中”）。
+cat > "$PMK_MIRRORS" <<'EOF2'
+{
+  "mirrors": [
+    { "name": "github", "label": "GitHub 官方", "prefix": "", "enabled": true, "official": true },
+    { "name": "custom", "label": "自定义反代", "prefix": "https://my.example/", "enabled": true, "official": false }
+  ]
+}
+EOF2
+t0=$(date +%s)
+out=$(timeout 8 sh "$SRC/kernel.sh" mirrors 2>/dev/null); rc=$?
+t1=$(date +%s)
+if [ "$rc" -eq 0 ] && [ $((t1 - t0)) -lt 8 ]; then
+	pass "旧格式迁移 $((t1 - t0))s 内返回（rc=0，不再递归挂起）"
+else
+	fail "旧格式迁移超时/失败 rc=$rc（递归回归）"
+fi
+echo "$out" | grep -q '"ok":true' && pass "迁移后 mirrors ok:true" || fail "迁移后 mirrors 非 ok：$out"
+grep -q '"version": 2' "$PMK_MIRRORS" && pass "迁移后写入 version:2" || fail "迁移后未写 version:2"
+grep -q 'my.example' "$PMK_MIRRORS" && pass "旧自定义前缀被保留" || fail "旧自定义前缀丢失"
+
+echo "===== 26. 损坏 mirrors.json（反例）：不挂起、返回合法 JSON、留备份 ====="
+printf '%s' '{"mirrors": [, broken' > "$PMK_MIRRORS"
+t0=$(date +%s)
+out=$(timeout 8 sh "$SRC/kernel.sh" mirrors 2>/dev/null); rc=$?
+t1=$(date +%s)
+if [ "$rc" -eq 0 ] && [ $((t1 - t0)) -lt 8 ]; then
+	pass "坏 JSON 下 $((t1 - t0))s 内返回"
+else
+	fail "坏 JSON 下超时/失败 rc=$rc"
+fi
+printf '%s' "$out" | python3 -c 'import json,sys; json.load(sys.stdin)' 2>/dev/null \
+	&& pass "坏 JSON 下输出仍是合法 JSON（前端 RPC 不会 reject）" || fail "输出不是合法 JSON：$out"
+echo "$out" | grep -q '"ok":' && pass "输出带 ok 字段" || fail "输出缺 ok 字段"
+[ -f "$PMK_MIRRORS.broken" ] && pass "坏文件已备份为 mirrors.json.broken" || fail "坏文件未备份"
+rm -f "$PMK_MIRRORS"
+
+echo "===== 27. 断网可用性：版本清单与镜像源都不依赖网络 ====="
+out=$(printf '{"kernel":"mihomo","prerelease":0}' | sh "$SRC/kernel.sh" versions 2>/dev/null)
+c=$(echo "$out" | grep -o '"asset"' | wc -l)
+[ "${c:-0}" -ge 1 ] && pass "离线版本清单非空（mihomo $c 条，来自内置 TSV）" \
+	|| fail "离线版本清单为空：$out"
+echo "$out" | grep -q '"list":"builtin"' && pass "清单来源标注为 builtin" || note "未标注 list=builtin"
+rm -f "$PMK_MIRRORS"
+out=$(sh "$SRC/kernel.sh" mirrors 2>/dev/null)
+n=$(echo "$out" | grep -c '"name"')
+[ "$n" -ge 3 ] && pass "默认镜像源非空（$n 条）" || fail "默认镜像源为空：$out"
+echo "$out" | grep -q '"chain"' && pass "镜像源返回 chain 字段" || fail "缺 chain 字段"
+
+echo "===== 28. 前端：5s 超时 + 错误态 + 版本不依赖镜像（静态断言） ====="
+VJS="$REPO/files/www/luci-static/resources/view/ferry/kernel.js"
+grep -q 'function rpcTimeout' "$VJS" && pass "存在 rpcTimeout 保护" || fail "缺 rpcTimeout"
+grep -q ', 5000,' "$VJS" && pass "所有请求 5s 上限" || fail "未见 5000ms 上限"
+grep -q 'if (!state.mirrors)' "$VJS" && fail "版本加载仍被镜像源阻塞（回归）" \
+	|| pass "版本清单不再依赖镜像源"
+grep -q 'state.mirrorsErr' "$VJS" && pass "镜像源错误态存在" || fail "缺镜像源错误态"
+grep -q 'state.versionsErr' "$VJS" && pass "版本清单错误态存在" || fail "缺版本错误态"
+grep -q "button('重试'" "$VJS" && pass "错误态带重试按钮" || fail "错误态缺重试按钮"
+grep -q 'state.pollErrs' "$VJS" && pass "job 轮询失败会停止并报错" || fail "job 轮询失败仍空转"
+
+echo "===== 29. rpcd 入口：watchdog + 缺失后端也返回合法 JSON ====="
+RPCD="$REPO/files/usr/libexec/rpcd/luci-ferry-kernel"
+sh -n "$RPCD" 2>/dev/null && pass "rpcd 脚本语法通过" || fail "rpcd 脚本语法错误"
+grep -q 'PMK_RPC_TIMEOUT' "$RPCD" && pass "rpcd 带后端超时保护" || fail "缺后端超时保护"
+grep -q 'sh "$K"' "$RPCD" && pass "后端用 sh 显式执行（丢可执行位也能跑）" || fail "未显式 sh 执行"
+grep -q 'unknown method' "$RPCD" && pass "未知方法有明确错误" || fail "未知方法无错误态"
+out=$(printf '{}' | sh "$RPCD" call versions 2>/dev/null)
+printf '%s' "$out" | python3 -c 'import json,sys; d=json.load(sys.stdin); assert d.get("ok") is False and d.get("error")' 2>/dev/null \
+	&& pass "后端缺失时返回 {ok:false,error}（不是空列表/挂起）" || fail "后端缺失时输出不合契约：$out"
+
+echo "===== 30. 诊断入口与升级清理清单 ====="
+DIAG="$REPO/files/usr/bin/ferry-kernel-diag"
+[ -f "$DIAG" ] && pass "ferry-kernel-diag 随包存在" || fail "缺 ferry-kernel-diag"
+sh -n "$DIAG" 2>/dev/null && pass "诊断脚本语法通过" || fail "诊断脚本语法错误"
+for k in 'uclient-fetch' 'ca_cert' 'kernel_dir' 'manifest_' 'job_message' 'ubus_versions'; do
+	grep -q "$k" "$DIAG" && pass "诊断包含 $k" || fail "诊断缺 $k"
+done
+[ -f "$REPO/files/usr/lib/ferry/legacy-files.txt" ] && pass "旧文件清单随包存在" || fail "缺旧文件清单"
+grep -q 'legacy-files.txt' "$REPO/Makefile" && pass "postinst 按清单删除旧文件" || fail "postinst 未引用清单"
+grep -q 'luci-indexcache' "$REPO/Makefile" && pass "postinst 清 LuCI 索引缓存" || fail "postinst 未清索引缓存"
+grep -q 'init-state' "$REPO/Makefile" && pass "postinst 主动迁移 mirrors.json" || fail "postinst 未迁移旧状态"
+
+echo "===== 31. ACL 覆盖 + 前端 404/未知方法/超时反例 ====="
+ACL="$REPO/files/usr/share/rpcd/acl.d/luci-app-ferry.json"
+for m in source_set store_set mirror_set versions mirrors; do
+	grep -q "\"$m\"" "$ACL" && pass "ACL 声明 $m" || fail "ACL 未声明 $m（LuCI 会话调用会被拒）"
+done
+grep -q 'acl_missing=' "$DIAG" && pass "诊断会检查 ACL 漏声明的方法" || fail "诊断未检查 ACL 覆盖"
+NODEBIN=''
+command -v node >/dev/null 2>&1 && NODEBIN=node
+if [ -z "$NODEBIN" ] && command -v node.exe >/dev/null 2>&1; then
+	NODEBIN=node.exe
+fi
+if [ -n "$NODEBIN" ]; then
+	JSE="$REPO/tests/test-kernel-ui-errors.mjs"
+	[ "$NODEBIN" = node.exe ] && JSE=$(wslpath -w "$JSE" 2>/dev/null || echo "$JSE")
+	out=$("$NODEBIN" "$JSE" 2>&1); rc=$?
+	echo "$out" | sed 's/^/  /'
+	[ "$rc" -eq 0 ] && pass "前端三种反例（超时/未知方法/404）都落到错误态" || fail "前端反例未通过"
+else
+	fail "无 node，无法运行前端反例断言"
+fi
+
+echo "===== 32. mirror-set 保存前端载荷（无 version 字段）后不触发迁移 ====="
+# 前端只提交 { mirrors: [...] }；busybox sed 不支持 0,/re/，r10 改用 awk 补 version:2。
+rm -f "$PMK_MIRRORS"
+RAW='{"mirrors":[{"name":"github","label":"GitHub 官方","prefix":"","enabled":true,"official":true},{"name":"ghfast","label":"ghfast","prefix":"https://ghfast.top/","enabled":false,"official":false}]}'
+ESC=$(printf '%s' "$RAW" | sed 's/\\/\\\\/g; s/"/\\"/g')
+out=$(printf '{"json":"%s"}' "$ESC" | sh "$SRC/kernel.sh" mirror-set 2>/dev/null)
+echo "$out" | grep -q '"ok":true' && pass "mirror-set 保存成功" || fail "mirror-set 失败：$out"
+grep -q '"version": 2' "$PMK_MIRRORS" 2>/dev/null && pass "保存时补回 version:2" || fail "保存后仍是 v1（注入失效，下次读取会迁移重置）"
+out=$(sh "$SRC/kernel.sh" mirrors 2>/dev/null)
+if [ "$(echo "$out" | sed -n 's/.*"chain":"\([^"]*\)".*/\1/p')" = "github" ]; then
+	pass "只启用 github 时 chain=github（保存结果未被迁移重置）"
+else
+	fail "chain 被迁移重置：$out"
+fi
+echo "$out" | grep -q '"name": *"ghfast"' && pass "保存的两条镜像仍在" || fail "镜像条目被迁移覆盖"
+rm -f "$PMK_MIRRORS"
+
 echo
 if [ "$FAILED" -eq 0 ]; then
 	echo "RESULT: ALL PASS（离线回归，mock 下载源 + 真实 sing-box/mihomo 二进制）"

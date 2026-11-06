@@ -17,7 +17,7 @@ include $(TOPDIR)/rules.mk
 
 PKG_NAME:=luci-app-ferry
 PKG_VERSION:=1.0.0
-PKG_RELEASE:=9
+PKG_RELEASE:=10
 
 PKG_LICENSE:=GPL-2.0-only
 PKG_MAINTAINER:=yunyu697
@@ -66,8 +66,27 @@ endef
 define Package/luci-app-ferry/postinst
 #!/bin/sh
 [ -n "$${IPKG_INSTROOT}" ] && exit 0
+# 1) LuCI 索引缓存：升级后旧索引可能让新模块解析失败（不清会话目录，不会被登出）
+rm -rf /tmp/luci-indexcache /tmp/luci-indexcache.* 2>/dev/null
+# 2) 旧版本遗留文件：按随包清单删除，不猜路径
+for f in $$(grep -v '^#' /usr/lib/ferry/legacy-files.txt 2>/dev/null); do
+	[ -e "$$f" ] && rm -rf "$$f"
+done
+# 3) 权限自愈（历史升级可能丢可执行位，rpcd 会因此 500）
+chmod 0755 /usr/lib/ferry/*.sh /usr/libexec/rpcd/luci-ferry-kernel /usr/bin/ferry-* 2>/dev/null
+chmod 0644 /usr/lib/ferry/kernels-builtin.tsv 2>/dev/null
+# 4) 旧版 mirrors.json（无 "version": 2）迁移：旧后端会在迁移分支里无限递归，
+#    新后端已修；这里主动跑一次，让升级后的第一次页面请求不再踩旧状态
+[ -s /usr/lib/ferry/kernel.sh ] && sh /usr/lib/ferry/kernel.sh init-state >/dev/null 2>&1
+[ -s /usr/lib/ferry/kernels-builtin.tsv ] || logger -t ferry "WARN 内置版本清单缺失：/usr/lib/ferry/kernels-builtin.tsv"
+# 5) 初始化（幂等）
 [ -x /etc/uci-defaults/50-ferry ] && /etc/uci-defaults/50-ferry
+# 6) 重新注册 rpcd 方法表/ACL。reload(HUP) 先做，避免直接 restart 打断
+#    正在执行的本次安装请求；随后后台 restart + uhttpd 重启确保彻底刷新
 /etc/init.d/rpcd reload >/dev/null 2>&1 || killall -HUP rpcd 2>/dev/null
+( sleep 5; /etc/init.d/rpcd restart >/dev/null 2>&1; \
+  [ -x /etc/init.d/uhttpd ] && /etc/init.d/uhttpd restart >/dev/null 2>&1 ) >/dev/null 2>&1 &
+logger -t ferry "luci-app-ferry postinst: upgrade state healed, rpcd reloaded" 2>/dev/null
 exit 0
 endef
 
@@ -97,6 +116,7 @@ define Package/luci-app-ferry/install
 	$(INSTALL_BIN) ./files/usr/lib/ferry/kernel.sh $(1)/usr/lib/ferry/kernel.sh
 	# 内置版本清单（含官方 SHA-256/大小）：离线也能列出可下载版本
 	$(INSTALL_DATA) ./files/usr/lib/ferry/kernels-builtin.tsv $(1)/usr/lib/ferry/kernels-builtin.tsv
+	$(INSTALL_DATA) ./files/usr/lib/ferry/legacy-files.txt $(1)/usr/lib/ferry/legacy-files.txt
 	$(INSTALL_DATA) ./files/lib/upgrade/keep.d/ferry $(1)/lib/upgrade/keep.d/ferry
 	$(INSTALL_BIN) ./files/usr/lib/ferry/transaction.sh $(1)/usr/lib/ferry/transaction.sh
 	$(INSTALL_BIN) ./files/usr/lib/ferry/watchdog.sh $(1)/usr/lib/ferry/watchdog.sh
@@ -106,6 +126,7 @@ define Package/luci-app-ferry/install
 	$(INSTALL_BIN) ./files/usr/bin/ferry-txnctl $(1)/usr/bin/ferry-txnctl
 	$(INSTALL_BIN) ./files/usr/bin/ferry-diag $(1)/usr/bin/ferry-diag
 	$(INSTALL_BIN) ./files/usr/bin/ferry-sysupgrade $(1)/usr/bin/ferry-sysupgrade
+	$(INSTALL_BIN) ./files/usr/bin/ferry-kernel-diag $(1)/usr/bin/ferry-kernel-diag
 
 	# 升级后首次启动自愈钩子（同时被 keep.d 保留）
 	$(INSTALL_BIN) ./files/etc/uci-defaults/60-ferry-selfheal $(1)/etc/uci-defaults/60-ferry-selfheal

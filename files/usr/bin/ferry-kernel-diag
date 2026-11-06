@@ -1,0 +1,176 @@
+#!/bin/sh
+# ferry 内核管理一键诊断（r10）
+# 用法：ferry-kernel-diag            # 全部
+#       ferry-kernel-diag --no-net   # 跳过网络探测（断网现场用）
+K=/usr/lib/ferry/kernel.sh
+STORE=/etc/ferry/kernels
+JOB=/var/etc/ferry/kernel-job.json
+TSV=/usr/lib/ferry/kernels-builtin.tsv
+NET=1
+[ "${1:-}" = "--no-net" ] && NET=0
+
+say() { echo "$*"; }
+sec() { echo; echo "== $* =="; }
+have() { command -v "$1" >/dev/null 2>&1; }
+
+# 从 JSON 字符串里取字段（jsonfilter 优先，缺失时退回 grep/sed）
+jget() { # json key
+	printf '%s' "$1" | jsonfilter -e "@.$2" 2>/dev/null | head -1
+}
+
+pkg_ver() {
+	if have apk; then
+		apk list --installed 2>/dev/null | awk -F' ' '$1 ~ /^luci-app-ferry-/ {print $1; exit}'
+		have apk && apk info -e luci-app-ferry 2>/dev/null | head -1
+	fi
+	if have opkg; then
+		opkg list-installed 2>/dev/null | awk '$1 == "luci-app-ferry" {print $1"-"$3; exit}'
+	fi
+}
+
+sec "环境"
+say "time=$(date '+%Y-%m-%d %H:%M:%S')  host=$(uname -n)"
+say "distro=$(grep -m1 DISTRIB_DESCRIPTION /etc/openwrt_release 2>/dev/null | sed 's/.*=.//; s/.$//')"
+say "package=$(pkg_ver | head -1)"
+say "arch=$(uname -m)"
+say "rpcd_object=$(ubus list luci-ferry-kernel 2>/dev/null | head -1)"
+say "backend=$K exists=$(test -f "$K" && echo yes || echo no) exec=$(test -x "$K" && echo yes || echo no)"
+say "rpcd_script=/usr/libexec/rpcd/luci-ferry-kernel exists=$(test -f /usr/libexec/rpcd/luci-ferry-kernel && echo yes || echo no)"
+say "acl=/usr/share/rpcd/acl.d/luci-app-ferry.json exists=$(test -f /usr/share/rpcd/acl.d/luci-app-ferry.json && echo yes || echo no)"
+# rpcd 列出的方法必须都在 ACL 里声明；漏声明时 LuCI 会话调用会直接被拒
+RPC=/usr/libexec/rpcd/luci-ferry-kernel
+ACL=/usr/share/rpcd/acl.d/luci-app-ferry.json
+if [ -s "$RPC" ] && [ -s "$ACL" ]; then
+	MISSING=''
+	for m in $(awk -F'"' '/^  "[a-z_]+":/ {print $2}' "$RPC"); do
+		grep -q "\"$m\"" "$ACL" || MISSING="$MISSING $m"
+	done
+	say "acl_missing=${MISSING:-none}（非空表示 LuCI 调用会被拒）"
+else
+	say "acl_missing=unknown（rpcd 脚本或 ACL 文件缺失）"
+fi
+
+sec "内核目录与空间"
+ST=$(sh "$K" status 2>/dev/null)
+[ -n "$ST" ] || ST='{}'
+KDIR=$(jget "$ST" kernel_dir); [ -n "$KDIR" ] || KDIR=$STORE
+[ -d "$KDIR" ] || KDIR=$STORE
+KDIR_CFG=$(jget "$ST" kernel_dir_cfg)
+PERSIST=$(jget "$ST" store_persist)
+DEV=$(jget "$ST" store_device)
+FREEKB=$(printf '%s' "$ST" | sed -n 's/.*"free_kb":\([0-9]*\).*/\1/p')
+say "kernel_dir=$KDIR（配置值='${KDIR_CFG}'） 存在=$(test -d "$KDIR" && echo yes || echo no) 可写=$(test -w "$KDIR" && echo yes || echo no)"
+say "persist=$PERSIST  device=$DEV  free_kb=${FREEKB:-unknown}（$(awk "BEGIN{printf \"%.1f\", ${FREEKB:-0}/1024}") MB）"
+say "df=$(df -k "$KDIR" 2>/dev/null | awk 'NR==2{print $1" mounted="substr($0, index($0,$6))}')"
+say "overlay_ok=$(test -w /etc/ferry && echo yes || echo no)  /etc/ferry 可写=$(test -w /etc && echo yes || echo no)"
+say "keepd=$(test -f /lib/upgrade/keep.d/ferry && echo installed || echo missing)"
+say "kernels_dir=$(ls -1 "$KDIR" 2>/dev/null | tr '\n' ' ')"
+
+sec "下载依赖（HTTPS/CA）"
+for c in uclient-fetch wget curl jsonfilter; do
+	have "$c" && say "$c=$(command -v $c)" || say "$c=missing"
+done
+if have opkg; then
+	opkg list-installed 2>/dev/null | grep -E '^(ca-bundle|libustream-[^ ]+|libcurl)' | sed 's/^/pkg: /'
+else
+	apk list --installed 2>/dev/null | grep -E '^(ca-bundle|libustream-[^ ]+|libcurl)' | sed 's/^/pkg: /'
+fi
+say "ca_cert=$(test -s /etc/ssl/certs/ca-certificates.crt && echo yes || echo no)"
+if have uclient-fetch; then
+	rm -f /tmp/.diag.ssl
+	uclient-fetch -q -T 8 -O /tmp/.diag.ssl https://github.com/robots.txt >/dev/null 2>&1
+	rc=$?
+	bytes=0
+	[ -f /tmp/.diag.ssl ] && bytes=$(wc -c </tmp/.diag.ssl)
+	say "uclient_https_rc=$rc bytes=$bytes（rc=1/4 且 0 字节 = 无 SSL 支持或证书/DNS 失败）"
+	rm -f /tmp/.diag.ssl
+fi
+
+sec "版本清单（内置、离线）"
+say "tsv=$TSV exists=$(test -s "$TSV" && echo yes || echo no) lines=$(grep -c . "$TSV" 2>/dev/null) rows=$(grep -vc '^#' "$TSV" 2>/dev/null)"
+say "generated=$(sed -n '1s/.*generated=//p' "$TSV" 2>/dev/null)"
+say "arch_norm=$(jget "$ST" arch)  variants=$(jget "$ST" variants)"
+V=$(printf '{"kernel":"mihomo","prerelease":0}' | sh "$K" versions 2>/dev/null)
+say "versions_ok=$(jget "$V" ok) arch=$(jget "$V" arch) variants=$(jget "$V" variants) generated=$(jget "$V" generated)"
+for kk in mihomo singbox; do
+	VR=$(printf '{"kernel":"%s","prerelease":0}' "$kk" | sh "$K" versions 2>/dev/null)
+	c=$(printf '%s' "$VR" | grep -o '"asset"' | wc -l)
+	say "manifest_${kk}_count=${c:-0} unavailable=$(jget "$VR" unavailable)"
+done
+
+sec "镜像源"
+M=$(sh "$K" mirrors 2>/dev/null)
+say "mirrors_ok=$(jget "$M" ok) selected=$(jget "$M" selected) chain=$(jget "$M" chain)"
+if [ "$(jget "$M" ok)" != "false" ]; then
+	printf '%s' "$M" | sed -n 's/.*"name":[[:space:]]*"\([^"]*\)".*/mirror: \1/p' | head -20
+else
+	say "mirrors_error=$(jget "$M" error)"
+fi
+say "broken_file=$(test -f "$STORE/mirrors.json.broken" && echo yes || echo no)"
+
+if [ "$NET" = 1 ]; then
+	sec "可达性（每个源 8s 上限）"
+	probe() { # label url
+		local label="$1" url="$2" rc t0 t1 bytes code
+		if have curl; then
+			code=$(curl -sS -o /dev/null -w '%{http_code}' --max-time 8 "$url" 2>/dev/null)
+			t0=$(date +%s); rc=$?; t1=$(date +%s)
+			say "probe[$label] url=$url http=${code:-none} rc=$rc elapsed=$((t1 - t0))s"
+		else
+			t0=$(date +%s)
+			uclient-fetch -q -T 8 -O /tmp/.diag.p "$url" >/dev/null 2>&1
+			rc=$?
+			bytes=$(wc -c </tmp/.diag.p 2>/dev/null)
+			rm -f /tmp/.diag.p
+			t1=$(date +%s)
+			say "probe[$label] url=$url rc=$rc bytes=${bytes:-0} elapsed=$((t1 - t0))s（无 curl，HTTP 码不可得）"
+		fi
+	}
+	probe github "https://github.com/robots.txt"
+	probe ghfast "https://ghfast.top/"
+	probe ghproxy "https://ghproxy.net/"
+	CUSTOM=$(jget "$M" source_selected)
+	[ "$CUSTOM" = "custom" ] && say "probe[custom] 已选用自定义源，请按上表 prefix 自行验证"
+else
+	sec "网络探测"
+	say "skipped (--no-net)"
+fi
+
+sec "最近一次任务"
+if [ -s "$JOB" ]; then
+	J=$(cat "$JOB")
+	say "job_phase=$(jget "$J" phase) code=$(jget "$J" code) done=$(jget "$J" done)"
+	say "job_message=$(jget "$J" message)"
+	say "job_raw=$J"
+else
+	say "job=none（$JOB 不存在或为空）"
+fi
+
+sec "rpcd 调用冒烟（6s 上限）"
+OUT=$(mktemp /tmp/.diag.rpc.XXXXXX 2>/dev/null) || OUT=/tmp/.diag.rpc.$$
+ubus call luci-ferry-kernel versions '{"kernel":"mihomo","prerelease":0}' >"$OUT" 2>/dev/null &
+P=$!
+I=0
+while kill -0 "$P" 2>/dev/null; do
+	if [ "$I" -ge 6 ]; then
+		kill -9 "$P" 2>/dev/null
+		say "ubus_versions=TIMEOUT（后端超过 6s 未返回：检查 /etc/init.d/rpcd restart）"
+		rm -f "$OUT"
+		return_done=1
+		P=''
+		break
+	fi
+	sleep 1
+	I=$((I + 1))
+done
+if [ -n "$P" ]; then
+	wait "$P" 2>/dev/null
+	say "ubus_versions=ok bytes=$(wc -c <"$OUT") rc=$?"
+fi
+rm -f "$OUT"
+
+sec "最近日志（ferry 相关，末尾 8 条）"
+logread 2>/dev/null | grep -iE 'ferry|mirrors.json|kernel' | tail -8
+
+echo
+say "提示：把以上输出整段贴回即可。"

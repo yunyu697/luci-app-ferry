@@ -1,0 +1,9 @@
+# 旧版本遗留文件清单（postinst 升级时按此删除；一行一个绝对路径，# 开头为注释）
+#
+# 核对结果（r5.0 → r9.0 逐 tag 比对 git 文件清单）：没有文件被删除或改名，
+# 因此本清单当前无条目。r9 的「升级后卡死」不是残留文件造成的，而是
+# /etc/ferry/kernels/mirrors.json 的旧格式（无 "version": 2）触发了
+# kernel.sh 里 pmk_mirrors_init ↔ pmk_mirror_get 的无限递归（r10 已修）。
+#
+# 以后若有文件下线，把路径追加到下面，postinst 会在升级时删掉。
+# /usr/lib/ferry/xxx.sh
