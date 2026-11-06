@@ -4,7 +4,8 @@ name: ci
 #   - shellcheck（error 级，file:line:col 输出）
 #   - 前端 JS 语法 + LuCI 类加载契约 + r11 进度/错误态静态断言
 #   - 离线回归：generate/rules/diag/mgmt/transaction/uninstall/kernel/sysupgrade/
-#     firewall/dnsmasq（全部为 fake uci/ubus/opkg 的纯离线脚本）
+#     firewall/dnsmasq（全部为 fake uci/ubus/opkg 的纯离线脚本；test-kernel 以 root 跑，
+#     tproxy inbound 绑定需要 CAP_NET_ADMIN，等同真机权限模型）
 #   - ipk/apk 构建、包内文件与 files/ 逐文件 diff/cmp、元数据版本、artifact 上传
 #
 # 明确不在 CI 覆盖（依赖 QEMU guest / 真机）：
@@ -96,7 +97,18 @@ jobs:
             test-sysupgrade.sh test-firewall.sh test-dnsmasq.sh
           do
             echo "::group::tests/$t"
-            bash "tests/$t"
+            if [ "$t" = test-kernel.sh ]; then
+              # 真机上内核由 root 启动；tproxy/redirect inbound 绑定需要 CAP_NET_ADMIN，
+              # 普通用户跑会 ERR_START（环境限制，不是功能缺陷）。runner 有免密 sudo，按真机权限跑。
+              if sudo -n true 2>/dev/null; then
+                echo "test-kernel.sh: 以 root 运行（tproxy inbound 需要 CAP_NET_ADMIN）"
+                sudo -n env KSRC="$KSRC" bash "tests/$t"
+              else
+                echo "SKIP tests/test-kernel.sh：没有 sudo/CAP_NET_ADMIN，无法启动 tproxy inbound（环境限制，非功能缺陷）" >&2
+              fi
+            else
+              bash "tests/$t"
+            fi
             echo "::endgroup::"
           done
 

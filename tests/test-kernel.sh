@@ -48,14 +48,15 @@ EOF
 cat > "$T/fake/initd-ferry" <<'EOF'
 #!/bin/sh
 # 与真机一致：pmk_kernel_running 按进程名判断，所以 mock 服务必须真正拉起内核进程
+# 内核自身输出落到 $SRV_KLOG，启动失败时可定位（例如缺少 CAP_NET_ADMIN 绑不上 tproxy）
 case "$1" in
 	start|restart)
 		echo "$1" >> "$SRV_LOG"
 		k=$(cat "$PM_TEST_UCI_STATE/ferry.main.kernel" 2>/dev/null)
 		case "$k" in
 			singbox) "$PMK_BIN_DIR/sing-box" run -c "$PM_SINGBOX_DIR/config.json" -D "$PM_SINGBOX_DIR" \
-				>/dev/null 2>&1 & ;;
-			*) "$PMK_BIN_DIR/mihomo" -d "$PM_MIHOMO_DIR" >/dev/null 2>&1 & ;;
+				>>"$SRV_KLOG" 2>&1 & ;;
+			*) "$PMK_BIN_DIR/mihomo" -d "$PM_MIHOMO_DIR" >>"$SRV_KLOG" 2>&1 & ;;
 		esac
 		echo $! > "$SRV_STATE" ;;
 	stop)
@@ -174,7 +175,7 @@ export PMK_LOCK="$T/run/kernel.lock" PMK_STAGE="$T/store/.stage" PMK_JAIL="$T/ja
 export PMK_CFG_MIHOMO="$T/etc/mihomo/config.yaml" PMK_CFG_SINGBOX="$T/etc/sing-box/config.json"
 export PM_SINGBOX_DIR="$T/etc/sing-box" PM_MIHOMO_DIR="$T/etc/mihomo"
 export PM_CONF_DIR="$T/etc/ferry" PM_RUN_DIR="$T/run"
-export SRV_STATE="$T/svc.state" SRV_LOG="$T/svc.log"
+export SRV_STATE="$T/svc.state" SRV_LOG="$T/svc.log" SRV_KLOG="$T/svc-kernel.log"
 export PM_FUNCTIONS_SH="$T/fake/functions.sh" PM_TEST_UCI_STATE="$T/uci-state"
 export PATH="$T/fake:$PATH"
 
@@ -203,6 +204,8 @@ job_is() { grep -q "\"$1\":$2" "$PMK_JOB" 2>/dev/null; }
 job_ok() { job_is ok true; }
 job_code() { sed -n 's/.*"code":"\([^"]*\)".*/\1/p' "$PMK_JOB" 2>/dev/null; }
 job_msg() { sed -n 's/.*"message":"\([^"]*\)".*/\1/p' "$PMK_JOB" 2>/dev/null; }
+# 服务启动失败时把内核自身输出打出来（否则只有 ERR_START 看不出原因）
+srv_diag() { tail -n 3 "$SRV_KLOG" 2>/dev/null | tr '\n' ' '; }
 
 run_op() { # op
 	local op=$1
@@ -231,7 +234,7 @@ note "job: $(cat "$PMK_JOB" 2>/dev/null)"
 
 echo "===== 1b. 显式切换到 sing-box v1.8.14（这一步才动 current 指针 + 重启服务） ====="
 PMK_OP_KERNEL=singbox PMK_OP_VERSION=v1.8.14 PMK_OP_RESTART=1 run_op switch
-job_ok && pass "切换 sing-box 1.8.14 成功" || fail "切换失败：$(job_code) $(job_msg)"
+job_ok && pass "切换 sing-box 1.8.14 成功" || fail "切换失败：$(job_code) $(job_msg) | $(srv_diag)"
 [ -L "$PMK_BIN_DIR/sing-box" ] && pass "启用指针 $PMK_BIN_DIR/sing-box -> $(readlink "$PMK_BIN_DIR/sing-box")" \
 	|| fail "未建立 current 启用链接"
 [ "$(cat "$T/uci-state/ferry.main.kernel")" = singbox ] && pass "uci ferry.main.kernel=singbox" \
@@ -258,7 +261,7 @@ job_ok && pass "安装 1.11.0（不启用）成功" || fail "安装 1.11.0 失�
 echo "===== 3. 切换 v1.8.14 -> v1.11.0 ====="
 PMK_OP_KERNEL=singbox PMK_OP_VERSION=v1.11.0 PMK_OP_RESTART=1 \
 	run_op switch
-job_ok && pass "切换成功" || fail "切换失败：$(job_code) $(job_msg)"
+job_ok && pass "切换成功" || fail "切换失败：$(job_code) $(job_msg) | $(srv_diag)"
 [ "$(basename "$(readlink "$PMK_STORE/singbox/active")")" = v1.11.0 ] && pass "active=v1.11.0" || fail "active 未切换"
 [ "$(basename "$(readlink "$PMK_STORE/singbox/previous")")" = v1.8.14 ] && pass "previous=v1.8.14（保留上一版本）" \
 	|| fail "previous 未记录"
@@ -270,7 +273,7 @@ note "job: $(cat "$PMK_JOB")"
 
 echo "===== 4. 回滚 -> v1.8.14 ====="
 PMK_OP_KERNEL=singbox PMK_OP_RESTART=1 run_op rollback
-job_ok && pass "回滚成功" || fail "回滚失败：$(job_code) $(job_msg)"
+job_ok && pass "回滚成功" || fail "回滚失败：$(job_code) $(job_msg) | $(srv_diag)"
 [ "$(basename "$(readlink "$PMK_STORE/singbox/active")")" = v1.8.14 ] && pass "active 回到 v1.8.14" || fail "回滚未生效"
 grep -q '"outbound":"dns-out"' "$(cfg_sb)" && pass "回滚后配置按 1.8.14 区间 A 重新生成" \
 	|| fail "回滚后配置未按旧内核重新生成"
@@ -310,7 +313,7 @@ job_ok && pass "mihomo 1.18.8 安装成功" || fail "mihomo 安装失败：$(job
 
 echo "===== 6b. 显式切换到 mihomo 1.18.8（停服务→替换→重生成→启动） ====="
 PMK_OP_KERNEL=mihomo PMK_OP_VERSION=v1.18.8 PMK_OP_RESTART=1 run_op switch
-job_ok && pass "切换到 mihomo 1.18.8 成功" || fail "切换失败：$(job_code) $(job_msg)"
+job_ok && pass "切换到 mihomo 1.18.8 成功" || fail "切换失败：$(job_code) $(job_msg) | $(srv_diag)"
 [ "$(cat "$T/uci-state/ferry.main.kernel")" = mihomo ] && pass "uci ferry.main.kernel=mihomo" || fail "uci 未切换"
 [ -L "$PMK_BIN_DIR/mihomo" ] && pass "启用指针 $PMK_BIN_DIR/mihomo" || fail "mihomo 链接缺失"
 [ -s "$(cfg_mh)" ] && pass "YAML 配置已生成 $(cfg_mh)" || fail "mihomo 配置未生成"
