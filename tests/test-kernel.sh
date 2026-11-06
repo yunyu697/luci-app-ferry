@@ -8,7 +8,7 @@ set -u
 
 REPO=$(cd "$(dirname "$0")/.." && pwd)
 SRC="$REPO/files/usr/lib/ferry"
-KSRC='/mnt/d/Users/Tyler Zhang/Documents/Trae-CN/temp_20261104_07/qemu/kernels'
+KSRC="${KSRC:-/mnt/d/Users/Tyler Zhang/Documents/Trae-CN/temp_20261104_07/qemu/kernels}"
 # 夹具目录不能放 /tmp、/var（内核目录在内存盘会被拒装，这是 r8 的保护逻辑）
 TEST_ROOT=${FERRY_TEST_ROOT:-${HOME:-/home/$(id -un)}}
 mkdir -p "$TEST_ROOT" 2>/dev/null

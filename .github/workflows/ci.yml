@@ -1,0 +1,126 @@
+name: ci
+
+# 覆盖范围（可自动化部分）：
+#   - shellcheck（error 级，file:line:col 输出）
+#   - 前端 JS 语法 + LuCI 类加载契约 + r11 进度/错误态静态断言
+#   - 离线回归：generate/rules/diag/mgmt/transaction/uninstall/kernel/sysupgrade/
+#     firewall/dnsmasq（全部为 fake uci/ubus/opkg 的纯离线脚本）
+#   - ipk/apk 构建、包内文件与 files/ 逐文件 diff/cmp、元数据版本、artifact 上传
+#
+# 明确不在 CI 覆盖（依赖 QEMU guest / 真机）：
+#   - QEMU OpenWrt guest 安装/升级矩阵、真实内核下载、WebUI headless CDP 断言
+#     （tests/luci-dom-negative.sh、ui/cdp-kernel-ui.mjs）
+#   - 真机 opkg/apk 安装与运行、代理链路、端口连通性
+#   - 真实公网下载/镜像回退（guest 无 WAN 时用本地 1:1 镜像）
+#   - 25.12 apk 在 guest 实跑（仅离线回归 + 出包）
+#
+# runner 上没有 opkg/ubus/uci：离线套件全部用 tests/ 内的 fake 实现，不依赖这些专有工具，
+# 也不会因缺工具而静默跳过断言（任何断言失败都会让 job 变红）。
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_call:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  shellcheck:
+    name: shellcheck
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install shellcheck
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y shellcheck
+          shellcheck --version
+      - name: Run shellcheck (error severity, file:line:col)
+        run: bash scripts/ci/shellcheck.sh
+
+  frontend-contract:
+    name: frontend-contract
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      - name: node --check (LuCI resources)
+        run: |
+          set -euo pipefail
+          files=$(git ls-files 'files/www/luci-static/resources/view/ferry/*.js' 'files/www/luci-static/resources/ferry/*.js')
+          [ -n "$files" ] || { echo "no JS files found" >&2; exit 1; }
+          for f in $files; do
+            echo "node --check $f"
+            node --check "$f"
+          done
+      - name: LuCI class-loader contract
+        run: node tests/test-luci-contract.mjs
+      - name: kernel UI error-state assertions (static)
+        run: node tests/test-kernel-ui-errors.mjs
+
+  offline-tests:
+    name: offline-tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      - name: Cache kernel fixtures
+        uses: actions/cache@v4
+        with:
+          path: .ci/kernels
+          key: kernel-fixtures-${{ hashFiles('scripts/ci/fetch-kernel-fixtures.sh') }}
+      - name: Fetch kernel fixtures (test only)
+        run: bash scripts/ci/fetch-kernel-fixtures.sh .ci/kernels
+      - name: Run offline regression suites
+        env:
+          KSRC: ${{ github.workspace }}/.ci/kernels
+        run: |
+          set -euo pipefail
+          for t in \
+            test-generate.sh test-rules.sh test-diag.sh test-mgmt-bypass.sh \
+            test-transaction.sh test-uninstall.sh test-kernel.sh \
+            test-sysupgrade.sh test-firewall.sh test-dnsmasq.sh
+          do
+            echo "::group::tests/$t"
+            bash "tests/$t"
+            echo "::endgroup::"
+          done
+
+  packages:
+    name: packages
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Fetch static apk-tools
+        run: bash scripts/ci/fetch-apk-tools.sh .ci/tools
+      - name: Build ipk + apk
+        run: bash scripts/ci/build-pkgs.sh dist
+      - name: Verify package contents against source tree
+        run: bash scripts/ci/verify-pkgs.sh dist
+      - name: Upload packages
+        uses: actions/upload-artifact@v4
+        with:
+          name: luci-app-ferry-packages
+          path: |
+            dist/*.ipk
+            dist/*.apk
+            dist/SHA256SUMS
+            dist/build-meta.txt
+          if-no-files-found: error

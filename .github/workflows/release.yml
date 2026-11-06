@@ -1,0 +1,87 @@
+name: release
+
+# tag v* 触发。流程：
+#   guard（tag == Makefile PKG_VERSION/PKG_RELEASE == apk pkgver，且 release-notes/<tag>.md 存在）
+#   → 复用 ci.yml（shellcheck / 前端契约 / 离线回归 / 包构建校验）
+#   → publish（用 ci 产物发布，附件 ipk/apk/SHA256SUMS，发布后重新下载复核哈希）
+#
+# 不在 CI 覆盖：QEMU guest、真机安装、真实公网下载、25.12 apk 实跑（详见 ci.yml 注释）。
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+# 同版本并发发布直接排队，避免重复创建/覆盖 Release
+concurrency:
+  group: release-${{ github.ref_name }}
+  cancel-in-progress: false
+
+jobs:
+  guard:
+    name: guard
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Tag vs Makefile version
+        run: bash scripts/ci/check-version.sh "${GITHUB_REF_NAME}"
+      - name: Release notes must exist
+        run: |
+          set -euo pipefail
+          notes="release-notes/${GITHUB_REF_NAME}.md"
+          [ -f "$notes" ] || { echo "ERROR: 缺少 $notes（不允许发空正文）" >&2; exit 1; }
+          echo "release notes: $notes ($(wc -c < "$notes") bytes)"
+
+  checks:
+    name: checks
+    uses: ./.github/workflows/ci.yml
+
+  publish:
+    name: publish
+    needs: [guard, checks]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Download CI packages
+        uses: actions/download-artifact@v4
+        with:
+          name: luci-app-ferry-packages
+          path: dist
+
+      - name: Fetch static apk-tools (for verification)
+        run: bash scripts/ci/fetch-apk-tools.sh .ci/tools
+
+      - name: Re-verify packages locally
+        run: bash scripts/ci/verify-pkgs.sh dist
+
+      - name: Create Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          tag="${GITHUB_REF_NAME}"
+          notes="release-notes/${tag}.md"
+          gh release create "$tag" \
+            --title "luci-app-ferry ${tag#v}" \
+            --notes-file "$notes" \
+            dist/*.ipk dist/*.apk dist/SHA256SUMS
+
+      - name: Download uploaded assets and verify SHA256SUMS
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          tag="${GITHUB_REF_NAME}"
+          mkdir -p verify
+          gh release download "$tag" --dir verify --clobber
+          ( cd verify && sha256sum -c SHA256SUMS )
+          echo "OK: release $tag assets match SHA256SUMS"
+          gh release view "$tag" --json url,isDraft,isPrerelease,assets \
+            --jq '{url,isDraft,isPrerelease,assets:[.assets[].name]}'

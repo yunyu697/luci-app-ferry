@@ -50,14 +50,14 @@ _redact_keys() {
 			if [ "$ere" = 1 ]; then
 				line=$(printf '%s\n' "$line" | sed -E \
 					-e "s/(\"$k\"[[:space:]]*:[[:space:]]*)\"[^\"]*\"/\\1\"***\"/g" \
-					-e "s/(option[[:space:]]+$k[[:space:]]+')[^']*/\\1***/g" \
-					-e "s/(list[[:space:]]+$k[[:space:]]+')[^']*/\\1***/g" \
-					-e "s/(^|[[:space:]])$k:[[:space:]]*[^,}[:space:]]+/\\1$k: ***/g")
+					-e "s/(option[[:space:]]+${k}[[:space:]]+')[^']*/\\1***/g" \
+					-e "s/(list[[:space:]]+${k}[[:space:]]+')[^']*/\\1***/g" \
+					-e "s/(^|[[:space:]])${k}:[[:space:]]*[^,}[:space:]]+/\\1${k}: ***/g")
 			else
 				line=$(printf '%s\n' "$line" | sed \
 					-e "s/\\(\"$k\"[[:space:]]*:[[:space:]]*\"\\)[^\"]*\"/\\1***\"/g" \
-					-e "s/\\(option[[:space:]]+$k[[:space:]]+'\\)[^']*'/\\1***'/g" \
-					-e "s/\\(list[[:space:]]+$k[[:space:]]+'\\)[^']*'/\\1***'/g")
+					-e "s/\\(option[[:space:]]+${k}[[:space:]]+'\\)[^']*'/\\1***'/g" \
+					-e "s/\\(list[[:space:]]+${k}[[:space:]]+'\\)[^']*'/\\1***'/g")
 			fi
 		done
 		printf '%s\n' "$line"

@@ -4,6 +4,9 @@ build/
 *.ipk
 *.apk
 
+# CI 本地工作目录（apk.static、staging、内核夹具）
+.ci/
+
 # 本地测试输出、缓存与日志（不纳入版本库）
 tests/out/
 tests/.cache/
