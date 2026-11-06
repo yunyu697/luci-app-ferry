@@ -336,7 +336,97 @@ sh /usr/lib/ferry/uninstall.sh --purge    # 连同用户数据一起删
 | `/etc/mihomo/config.yaml`、`/etc/sing-box/config.json` | 保留（可能是用户自备配置，脚本不删） | 保留 |
 | `/var/etc/ferry/` | 删除 | 删除 |
 
+### 4.8 升级系统（sysupgrade / attended sysupgrade）与 ferry
 
+ferry 不在 OpenWrt 官方源里，这会影响两种升级路径。下面结论全部来自 headless QEMU 实测
+（24.10.4 x86_64、25.12.0 x86_64），不是推断。
+
+#### 两种路径的真实行为（实测）
+
+| 路径 | 24.10.4（opkg + owut） | 25.12.0（apk-tools 3.0.2 + owut） |
+| --- | --- | --- |
+| attended sysupgrade（ASU，LuCI「保留配置重建」同源） | HTTP 500，`Error: Impossible package selection: missing (luci-app-ferry)` | 同一条 500，错误文本一致 |
+| 错误来源 | **服务端包索引**找不到 `luci-app-ferry`（不是本地依赖校验，也不是签名问题） | 同左 |
+| 普通 `sysupgrade` 刷下载好的镜像 | 能正常完成；未登记 keep.d 时 ferry 的包文件和 `/etc/config/ferry` 全部丢失 | 同左（`apk` 分支同样按白名单备份） |
+
+- 24.10.4 **没有** `auc`（该分支 ASU 客户端是 `owut`，`opkg install owut` 还会被签名检查拦住）；
+  用户原假设的「24.10 = apk 时代」不成立，apk 从 25.x 才开始（本报告按实测纠正）。
+- ASU 请求体带 `repositories` / `repository_keys` / `repositories_mode: replace`，说明 **API 层支持
+  自定义源与公钥**；但公共服务器 `sysupgrade.openwrt.org` 不接受我们的自签名 feed 参与构建
+  （没有公共可达的签名 feed 可做端到端验证）。因此**不能**指望 ASU 直接构建出带 ferry 的镜像。
+- 结论：ASU 路径必须「先移除 ferry 再升级」，升级完成后由首启自愈自动装回；普通 sysupgrade
+  路径同样走这套。
+
+#### 刷机前要做什么（一条命令）
+
+```sh
+ferry-sysupgrade prep            # 等价于：snapshot + 写 keep.d + 打包离线安装件
+ferry-sysupgrade verify          # 升级前自检：快照字段逐项可读
+```
+
+`prep` 依次做四件事：
+
+1. 导出配置快照到 `/etc/ferry/snapshot`（节点、规则、profile、源、端口、内核清单、订阅相关 UCI 字段）；
+2. 写 `/lib/upgrade/keep.d/ferry`（**有序清单**，顺序决定备份顺序，截断时先丢后面的）：
+
+   ```
+   /etc/uci-defaults/60-ferry-selfheal   # 首启自愈钩子（最先，最重要）
+   /etc/ferry/offline                    # 安装包本体 + payload + install-payload.sh
+   /etc/ferry/snapshot                   # 配置快照
+   /etc/config/ferry                     # UCI 配置
+   /etc/ferry                            # 其余数据（含 kernels/，放最后）
+   ```
+
+3. 把安装包（`.ipk` / `.apk`，自动从 `/tmp`、`/root` 找）与 `payload.tar.gz` 落到
+   `/etc/ferry/offline`，并生成不依赖网络的 `install-payload.sh`；
+4. 预检备份体积：x86 上备份包写在**分区 1 `/boot`（约 15.7 MB）**，超出会被截断 →
+   直接打印 `PREP WARN 备份压缩后约 N KB，超过 /boot 可用 M KB`。
+
+`prep` 打印的 `PREP WARN` 必须处理：把 `kernel_dir` 改到外置盘（见 6.3），再重新 `prep`。
+
+#### 升级后会发生什么
+
+1. 新固件首启执行 `/etc/uci-defaults/60-ferry-selfheal`；
+2. 检测包是否已安装：已装 → 直接跳过；未装 → 从 `/etc/ferry/offline` **离线**安装
+   （`opkg install` / `opkg install --force-depends`、`apk add --allow-untrusted`，
+   都没有时用 `payload.tar.gz` + `install-payload.sh` 兜底，不访问网络与官方源）；
+3. 按 `/etc/config/ferry` 的 `kernel_dir` 恢复内核目录：外置盘缺失挂载时，按 `/etc/config/fstab`
+   直接 `mount -t $fstype $device $target`（不依赖新固件是否带 `block-mount`）；
+4. 从快照恢复配置并 `enable` + `start` 服务；
+5. 自愈脚本执行完自动删除，避免每次开机重跑（下次 `prep` 会重建）。
+
+升级后核对：
+
+```sh
+ferry-sysupgrade verify          # 逐字段比对，输出 PASS/FAIL/WARN 计数
+ferry-sysupgrade verify --json   # {"ok":true,"pass":35,"fail":0,"warn":0,"total":35}
+ferry-sysupgrade restore         # 需要一键恢复时（幂等）
+```
+
+LuCI 侧同一入口在「服务 → Ferry → 升级与恢复」页（`status` / 快照导出 / 一键恢复）。
+
+#### 不要让 ferry 卡住系统升级
+
+- 本包**从不改写** `/etc/opkg/*.conf` 或 `/etc/apk/repositories`：安装 ferry 不会把官方源换成自建源，
+  因此不会出现「源被改掉 → `opkg update` / `apk update` 失败 → 系统升级卡住」。
+- 依赖不硬绑：`kmod-nft-tproxy` 等只在运行期按需检测，缺包不影响安装，也不阻塞包管理器事务。
+- 升级前想彻底移除而不丢数据：
+
+  ```sh
+  ferry-sysupgrade remove      # 卸载包（保留 /etc/config/ferry 与 kernel_dir 数据）
+  opkg remove luci-app-ferry   # 等价的纯包管理器操作；prerm 会 stop/清规则，但不删配置
+  ```
+
+  卸载脚本只清运行期副作用（服务、nft 表、策略路由、dnsmasq 上游），`/etc/config/ferry`、
+  `/etc/ferry/nodes.json`、profiles、快照、外置内核目录都保留。
+
+#### x86 的硬限制（实测）
+
+- `/lib/upgrade/platform.sh` 的 `platform_copy_config()` 把备份写到分区 1 `/boot`（15.7 MB）；
+- 62 MB mihomo 内核参与备份时：先 `tar: unexpected end of file`，恢复出的 mihomo 只有
+  `25,308,160 / 62,079,102` 字节，且 snapshot/offline/selfheal 钩子全部丢失；
+- 所以 x86 上**内置内核目录无法在 sysupgrade 中保留**，必须把 `kernel_dir` 指到外置分区
+  （`external`，独立分区，升级不需要 keep.d）。
 
 ---
 

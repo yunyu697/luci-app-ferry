@@ -1,0 +1,659 @@
+#!/bin/sh
+# ferry-sysupgrade —— 升级前快照 / 一致性校验 / 离线自动装回 / 一键恢复
+#
+# 用法：
+#   ferry-sysupgrade status          查看可升级状态（快照、保留清单、离线包、包管理器）
+#   ferry-sysupgrade snapshot        导出配置快照并自检（节点/规则/profile/内核/端口…）
+#   ferry-sysupgrade verify [--json] 升级后逐字段比对（uci / 文件 / 计数 / 内核）
+#   ferry-sysupgrade restore [--auto] 从快照恢复配置并（按需）重启服务
+#   ferry-sysupgrade prep [--pkg F]  升级前准备：keep.d + 快照 + 离线安装包/安装脚本
+#   ferry-sysupgrade remove          升级前安全移除 ferry（保留配置与内核目录）
+#   ferry-sysupgrade selfheal        首次启动自愈（由 /etc/uci-defaults/60-ferry-selfheal 调用）
+#
+# 只使用 BusyBox ash 兼容语法。
+
+FERRY_LIB=${FERRY_LIB:-/usr/lib/ferry/common.sh}
+[ -f "$FERRY_LIB" ] && . "$FERRY_LIB" 2>/dev/null
+
+PM_CONF_DIR=${PM_CONF_DIR:-/etc/ferry}
+CONF_DIR=${FERRY_CONF_DIR:-$PM_CONF_DIR}
+CFG_FILE=${FERRY_CFG_FILE:-/etc/config/ferry}
+SNAP_DIR=${FERRY_SNAP_DIR:-$CONF_DIR/snapshot}
+OFFLINE_DIR=${FERRY_OFFLINE_DIR:-$CONF_DIR/offline}
+KEEP_D=${FERRY_KEEP_D:-/lib/upgrade/keep.d/ferry}
+UCI_DEFAULTS_DIR=${FERRY_UCI_DEFAULTS_DIR:-/etc/uci-defaults}
+SELFHEAL_STUB=$UCI_DEFAULTS_DIR/60-ferry-selfheal
+PKG_NAME=${FERRY_PKG_NAME:-luci-app-ferry}
+LOG_FILE=${FERRY_LOG_FILE:-$CONF_DIR/selfheal.log}
+
+UCI=${FERRY_UCI:-uci}
+FROOT=${FERRY_ROOT:-}
+DATA_FILES="nodes.json profiles.json active nodes.lst rules.lst custom.lst mirrors.json"
+
+say() { printf '%s\n' "$*"; }
+jesc() { printf '%s' "$1" | tr -d '\r\n\t' | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g'; }
+now() { date -u '+%Y-%m-%dT%H:%M:%SZ'; }
+
+mgr() {
+	if command -v apk >/dev/null 2>&1; then echo apk; return 0; fi
+	if command -v opkg >/dev/null 2>&1; then echo opkg; return 0; fi
+	echo none
+}
+
+pkg_installed() {
+	case "$(mgr)" in
+		apk)  apk info -e "$PKG_NAME" >/dev/null 2>&1 ;;
+		opkg) opkg list-installed 2>/dev/null | grep -q "^$PKG_NAME " ;;
+		*)    [ -x /usr/bin/ferry-sysupgrade ] ;;
+	esac
+}
+
+kernel_store() {
+	local d
+	d=$($UCI -q get ferry.main.kernel_dir 2>/dev/null)
+	[ -n "$d" ] || d=$CONF_DIR/kernels
+	echo "$d"
+}
+
+count_nodes() {
+	local f="$CONF_DIR/nodes.lst"
+	[ -f "$f" ] && grep -c '^BEGIN$' "$f" 2>/dev/null || echo 0
+}
+
+count_rules() {
+	local f="$CONF_DIR/rules.lst"
+	[ -f "$f" ] && grep -c . "$f" 2>/dev/null || echo 0
+}
+
+count_profiles() {
+	if command -v jsonfilter >/dev/null 2>&1 && [ -s "$CONF_DIR/profiles.json" ]; then
+		jsonfilter -i "$CONF_DIR/profiles.json" -e '@.profiles[*].id' 2>/dev/null | grep -c . || echo 0
+	elif [ -s "$CONF_DIR/profiles.json" ]; then
+		grep -o '"id"' "$CONF_DIR/profiles.json" 2>/dev/null | wc -l | tr -d ' '
+	else
+		echo 0
+	fi
+}
+
+sha_of() { sha256sum "$1" 2>/dev/null | cut -d' ' -f1; }
+
+# 内核清单：kernel<TAB>tag<TAB>sha256<TAB>active
+kernel_manifest() {
+	local store k d t sha act
+	store=$(kernel_store)
+	for k in mihomo singbox; do
+		d="$store/$k"
+		[ -d "$d" ] || continue
+		for t in "$d"/*; do
+			[ -d "$t" ] || continue
+			case "$t" in */.stage*) continue ;; esac
+			[ -s "$t/meta" ] || continue
+			sha=$(sed -n 's/^sha256=//p' "$t/meta" | head -1)
+			act=0
+			[ -L "$d/active" ] && [ "$(basename "$(readlink "$d/active")")" = "$(basename "$t")" ] && act=1
+			printf '%s\t%s\t%s\t%s\n' "$k" "$(basename "$t")" "$sha" "$act"
+		done
+	done
+}
+
+feeds_sha() {
+	for f in /etc/opkg/distfeeds.conf /etc/apk/repositories /etc/apk/repositories.d/*.list; do
+		[ -f "$f" ] && printf '%s %s\n' "$(sha_of "$f")" "$f"
+	done
+}
+
+# ---------------------------------------------------------------------------
+# snapshot
+# ---------------------------------------------------------------------------
+cmd_snapshot() {
+	mkdir -p "$SNAP_DIR/files" || return 1
+	$UCI -q export ferry > "$SNAP_DIR/ferry.uci" 2>/dev/null || : > "$SNAP_DIR/ferry.uci"
+	$UCI -q show ferry > "$SNAP_DIR/uci.txt" 2>/dev/null || : > "$SNAP_DIR/uci.txt"
+
+	local f
+	for f in $DATA_FILES; do
+		[ -f "$CONF_DIR/$f" ] && cp -p "$CONF_DIR/$f" "$SNAP_DIR/files/$f" 2>/dev/null
+	done
+	# 自备配置（config_path）不在 /etc/ferry 时也留一份指纹
+	local cp; cp=$($UCI -q get ferry.main.config_path 2>/dev/null)
+	echo "$cp" > "$SNAP_DIR/config_path.txt"
+
+	kernel_manifest > "$SNAP_DIR/kernels.tsv"
+	feeds_sha > "$SNAP_DIR/feeds.sha256"
+
+	local rel arch kd kact
+	rel=$(sed -n 's/^DISTRIB_RELEASE=//p' /etc/openwrt_release 2>/dev/null | tr -d "'")
+	arch=$(uname -m 2>/dev/null)
+	kd=$(kernel_store)
+	kact=$(basename "$(readlink "$kd/mihomo/active" 2>/dev/null)" 2>/dev/null)
+
+	{
+		echo "version=2"
+		echo "generated=$(now)"
+		echo "release=$rel"
+		echo "arch=$arch"
+		echo "pkgmgr=$(mgr)"
+		echo "kernel_dir=$kd"
+		echo "kernel_active=$kact"
+		echo "nodes=$(count_nodes)"
+		echo "rules=$(count_rules)"
+		echo "profiles=$(count_profiles)"
+		echo "config_enabled=$($UCI -q get ferry.main.enabled 2>/dev/null)"
+		echo "cfg_sha=$(sha_of "$CFG_FILE")"
+	} > "$SNAP_DIR/meta"
+
+	( cd "$SNAP_DIR" && sha256sum meta uci.txt ferry.uci kernels.tsv feeds.sha256 config_path.txt 2>/dev/null > manifest.sha256 )
+
+	# 自检：关键项是否存在且可读
+	local rc=0 nodes rules
+	nodes=$(count_nodes); rules=$(count_rules)
+	[ -s "$CFG_FILE" ] || { say "SNAP-CHECK FAIL 缺少 $CFG_FILE"; rc=1; }
+	[ -s "$SNAP_DIR/uci.txt" ] || { say "SNAP-CHECK FAIL uci 快照为空"; rc=1; }
+	[ -d "$(kernel_store)" ] || { say "SNAP-CHECK WARN 内核目录不存在：$(kernel_store)"; }
+	if [ -z "$(kernel_manifest)" ]; then
+		say "SNAP-CHECK WARN 内核目录为空（升级后只能保留目录，不会保留内核文件）"
+	fi
+	say "SNAP-CHECK OK nodes=$nodes rules=$rules profiles=$(count_profiles) kernel_dir=$(kernel_store) cfg_sha=$(sha_of "$CFG_FILE")"
+	say "SNAPSHOT $SNAP_DIR"
+	return $rc
+}
+
+# ---------------------------------------------------------------------------
+# verify：逐字段比对
+# ---------------------------------------------------------------------------
+cmd_verify() {
+	local json=0
+	[ "${1:-}" = "--json" ] && json=1
+	local pass=0 fail=0 warn=0 total=0 line key exp act f t k
+
+	if [ ! -f "$SNAP_DIR/uci.txt" ]; then
+		say "VERIFY FAIL 没有快照：$SNAP_DIR（请先执行 ferry-sysupgrade snapshot）"
+		return 1
+	fi
+
+	$UCI -q show ferry > /tmp/ferry-uci-now.$$ 2>/dev/null
+
+	# UCI 字段逐个比对（快照里的每个 key 都必须存在且相同）
+	while IFS= read -r line; do
+		[ -n "$line" ] || continue
+		case "$line" in
+			ferry.*=*) ;;
+			*) continue ;;
+		esac
+		key=${line%%=*}
+		exp=$line
+		act=$(grep -F "$key=" /tmp/ferry-uci-now.$$ 2>/dev/null | head -1)
+		total=$((total + 1))
+		if [ -n "$act" ] && [ "$act" = "$exp" ]; then
+			pass=$((pass + 1))
+			[ "$json" = 1 ] || say "PASS $key"
+		else
+			fail=$((fail + 1))
+			[ "$json" = 1 ] || say "FAIL $key snapshot=$exp now=${act:-<缺失>}"
+		fi
+	done < "$SNAP_DIR/uci.txt"
+
+	# 新增字段（例如新版本加入的默认项）只告警，不算失败
+	while IFS= read -r line; do
+		case "$line" in
+			ferry.*=*)
+				key=${line%%=*}
+				grep -qF "$key=" "$SNAP_DIR/uci.txt" 2>/dev/null || {
+					warn=$((warn + 1))
+					[ "$json" = 1 ] || say "WARN 新增字段 $key"
+				}
+				;;
+		esac
+	done < /tmp/ferry-uci-now.$$
+
+	# 数据文件 sha 比对
+	for f in $DATA_FILES; do
+		[ -f "$SNAP_DIR/files/$f" ] || continue
+		exp=$(sha_of "$SNAP_DIR/files/$f")
+		act=$(sha_of "$CONF_DIR/$f")
+		total=$((total + 1))
+		if [ -n "$act" ] && [ "$act" = "$exp" ]; then
+			pass=$((pass + 1))
+			[ "$json" = 1 ] || say "PASS file:$f"
+		else
+			fail=$((fail + 1))
+			[ "$json" = 1 ] || say "FAIL file:$f snapshot=$exp now=${act:-<缺失>}"
+		fi
+	done
+
+	# 数量比对
+	for pair in "nodes:$(count_nodes)" "rules:$(count_rules)"; do
+		k=${pair%%:*}
+		act=${pair#*:}
+		exp=$(sed -n "s/^$k=//p" "$SNAP_DIR/meta")
+		total=$((total + 1))
+		if [ "$exp" = "$act" ]; then
+			pass=$((pass + 1))
+			[ "$json" = 1 ] || say "PASS count:$k $act"
+		else
+			fail=$((fail + 1))
+			[ "$json" = 1 ] || say "FAIL count:$k snapshot=${exp:-0} now=$act"
+		fi
+	done
+
+	# 内核清单
+	if [ -s "$SNAP_DIR/kernels.tsv" ]; then
+		while IFS="$(printf '\t')" read -r k t exp act; do
+			[ -n "$t" ] || continue
+			total=$((total + 1))
+			if [ -s "$(kernel_store)/$k/$t/meta" ]; then
+				pass=$((pass + 1))
+				[ "$json" = 1 ] || say "PASS kernel:$k/$t sha=${exp:-n/a}"
+			else
+				fail=$((fail + 1))
+				[ "$json" = 1 ] || say "FAIL kernel:$k/$t 目录缺失（内核文件未保留）"
+			fi
+		done < "$SNAP_DIR/kernels.tsv"
+	fi
+
+	# 源列表变化（升级到新发行版本来就会变，只提示）
+	if [ -s "$SNAP_DIR/feeds.sha256" ]; then
+		while read -r exp f; do
+			[ -n "$f" ] || continue
+			act=$(sha_of "$f")
+			if [ -n "$act" ] && [ "$act" != "$exp" ]; then
+				warn=$((warn + 1))
+				[ "$json" = 1 ] || say "WARN feeds:$f 已变化（固件升级正常现象，非 ferry 改写）"
+			fi
+		done < "$SNAP_DIR/feeds.sha256"
+	fi
+
+	rm -f /tmp/ferry-uci-now.$$ 2>/dev/null
+	if [ "$json" = 1 ]; then
+		printf '{"ok":%s,"pass":%d,"fail":%d,"warn":%d,"total":%d}\n' \
+			$([ "$fail" -eq 0 ] && echo true || echo false) "$pass" "$fail" "$warn" "$total"
+	else
+		say "VERIFY RESULT: ${pass}/${total} PASS, ${fail} FAIL, ${warn} WARN"
+	fi
+	[ "$fail" -eq 0 ]
+}
+
+# ---------------------------------------------------------------------------
+# restore
+# ---------------------------------------------------------------------------
+cmd_restore() {
+	local auto=0
+	[ "${1:-}" = "--auto" ] && auto=1
+	[ -f "$SNAP_DIR/ferry.uci" ] || { say "RESTORE SKIP 没有快照"; return 1; }
+
+	# 配置：快照优先，避免新固件包里的默认配置覆盖旧值
+	if [ -s "$SNAP_DIR/ferry.uci" ]; then
+		$UCI -q import ferry < "$SNAP_DIR/ferry.uci" 2>/dev/null
+		$UCI -q commit ferry 2>/dev/null
+	fi
+
+	mkdir -p "$CONF_DIR"
+	local f
+	for f in $DATA_FILES; do
+		if [ -f "$SNAP_DIR/files/$f" ]; then
+			cp -p "$SNAP_DIR/files/$f" "$CONF_DIR/$f" 2>/dev/null
+		fi
+	done
+
+	# 内核目录：外置目录只要还挂载着就不动；默认目录随 keep.d 一起恢复
+	local kd; kd=$(kernel_store)
+	if [ ! -d "$kd" ]; then
+		say "RESTORE WARN 内核目录不可用：$kd（外置存储未挂载或内核未保留）"
+	fi
+
+	local enabled; enabled=$($UCI -q get ferry.main.enabled 2>/dev/null)
+	if [ "$enabled" = 1 ] && [ -x "$FROOT/etc/init.d/ferry" ]; then
+		"$FROOT/etc/init.d/ferry" enable >/dev/null 2>&1
+		if [ "$auto" = 1 ]; then
+			"$FROOT/etc/init.d/ferry" start >/dev/null 2>&1
+			say "RESTORE 服务已启动（enabled=$enabled）"
+		else
+			say "RESTORE 配置已恢复；执行 /etc/init.d/ferry restart 生效"
+		fi
+	fi
+	say "RESTORE OK from $SNAP_DIR"
+	return 0
+}
+
+# ---------------------------------------------------------------------------
+# keep.d / 离线包
+# ---------------------------------------------------------------------------
+write_keepd() {
+	mkdir -p "$(dirname "$KEEP_D")"
+	cat > "$KEEP_D" <<'EOF'
+# ferry：固件升级（sysupgrade）备份清单
+# 顺序很重要：sysupgrade 备份可能因空间不足被截断，必须让“自愈所需的最小集合”排在前面
+# 1) 首启自愈钩子（包被新固件清掉后靠它装回）
+/etc/uci-defaults/60-ferry-selfheal
+# 2) 离线安装包/安装脚本（体积小，必须优先保留）
+/etc/ferry/offline
+# 3) 升级前快照（供逐字段比对与恢复）
+/etc/ferry/snapshot
+# 4) 配置
+/etc/config/ferry
+# 5) 节点、规则、profile、订阅/镜像设置、内核目录（体积最大，放最后）
+/etc/ferry
+EOF
+	say "KEEP.D $KEEP_D"
+}
+
+# x86 的 sysupgrade 把备份包写在 /boot 分区（通常只有 16MB），
+# 内核目录稍大就会被截断。这里提前估算并明确警告。
+preflight_backup_size() {
+	local total est_kb avail_kb tmp
+	total=$(( $(du -sk "$FROOT/etc/config/ferry" 2>/dev/null | cut -f1) + $(du -sk "$FROOT/etc/ferry" 2>/dev/null | cut -f1) ))
+	avail_kb=$(df -k "$FROOT/boot" 2>/dev/null | awk 'NR==2 {print $4}')
+	[ -n "$avail_kb" ] || return 0
+	if [ "$total" -gt 4096 ]; then
+		# 体积较大时直接实测压缩后大小，避免拍脑袋
+		tmp="/tmp/.ferry-est.$$.tgz"
+		tar -czf "$tmp" -C "${FROOT:-/}" etc/config/ferry etc/ferry 2>/dev/null
+		est_kb=$(du -k "$tmp" 2>/dev/null | cut -f1)
+		rm -f "$tmp"
+	else
+		est_kb=$((total * 6 / 10))
+	fi
+	if [ "${est_kb:-0}" -gt $((avail_kb - 1024)) ]; then
+		say "PREP WARN 备份压缩后约 ${est_kb}KB，超过 /boot 可用 ${avail_kb}KB，sysupgrade 备份会被截断"
+		say "PREP WARN x86 上请把 kernel_dir 指到外置存储（keep.d 只保留配置与离线包），或换用 /boot 分区更大的固件"
+	fi
+	return 0
+}
+
+pkg_file_list() {
+	case "$(mgr)" in
+		opkg) opkg files "$PKG_NAME" 2>/dev/null | sed -n 's#^/##p' ;;
+		# apk-tools 3 的 -L 输出不带前导 /，且首行是 “pkg contains:”
+		apk)  apk info -L "$PKG_NAME" 2>/dev/null | awk 'NF==1 && $0 !~ /:$/ { sub(/^\//,""); print }' ;;
+		*)    return 1 ;;
+	esac
+}
+
+stage_payload() {
+	mkdir -p "$OFFLINE_DIR"
+	local list="$OFFLINE_DIR/files.txt"
+	: > "$list"
+	pkg_file_list > "$list" 2>/dev/null
+	if [ ! -s "$list" ]; then
+		# 包管理器查不到时退回静态清单
+		cat > "$list" <<'EOF'
+etc/config/ferry
+etc/init.d/ferry
+etc/init.d/ferry-watchdog
+etc/uci-defaults/50-ferry
+etc/uci-defaults/60-ferry-selfheal
+lib/upgrade/keep.d/ferry
+usr/lib/ferry
+usr/bin/ferry-txnctl
+usr/bin/ferry-diag
+usr/bin/ferry-sysupgrade
+usr/libexec/rpcd/luci-ferry-kernel
+usr/libexec/rpcd/luci-ferry-safety
+usr/libexec/rpcd/luci-ferry-upgrade
+usr/share/luci/menu.d/luci-app-ferry.json
+usr/share/rpcd/acl.d/luci-app-ferry.json
+www/luci-static/resources/ferry
+www/luci-static/resources/view/ferry
+EOF
+	fi
+
+	# /etc/config/ferry 单独处理：payload 里不带用户配置，避免覆盖已保留的配置
+	grep -v '^etc/config/ferry$' "$list" > "$list.tmp" 2>/dev/null
+	[ -s "$list.tmp" ] && mv "$list.tmp" "$list"
+
+	local existing=''
+	while IFS= read -r f; do
+		[ -n "$f" ] || continue
+		[ -e "$FROOT/$f" ] && existing="$existing $f"
+	done < "$list"
+
+	# shellcheck disable=SC2086
+	tar -czf "$OFFLINE_DIR/payload.tar.gz" -C "${FROOT:-/}" $existing 2>/dev/null
+	[ -s "$OFFLINE_DIR/payload.tar.gz" ] || { say "PREP FAIL 生成离线包失败"; return 1; }
+
+	write_install_script
+	say "OFFLINE payload.tar.gz $(wc -c < "$OFFLINE_DIR/payload.tar.gz" | tr -d ' ') bytes, files=$(printf '%s\n' $existing | wc -l | tr -d ' ')"
+}
+
+write_install_script() {
+	cat > "$OFFLINE_DIR/install-payload.sh" <<'EOF'
+#!/bin/sh
+# 离线安装 ferry 文件本体（不依赖 opkg/apk 与网络）
+set -e
+ROOT=${FERRY_ROOT:-}
+DIR=$ROOT/etc/ferry/offline
+[ -s "$DIR/payload.tar.gz" ] || { echo "no payload"; exit 1; }
+SAVED=''
+if [ -f "$ROOT/etc/config/ferry" ]; then
+	SAVED=$ROOT/tmp/ferry-config-saved.$$
+	cp "$ROOT/etc/config/ferry" "$SAVED"
+fi
+tar -xzf "$DIR/payload.tar.gz" -C "${ROOT:-/}"
+if [ -n "$SAVED" ] && [ -f "$SAVED" ]; then
+	cp "$SAVED" "$ROOT/etc/config/ferry"
+	rm -f "$SAVED"
+fi
+mkdir -p "$ROOT/etc/mihomo/providers" "$ROOT/etc/sing-box" "$ROOT/var/etc/ferry"
+[ -x "$ROOT/etc/uci-defaults/50-ferry" ] && "$ROOT/etc/uci-defaults/50-ferry"
+rm -f "$ROOT/tmp/luci-indexcache"* 2>/dev/null
+"$ROOT/etc/init.d/rpcd" reload >/dev/null 2>&1 || killall -HUP rpcd 2>/dev/null || true
+echo "payload installed"
+EOF
+	chmod 755 "$OFFLINE_DIR/install-payload.sh"
+
+	# 自愈脚本：不依赖 ferry 包本身，靠 keep.d 保留
+	cat > "$OFFLINE_DIR/selfheal.sh" <<'EOF'
+#!/bin/sh
+# ferry 首次启动自愈：未安装则从保留的离线包/安装脚本装回，再恢复配置并启动服务
+CONF=${FERRY_CONF_DIR:-/etc/ferry}
+OFF=$CONF/offline
+LOG=$CONF/selfheal.log
+ROOT=${FERRY_ROOT:-}
+mkdir -p "$CONF"
+exec >> "$LOG" 2>&1
+echo "=== $(date -u '+%Y-%m-%dT%H:%M:%SZ') selfheal start"
+
+mgr() { command -v apk >/dev/null 2>&1 && echo apk || { command -v opkg >/dev/null 2>&1 && echo opkg || echo none; }; }
+installed() {
+	case "$(mgr)" in
+		apk)  apk info -e luci-app-ferry >/dev/null 2>&1 && return 0 ;;
+		opkg) opkg list-installed 2>/dev/null | grep -q '^luci-app-ferry ' && return 0 ;;
+	esac
+	# 从 payload 离线还原（包管理器里没有登记）时看标记文件
+	[ -f "$CONF/.installed-payload" ] && [ -x "$ROOT/usr/bin/ferry-sysupgrade" ]
+}
+
+if installed; then
+	echo "already installed ($(mgr))"
+else
+	PKG=''
+	for f in "$OFF"/*.ipk "$OFF"/*.apk; do
+		[ -f "$f" ] && PKG=$f && break
+	done
+	ok=0
+	if [ -n "$PKG" ]; then
+		case "$(mgr)" in
+			opkg)
+				opkg install "$PKG" >/dev/null 2>&1 && ok=1
+				[ "$ok" = 1 ] || { echo "opkg install failed, retry --force-depends"; opkg install --force-depends "$PKG" >/dev/null 2>&1 && ok=1; }
+				;;
+			apk)
+				apk add --allow-untrusted "$PKG" >/dev/null 2>&1 && ok=1
+				;;
+		esac
+		echo "pm-install $(mgr) pkg=$PKG ok=$ok"
+	fi
+	if [ "$ok" != 1 ]; then
+		if [ -x "$OFF/install-payload.sh" ]; then
+			sh "$OFF/install-payload.sh" >/dev/null 2>&1 && ok=2
+			[ "$ok" = 2 ] && date -u '+%Y-%m-%dT%H:%M:%SZ' > "$CONF/.installed-payload"
+			echo "payload-install ok=$ok"
+		fi
+	fi
+	[ "$ok" != 0 ] || echo "SELFHEAL FAIL: no package and no payload"
+fi
+
+# 外置内核目录：先按 /etc/config/fstab 把对应设备挂上（新固件可能没装 block-mount）
+ensure_kernel_dir() {
+	kd=$(uci -q get ferry.main.kernel_dir)
+	case "$kd" in /*) ;; *) return 0 ;; esac
+	[ -z "$(ls -A "$kd" 2>/dev/null)" ] || return 0
+	for s in $(uci -q show fstab 2>/dev/null | sed -n 's/^fstab\.\([^.]*\)\.target=.*/\1/p'); do
+		t=$(uci -q get "fstab.$s.target")
+		[ "$t" = "$kd" ] || continue
+		dev=$(uci -q get "fstab.$s.device")
+		fs=$(uci -q get "fstab.$s.fstype")
+		[ -n "$dev" ] || continue
+		mkdir -p "$kd"
+		mount -t "${fs:-ext4}" "$dev" "$kd" && echo "kernel-dir mounted $dev -> $kd"
+	done
+}
+ensure_kernel_dir
+
+# 恢复配置（快照存在时逐项导入）
+if [ -x "$ROOT/usr/bin/ferry-sysupgrade" ]; then
+	"$ROOT/usr/bin/ferry-sysupgrade" restore --auto >> "$LOG" 2>&1
+elif [ -s "$CONF/snapshot/ferry.uci" ]; then
+	uci -q import ferry < "$CONF/snapshot/ferry.uci" && uci -q commit ferry
+	[ -x "$ROOT/etc/init.d/ferry" ] && "$ROOT/etc/init.d/ferry" enable >/dev/null 2>&1
+fi
+
+# 钩子自我复制：uci-defaults 执行成功后会删除脚本，下次升级还要用
+mkdir -p "$ROOT/etc/uci-defaults"
+[ -f "$OFF/uci-defaults-selfheal" ] && cp "$OFF/uci-defaults-selfheal" "$ROOT/etc/uci-defaults/60-ferry-selfheal" 2>/dev/null
+chmod 755 "$ROOT/etc/uci-defaults/60-ferry-selfheal" 2>/dev/null
+
+[ -x "$ROOT/etc/init.d/ferry" ] && "$ROOT/etc/init.d/ferry" enable >/dev/null 2>&1
+echo "=== selfheal done"
+exit 0
+EOF
+	chmod 755 "$OFFLINE_DIR/selfheal.sh"
+
+	# 钩子本体副本（供自愈后重新落盘）
+	cat > "$OFFLINE_DIR/uci-defaults-selfheal" <<'EOF'
+#!/bin/sh
+# ferry 升级后首次启动自愈钩子（由 keep.d 保留）
+[ -x /etc/ferry/offline/selfheal.sh ] && /etc/ferry/offline/selfheal.sh
+exit 0
+EOF
+	chmod 755 "$OFFLINE_DIR/uci-defaults-selfheal"
+
+	mkdir -p "$UCI_DEFAULTS_DIR"
+	cp "$OFFLINE_DIR/uci-defaults-selfheal" "$SELFHEAL_STUB"
+	chmod 755 "$SELFHEAL_STUB"
+}
+
+stage_package() {
+	local src="$1"
+	[ -f "$src" ] || { say "PREP WARN 包文件不存在：$src"; return 1; }
+	mkdir -p "$OFFLINE_DIR"
+	case "$src" in
+		*.apk) cp "$src" "$OFFLINE_DIR/luci-app-ferry.apk" ;;
+		*.ipk) cp "$src" "$OFFLINE_DIR/luci-app-ferry.ipk" ;;
+		*) say "PREP WARN 只接受 .ipk / .apk：$src"; return 1 ;;
+	esac
+	say "OFFLINE package $(basename "$src") -> $OFFLINE_DIR"
+}
+
+# ---------------------------------------------------------------------------
+# prep / remove / selfheal / status
+# ---------------------------------------------------------------------------
+cmd_prep() {
+	local pkg=''
+	while [ $# -gt 0 ]; do
+		case "$1" in
+			--pkg) pkg=$2; shift 2 ;;
+			*) shift ;;
+		esac
+	done
+	cmd_snapshot || return 1
+	write_keepd
+	preflight_backup_size
+	stage_payload || return 1
+	if [ -z "$pkg" ]; then
+		# 自动找现成的包文件（用户手动上传到 /tmp 或 /root 的情况）
+		for f in /tmp/*ferry*.ipk /root/*ferry*.ipk /tmp/*ferry*.apk /root/*ferry*.apk; do
+			[ -f "$f" ] && pkg=$f && break
+		done
+	fi
+	[ -n "$pkg" ] && stage_package "$pkg"
+	say "PREP OK 快照=$(du -k "$SNAP_DIR" 2>/dev/null | cut -f1)KB 离线=$(du -k "$OFFLINE_DIR" 2>/dev/null | cut -f1)KB"
+	return 0
+}
+
+cmd_remove() {
+	cmd_prep || return 1
+	local m; m=$(mgr)
+	case "$m" in
+		opkg) opkg remove "$PKG_NAME" >/dev/null 2>&1 ;;
+		apk)  apk del "$PKG_NAME" >/dev/null 2>&1 ;;
+		*)    say "REMOVE SKIP 未知包管理器" ;;
+	esac
+	# 包管理器可能删掉 conffiles：立刻用快照补回
+	if [ ! -s "$CFG_FILE" ] && [ -s "$SNAP_DIR/ferry.uci" ]; then
+		$UCI -q import ferry < "$SNAP_DIR/ferry.uci" 2>/dev/null
+		$UCI -q commit ferry 2>/dev/null
+		say "REMOVE 已用快照恢复 $CFG_FILE"
+	fi
+	mkdir -p "$CONF_DIR"
+	rm -f "$CONF_DIR/.installed-payload"
+	pkg_installed && say "REMOVE WARN 包仍存在" || say "REMOVE OK ferry 已移除（配置与内核目录保留）"
+	say "REMOVE 保留：$CFG_FILE /etc/ferry keep.d=$KEEP_D"
+	[ -x "$FROOT/etc/init.d/ferry" ] && say "REMOVE WARN init 脚本仍在（包未真正移除）"
+	return 0
+}
+
+cmd_selfheal() {
+	if [ -x "$OFFLINE_DIR/selfheal.sh" ]; then
+		sh "$OFFLINE_DIR/selfheal.sh"
+	else
+		say "SELFHEAL SKIP 没有 $OFFLINE_DIR/selfheal.sh（请先 ferry-sysupgrade prep）"
+		return 1
+	fi
+}
+
+cmd_status() {
+	local m; m=$(mgr)
+	say "package_manager: $m"
+	pkg_installed && say "package: installed" || {
+		if [ -f "$CONF_DIR/.installed-payload" ] && [ -x "$FROOT/usr/bin/ferry-sysupgrade" ]; then
+			say "package: installed (payload 离线还原，未登记到 $(mgr))"
+		else
+			say "package: absent"
+		fi
+	}
+	[ -d "$SNAP_DIR" ] && say "snapshot: $SNAP_DIR ($(sed -n 's/^generated=//p' "$SNAP_DIR/meta" 2>/dev/null))" || say "snapshot: none"
+	[ -s "$KEEP_D" ] && say "keep.d: $KEEP_D ($(grep -vc '^#' "$KEEP_D" 2>/dev/null) 项)" || say "keep.d: none"
+	local n=0 f
+	for f in "$OFFLINE_DIR"/*.ipk "$OFFLINE_DIR"/*.apk; do [ -f "$f" ] && n=$((n + 1)); done
+	[ -f "$OFFLINE_DIR/payload.tar.gz" ] && n=$((n + 1))
+	say "offline: $n 个可离线安装项"
+	[ -x "$SELFHEAL_STUB" ] && say "selfheal hook: present" || say "selfheal hook: 已在本轮首启执行并清理（下次升级前 prep 会重建）"
+	say "kernel_dir: $(kernel_store)"
+	[ -f "$LOG_FILE" ] && say "last selfheal: $(tail -2 "$LOG_FILE" 2>/dev/null | tr '\n' ' ')"
+	return 0
+}
+
+case "${1:-}" in
+	snapshot) shift; cmd_snapshot "$@" ;;
+	verify)   shift; cmd_verify "$@" ;;
+	restore)  shift; cmd_restore "$@" ;;
+	prep)     shift; cmd_prep "$@" ;;
+	remove)   shift; cmd_remove "$@" ;;
+	selfheal) shift; cmd_selfheal "$@" ;;
+	status)   shift; cmd_status "$@" ;;
+	*)
+		cat <<'EOF'
+ferry-sysupgrade —— 升级前快照 / 一致性校验 / 离线自动装回
+
+  status              查看快照、保留清单、离线包与包管理器
+  snapshot            导出配置快照并自检
+  verify [--json]     升级后逐字段比对
+  restore [--auto]    从快照恢复配置（--auto 同时启动服务）
+  prep [--pkg F]      升级前准备：keep.d + 快照 + 离线安装包/安装脚本
+  remove              安全移除 ferry（保留配置与内核目录），之后可做 ASU 重建
+  selfheal            首次启动自愈（通常由 /etc/uci-defaults/60-ferry-selfheal 调用）
+EOF
+		exit 1
+		;;
+esac

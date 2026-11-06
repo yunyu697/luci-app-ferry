@@ -144,7 +144,7 @@ return view.extend({
 			if (s.store_persist === 'rootfs')
 				add(boxStatus, warn('内核目录在 overlay 上：sysupgrade 只保留 /etc/sysupgrade.conf 与 /lib/upgrade/keep.d 登记的路径。'
 					+ (s.keepd_installed ? '本插件已登记 keep.d，升级时会打进备份（当前 ' + Math.round((s.store_backup_kb || 0) / 1024)
-						+ ' MB，备份过大可能导致升级失败，建议放外置存储）。' : '但本机没有 keep.d 登记，升级固件会丢内核，请重装本插件或改目录。'));
+						+ ' MB，备份过大可能导致升级失败，建议放外置存储）。' : '但本机没有 keep.d 登记，升级固件会丢内核，请重装本插件或改目录。')));
 		}
 
 		function renderInstallTable() {
@@ -571,7 +571,7 @@ return view.extend({
 				+ ((state.versionsMeta && state.versionsMeta.generated) || '未知') + '。下载会按当前源顺序回退；'
 				+ 'SHA-256 不匹配、架构不符、glibc 依赖、磁盘不足都会直接失败且不落位，旧版本保留可回滚。'
 				+ ((state.versionsMeta && state.versionsMeta.unavailable)
-					? '已隐藏 ' + state.versionsMeta.unavailable + ' 条源上不可用的资产（审计标记 dead，不展示以免点了才失败）。' : ''));
+					? '已隐藏 ' + state.versionsMeta.unavailable + ' 条源上不可用的资产（审计标记 dead，不展示以免点了才失败）。' : '')));
 			if (state.versionsErr) add(boxInstall, warn(state.versionsErr));
 		}
 

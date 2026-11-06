@@ -1,0 +1,49 @@
+#!/bin/sh
+# rpcd 后端：升级前快照 / 一致性校验 / 一键恢复 / 离线装回
+# rpcd 脚本协议：$1 为 "list" 或 "call"；"call" 时 $2 才是方法名。
+
+jesc() { printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g' | tr '\n' ' '; }
+
+run() { # 输出命令文本并包成 JSON
+	local out rc
+	out=$("$@" 2>&1)
+	rc=$?
+	printf '{"ok":%s,"rc":%d,"output":"%s"}\n' \
+		$([ "$rc" -eq 0 ] && echo true || echo false) "$rc" "$(jesc "$out")"
+}
+
+case "$1" in
+	list)
+		cat <<'EOF'
+{
+  "status": {},
+  "snapshot": {},
+  "verify": {},
+  "restore": {},
+  "prep": {},
+  "remove": {}
+}
+EOF
+		;;
+	call)
+		CLI=/usr/bin/ferry-sysupgrade
+		if [ ! -x "$CLI" ]; then
+			echo '{"ok":false,"rc":1,"output":"ferry-sysupgrade missing"}'
+			exit 0
+		fi
+		case "$2" in
+			status)   run "$CLI" status ;;
+			snapshot) run "$CLI" snapshot ;;
+			verify)   run "$CLI" verify --json ;;
+			restore)  run "$CLI" restore ;;
+			prep)     run "$CLI" prep ;;
+			remove)   run "$CLI" remove ;;
+			*)
+				echo '{"ok":false,"rc":1,"output":"unknown method"}'
+				;;
+		esac
+		;;
+	*)
+		echo '{"ok":false,"rc":1,"output":"unknown method"}'
+		;;
+esac

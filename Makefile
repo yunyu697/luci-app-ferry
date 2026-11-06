@@ -17,7 +17,7 @@ include $(TOPDIR)/rules.mk
 
 PKG_NAME:=luci-app-ferry
 PKG_VERSION:=1.0.0
-PKG_RELEASE:=8
+PKG_RELEASE:=9
 
 PKG_LICENSE:=GPL-2.0-only
 PKG_MAINTAINER:=yunyu697
@@ -105,11 +105,16 @@ define Package/luci-app-ferry/install
 	$(INSTALL_DIR) $(1)/usr/bin
 	$(INSTALL_BIN) ./files/usr/bin/ferry-txnctl $(1)/usr/bin/ferry-txnctl
 	$(INSTALL_BIN) ./files/usr/bin/ferry-diag $(1)/usr/bin/ferry-diag
+	$(INSTALL_BIN) ./files/usr/bin/ferry-sysupgrade $(1)/usr/bin/ferry-sysupgrade
+
+	# 升级后首次启动自愈钩子（同时被 keep.d 保留）
+	$(INSTALL_BIN) ./files/etc/uci-defaults/60-ferry-selfheal $(1)/etc/uci-defaults/60-ferry-selfheal
 
 	# rpcd 后端（内核管理 / 事务与诊断）
 	$(INSTALL_DIR) $(1)/usr/libexec/rpcd
 	$(INSTALL_BIN) ./files/usr/libexec/rpcd/luci-ferry-kernel $(1)/usr/libexec/rpcd/luci-ferry-kernel
 	$(INSTALL_BIN) ./files/usr/libexec/rpcd/luci-ferry-safety $(1)/usr/libexec/rpcd/luci-ferry-safety
+	$(INSTALL_BIN) ./files/usr/libexec/rpcd/luci-ferry-upgrade $(1)/usr/libexec/rpcd/luci-ferry-upgrade
 
 	# 节点/profile 持久化目录（节点与 profile 不入 UCI）
 	$(INSTALL_DIR) $(1)/etc/ferry/rules-cache/mihomo
@@ -140,6 +145,8 @@ define Package/luci-app-ferry/install
 		$(1)/www/luci-static/resources/view/ferry/kernel.js
 	$(INSTALL_DATA) ./files/www/luci-static/resources/view/ferry/safety.js \
 		$(1)/www/luci-static/resources/view/ferry/safety.js
+	$(INSTALL_DATA) ./files/www/luci-static/resources/view/ferry/upgrade.js \
+		$(1)/www/luci-static/resources/view/ferry/upgrade.js
 
 	$(INSTALL_DIR) $(1)/www/luci-static/resources/ferry
 	$(INSTALL_DATA) ./files/www/luci-static/resources/ferry/links.js \

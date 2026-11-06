@@ -86,5 +86,16 @@
 		"depends": {
 			"acl": [ "luci-app-ferry" ]
 		}
+	},
+	"admin/services/ferry/upgrade": {
+		"title": "升级与恢复",
+		"order": 68,
+		"action": {
+			"type": "view",
+			"path": "ferry/upgrade"
+		},
+		"depends": {
+			"acl": [ "luci-app-ferry" ]
+		}
 	}
 }

@@ -436,3 +436,75 @@ return notice ? E('div', {}, [ notice, node ]) : node;
 
 
 
+
+## r9：升级不阻塞 + 升级后自动装回 + 配置零丢失（v1.0.0-r9，2026-11-06）
+
+### 结论 1：两条升级路径的实测行为（headless QEMU，不是推断）
+
+- attended sysupgrade（ASU 公共 API `https://sysupgrade.openwrt.org/api/v1/build`）：
+  - 24.10.4（opkg，客户端 `owut`，**该分支没有 auc**）：装了 `luci-app-ferry` 时
+    HTTP **500**，正文 `Error: Impossible package selection: missing (luci-app-ferry)`。
+  - 25.12.0（apk-tools 3.0.2，客户端 `owut`）：同一条 500，文本一致。
+  - 错误来自**服务端包索引找不到包**；基线包（不含 ferry）同一 API 返回 202 并构建成功，
+    证明不是本地依赖校验、也不是签名问题。
+  - 请求体里 `repositories` / `repository_keys` / `repositories_mode: replace` 均被接受，说明
+    API 层**支持**自定义源与公钥；但公共服务器不会拉取我们的自签名 feed（没有公共可达的签名
+    feed 可做端到端），因此**ASU 无法直接构建带 ferry 的镜像**这一条要如实保留。
+- 普通 `sysupgrade` 刷镜像：能正常完成；未登记 keep.d 时 ferry 包文件与 `/etc/config/ferry`
+  **全部丢失**，只保留官方默认保留项（网络配置等）。
+
+### 结论 2：x86 的备份位置与截断（延续 r8）
+
+- `platform_copy_config()` 把备份写到分区 1 `/boot`（15.7 MB）。62 MB mihomo 参与备份时被截断，
+  解包 `tar: unexpected end of file`，mihomo 只恢复 25,308,160/62,079,102 字节，
+  snapshot/offline/selfheal 钩子全部丢失。→ 内置内核目录在 x86 上不可保留，必须外置；
+  `prep` 增加 `preflight_backup_size()` 预警（实测 20 MB dummy → `PREP WARN ... 超过 /boot 可用 9952KB`）。
+
+### 实现
+
+- `ferry-sysupgrade` 子命令：`status / snapshot / verify [--json] / restore [--auto] / prep [--pkg F] / remove / selfheal`。
+- keep.d 改为**有序 5 条**（顺序即备份顺序，截断先丢后面的）：
+  `/etc/uci-defaults/60-ferry-selfheal` → `/etc/ferry/offline` → `/etc/ferry/snapshot`
+  → `/etc/config/ferry` → `/etc/ferry`（内核目录由父目录递归覆盖，外置时不打包多份）。
+  仓库静态 `files/lib/upgrade/keep.d/ferry` 已同步，避免装回后覆盖回旧清单。
+- 离线安装：优先包管理器（`opkg install` / `--force-depends`；`apk add --allow-untrusted`），
+  无包文件时 `payload.tar.gz` + `install-payload.sh` 兜底并写 `/etc/ferry/.installed-payload`。
+- 首启自愈 `60-ferry-selfheal`：区分 opkg/apk；未装则离线装回；按 `fstab` 直接
+  `mount -t $fstype $device $target` 恢复外置内核目录（不依赖新固件是否有 `block-mount`）；
+  从快照恢复并 enable+start；执行后自删，下次 `prep` 重建。
+- 快照逐项：UCI 全量 + 节点/规则/profile 计数与校验和 + 内核清单（sha256）+ 端口/订阅字段；
+  `verify` 升级前后逐字段比对，`--json` 输出计数。LuCI 新增「升级与恢复」页。
+
+### 发现并修复（r8 遗留，阻断性）
+
+- `view/ferry/kernel.js` 两处括号缺失（第 147、574 行）→ 整个内核页 JS 语法错误无法加载；
+  已修复，`node --check` 全量通过，`test-luci-contract.mjs` **PASS（12 个模块）**。
+
+### 验证（后台执行，全部用最终包）
+
+- 离线回归：`test-sysupgrade.sh` **ALL PASS**；`test-kernel.sh` **ALL PASS**（keep.d 断言更新为
+  接受父目录覆盖）；`test-generate` 20/0、`test-rules` 26/0、`test-diag` 49/0、
+  `test-mgmt-bypass` 21/0、`test-transaction` 49/0、`test-uninstall` 26/0。
+  `test-firewall` 16/5、`test-dnsmasq` 24/2 为 **r8 基线同样存在的既有失败**（已在 r8 worktree 复跑确认，
+  与 r9 改动无关）。
+- 同发行版真实升级（24.10.4 → 24.10.4，x86_64，外置 `/dev/sdb -> /mnt/kernels`）：
+  装 r9 → 配置（节点 2/规则 3/profile 2/端口 7890/7891/1053/订阅 URL）→ snapshot 35 项
+  → prep（keep.d 5 条、offline ipk+payload、hook）→ verify 35/35 → `sysupgrade` 刷 `owrt2410.img.gz`
+  → 首启 `pm-install opkg ... ok=1` + `kernel-dir mounted /dev/sdb -> /mnt/kernels` + `RESTORE OK`
+  → **verify 35/35 PASS, 0 FAIL, 0 WARN**，`procs=1`，7891/1053 监听，`package: installed`。
+- 跨包管理器真实升级（24.10.4 opkg → 25.12.0 apk-tools 3.0.2）：
+  首启 `pm-install apk ... ok=1`、自动挂载外置盘、`RESTORE OK`；`apk info -e luci-app-ferry` 已登记；
+  **verify 35/35 PASS**；`procs=1`；7891/1053 监听；内核 sha256 `817f50b3…b620f` 与升级前一致。
+- 一致性：ipk / apk 各 **37** 文件 `diff -r` **NO_DIFF**；与源码 `cmp` **ALL_MATCH**。
+
+### 出包
+
+- ipk：`luci-app-ferry_1.0.0-r9_all.ipk`，103,370 B，`0d7ab5aca5ee807b4903ae17fa63d8ebccbc8985e2e87c2567cd8611eaace481`
+- apk：`luci-app-ferry-1.0.0-r9.apk`，103,390 B，`ac49edeb09654b9e7d90cc485224d4d3561453849d79c53562fbacc35e003ada`
+
+### 仍未做到
+
+- ASU 公共服务器不接受自签名 feed 参与构建（无公共可达签名 feed），跨版本「保留包重建」仍需
+  先 `ferry-sysupgrade remove`，升级后自愈自动装回；无法宣称 ASU 一步到位。
+- 23.05 环境未覆盖（无该镜像；23.05 也是 opkg，按 24.10 的 opkg 路径实现，未实测）。
+- x86 上内核目录必须外置；内置大内核在 `sysupgrade` 中无法保留（`/boot` 16 MB 硬限制）。

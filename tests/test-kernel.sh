@@ -486,10 +486,11 @@ echo "$out" | grep -q '"size":[1-9]' && pass "清单含资产大小（用于下�
 
 echo "===== 21. sysupgrade 保留：keep.d 登记 ====="
 keepd="$REPO/files/lib/upgrade/keep.d/ferry"
-if [ -s "$keepd" ] && grep -q '^/etc/ferry/kernels$' "$keepd"; then
-	pass "随包 keep.d 登记内核目录：$(grep -v '^#' "$keepd" | tail -1)"
+# r9 起 keep.d 收敛为有序清单，内核目录由父目录 /etc/ferry 递归覆盖（外置时不会打包多份）
+if [ -s "$keepd" ] && grep -qE '^/etc/ferry(/kernels)?$' "$keepd"; then
+	pass "随包 keep.d 登记内核目录（含父目录覆盖）：$(grep -v '^#' "$keepd" | tail -1)"
 else
-	fail "keep.d 缺失或未登记 /etc/ferry/kernels"
+	fail "keep.d 缺失或未登记 /etc/ferry/kernels 或 /etc/ferry"
 fi
 grep -q 'keep.d/ferry' "$REPO/Makefile" && pass "Makefile 安装 keep.d" || fail "Makefile 未安装 keep.d"
 PMK_KEEP_D="$T/keepd-none" sh -c '. "$0"; pmk_api_status' "$SRC/kernel.sh" | grep -q '"keepd_installed":false' \

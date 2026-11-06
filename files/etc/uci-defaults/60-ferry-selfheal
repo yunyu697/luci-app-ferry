@@ -1,0 +1,7 @@
+#!/bin/sh
+# ferry 升级后首次启动自愈钩子（由 /lib/upgrade/keep.d/ferry 登记保留）
+# 新固件里 ferry 包会被清掉：从 /etc/ferry/offline 离线装回，再恢复配置并启动服务。
+# 已安装时自愈脚本会跳过安装，只做配置核对/恢复。
+[ -x /etc/ferry/offline/selfheal.sh ] || exit 0
+/etc/ferry/offline/selfheal.sh
+exit 0

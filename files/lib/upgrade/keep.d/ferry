@@ -1,6 +1,12 @@
-# ferry: sysupgrade 保留插件专属内核目录（<内核>/<版本>/ + active/previous/current 指针）
-# 机制：OpenWrt sysupgrade 只会备份 /etc/sysupgrade.conf 与 /lib/upgrade/keep.d/* 里列出的路径，
-# overlay 上的其它文件在升级时全部丢弃（实测见 F1-PROGRESS r8）。
-# 注意：内核是几十 MB 的二进制，打进备份会显著增大升级包；建议把 ferry.main.kernel_dir
-# 指到外置存储（如 /mnt/sda1/ferry-kernels），那样无需依赖本文件。
-/etc/ferry/kernels
+# ferry：固件升级（sysupgrade）备份清单
+# 顺序很重要：sysupgrade 备份可能因空间不足被截断，必须让“自愈所需的最小集合”排在前面
+# 1) 首启自愈钩子（包被新固件清掉后靠它装回）
+/etc/uci-defaults/60-ferry-selfheal
+# 2) 离线安装包/安装脚本（体积小，必须优先保留）
+/etc/ferry/offline
+# 3) 升级前快照（供逐字段比对与恢复）
+/etc/ferry/snapshot
+# 4) 配置
+/etc/config/ferry
+# 5) 节点、规则、profile、订阅/镜像设置、内核目录（体积最大，放最后）
+/etc/ferry

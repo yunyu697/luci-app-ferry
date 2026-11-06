@@ -5,7 +5,8 @@
 			"uci": [ "ferry" ],
 			"ubus": {
 				"luci-ferry-kernel": [ "list", "status", "versions", "job", "mirrors", "mirror_test", "preview" ],
-				"luci-ferry-safety": [ "status" ]
+				"luci-ferry-safety": [ "status" ],
+				"luci-ferry-upgrade": [ "status", "snapshot", "verify" ]
 			},
 			"file": {
 				"/etc/ferry/nodes.json": [ "read" ],
@@ -27,7 +28,8 @@
 			"ubus": {
 				"service": [ "reload", "list" ],
 				"luci-ferry-kernel": [ "list", "status", "versions", "job", "start", "remove", "mirrors", "mirror_set", "mirror_test", "preview" ],
-				"luci-ferry-safety": [ "status", "confirm", "rollback", "disable", "enable", "diag", "diag_download" ]
+				"luci-ferry-safety": [ "status", "confirm", "rollback", "disable", "enable", "diag", "diag_download" ],
+				"luci-ferry-upgrade": [ "status", "snapshot", "verify", "restore", "prep", "remove" ]
 			},
 			"file": {
 				"/etc/ferry/nodes.json": [ "write" ],
@@ -37,7 +39,8 @@
 				"/etc/ferry/custom.lst": [ "write" ],
 				"/etc/init.d/ferry": [ "exec" ],
 				"/usr/bin/ferry-txnctl": [ "exec" ],
-				"/usr/bin/ferry-diag": [ "exec" ]
+				"/usr/bin/ferry-diag": [ "exec" ],
+				"/usr/bin/ferry-sysupgrade": [ "exec" ]
 			}
 		}
 	}
