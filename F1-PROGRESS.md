@@ -310,5 +310,61 @@ return notice ? E('div', {}, [ notice, node ]) : node;
   环境类 `Failed to send request: Operation not permitted`），复跑 **PASS=80 FAIL=0**。
 - r5 Release 已追加「勘误（2026-11-06）」，说明 r5 的「保留表单骨架」在真实失败时不成立，指向 r6。
 
+## r7：内核管理下载修复 + 插件专属内核目录（v1.0.0-r7，2026-11-06）
+
+### 「下载不了内核」的真实原因（实测定位）
+
+1. **代码缺陷（主因）**：`kernel.sh` 的 CLI `versions` 分支没有读取 stdin，而 `PMK_ARGS` 又被
+   `PMK_ARGS=''` 清空，rpcd 传入的 `kernel` 参数丢失，接口恒定返回
+   `{"ok":false,"error":"unknown kernel"}` —— 界面拿不到版本列表，下载入口等于不存在。
+   （QEMU guest 内用 r6 包实测复现：`kernel.sh versions` → unknown kernel。）
+2. **只有官方源**：`mirrors` 清单默认仅启用 GitHub 官方源；本次在受限网络实测官方资产
+   `302 → 连接重置`（curl code=000，16s 失败），没有镜像就没有可用路径。
+3. **临时目录与空间检查错位**：下载临时文件写 `/var/etc/ferry`（tmpfs），空间预检却查 flash。
+4. **落位到 `/usr/bin`**：会覆盖系统已有的 mihomo / sing-box / xray，且插件升级/卸载易误删。
+
+### 修复
+
+- 内置源清单 `files/usr/lib/ferry/kernels-builtin.tsv`（34 条资产记录，官方 SHA-256 + 大小）：
+  官方 `github` / `ghfast.top` / `ghproxy.net` 默认启用 + jsDelivr（仅仓库内文件，默认关闭）+ custom。
+  `auto` 模式按序回退，任务与界面标注「已回退到 X 源」；**校验基准始终是官方 SHA-256**，
+  镜像侧车 `.sha256` 永不采信，镜像给错/给旧文件会被 `ERR_SHA_MISMATCH` 拦住。
+- 插件专属目录：`/etc/ferry/kernels/<内核>/<版本>/<二进制>` + `<内核>/active`、`previous` 指针
+  + `kernels/current` 运行指针；启动从插件目录取二进制，不依赖 PATH；`common.sh` 的
+  `pm_kernel_bin()` 优先 current 指针。升级不丢内核；卸载默认保留并提示，`--purge-kernels` 才删。
+- 下载保护：按目标大小 ×6 + 8 MB 预检空间（报错含可用/所需 MB）；临时文件 → SHA-256 →
+  权限 → 目录级原子替换，失败回滚保留旧版本。
+- 架构与变体：amd64 / arm64 / armv7 / armv6 / mipsle / mips / 386 / riscv64，含 ELF 大小端判定；
+  架构不符直接列出本机可用变体；glibc 依赖的资产拒装。
+- 界面（`kernel.js`）：架构、版本列表（大小 + 官方 SHA-256，打开页面自动加载内置清单）、
+  当前源、进度、可读失败原因、重试（沿用上次参数）、已装版本与路径；新增二进制来源/内核目录/
+  current 指针/系统内核/可用空间。
+- `build_ipk.py`：`VERSION` 从 `1.0.0-r5` 修正为 `1.0.0-r7`（此前 r6 的包文件名是 r6、
+  control 里仍写 r5，属发布元数据缺陷）。`Makefile` `PKG_RELEASE` 6 → 7，
+  `kernels-builtin.tsv` 进入安装清单。
+
+### 验证（后台执行）
+
+- 离线回归 `tests/test-kernel.sh` 20 组：**PASS=80 FAIL=0**（新增 16–20 共 5 组 22 条断言：
+  内置源清单、自动回退与 fallback 标注、镜像旧文件被 SHA-256 拦截、插件目录且不覆盖系统内核、
+  离线版本清单）。反例覆盖：校验失败不落位、架构不匹配、空间不足、镜像旧文件、回退。
+- **真实网络端到端**（WSL 宿主，非 mock）：`ghfast.top` 15s 下载 22,893,972 B →
+  官方 SHA-256 `386508bf…22b6` 校验通过 → 落位 `store/mihomo/v1.19.33/`（62,079,102 B）→
+  current 指针 → `mihomo -v` 输出 `Mihomo Meta v1.19.33 linux amd64`，`rc=0`，
+  job `source=ghfast fallback=false`。
+- 源可用性实测（同一资产）：`ghfast.top` 200（15s 全量）；`ghproxy.net` 200 可下载但 25s 仅 5.8 MB；
+  官方 GitHub `302` 后连接重置；jsDelivr 默认关闭（仅能映射仓库内文件）。
+- smoke（OpenWrt 24.10.4 x86_64 headless QEMU，`--suite smoke`）：3 次 **78/2、79/1、85/1**，
+  唯一 FAIL 恒为 `00-router-net.sh` 的 WAN TCP 探测（`uclient-fetch` →
+  `Failed to send request: Operation not permitted`，WSL+slirp 环境类，与 r5/r6 同源）；
+  安装段扩到 23 条断言并全绿（含 `kernels-builtin.tsv` 34 条、包元数据版本 = 1.0.0-r7）。
+
+### 出包与门禁
+
+- ipk：`luci-app-ferry_1.0.0-r7_all.ipk`，91,981 B，`d5e188b94f3fd9cd84bd086cfdb55409757b0f755a0c439f7ed91ceabc2286c1`
+- apk：`luci-app-ferry-1.0.0-r7.apk`，91,856 B，`410eb30d912e1c2666128b936f2bdde9081f0e0eb62355517849a91b878c4102`
+- 一致性：ipk / apk 各 32 文件 `diff -r` **NO_DIFF**；与源码逐文件 `cmp` **ALL_MATCH**。
+- ipk control：`Version: 1.0.0-r7`；apk adbdump：`version: 1.0.0-r7`（与发布版本一致）。
+
 
 

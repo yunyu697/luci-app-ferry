@@ -81,10 +81,31 @@ else
 fi
 
 for f in /etc/init.d/ferry /etc/init.d/ferry-watchdog /usr/lib/ferry/transaction.sh \
-	/usr/lib/ferry/watchdog.sh /usr/bin/ferry-txnctl /usr/bin/ferry-diag \
-	/usr/libexec/rpcd/luci-ferry-safety; do
+	/usr/lib/ferry/watchdog.sh /usr/lib/ferry/kernel.sh /usr/bin/ferry-txnctl \
+	/usr/bin/ferry-diag /usr/libexec/rpcd/luci-ferry-safety \
+	/usr/libexec/rpcd/luci-ferry-kernel; do
 	[ -x "$f" ] && ok "installed $f" || bad "missing $f"
 done
+
+# 内置版本/源清单必须随包安装（否则「下载不了内核」会复发）
+if [ -s /usr/lib/ferry/kernels-builtin.tsv ]; then
+	ok "installed /usr/lib/ferry/kernels-builtin.tsv"
+	N=$(grep -vc '^#' /usr/lib/ferry/kernels-builtin.tsv)
+	[ "$N" -ge 10 ] && ok "内置资产清单条目 $N 条" || bad "内置资产清单条目过少（$N）"
+	grep -q '^# generated=' /usr/lib/ferry/kernels-builtin.tsv \
+		&& ok "内置清单含生成日期" || bad "内置清单缺生成日期"
+else
+	bad "missing /usr/lib/ferry/kernels-builtin.tsv"
+fi
+
+# 包元数据版本必须与发布版本一致（r6 曾出现文件名 r6、control 仍是 r5）
+if [ "$KIND" = ipk ]; then
+	V=$(sed -n 's/^Version: //p' /usr/lib/opkg/info/luci-app-ferry.control 2>/dev/null)
+else
+	V=$(apk info -e luci-app-ferry 2>/dev/null | head -1)
+fi
+echo "installed_version=$V"
+echo "$V" | grep -q '1\.0\.0-r7' && ok "包元数据版本 = 1.0.0-r7" || bad "包元数据版本异常（$V）"
 
 command -v nft >/dev/null 2>&1 && ok "nft 可用" || bad "nft 缺失"
 nft list tables >/dev/null 2>&1 && ok "nft 内核接口可用" || bad "nft 不可用"
