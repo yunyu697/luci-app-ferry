@@ -9,12 +9,13 @@ var callPreview = rpc.declare({ object: 'luci-ferry-kernel', method: 'preview', 
 var callStart = rpc.declare({
 	object: 'luci-ferry-kernel', method: 'start',
 	params: [ 'op', 'kernel', 'version', 'urls', 'file', 'sha256', 'expect_version',
-	          'mirror', 'allow_unverified', 'activate', 'restart', 'force' ]
+	          'mirror', 'size', 'allow_unverified', 'activate', 'restart', 'force' ]
 });
 var callRemove = rpc.declare({ object: 'luci-ferry-kernel', method: 'remove', params: [ 'kernel', 'version' ] });
 var callMirrors = rpc.declare({ object: 'luci-ferry-kernel', method: 'mirrors' });
 var callMirrorSet = rpc.declare({ object: 'luci-ferry-kernel', method: 'mirror_set', params: [ 'json' ] });
 var callMirrorTest = rpc.declare({ object: 'luci-ferry-kernel', method: 'mirror_test', params: [ 'name' ] });
+var callSourceSet = rpc.declare({ object: 'luci-ferry-kernel', method: 'source_set', params: [ 'name' ] });
 
 /* sing-box 配置模板矩阵（与 generate.sh 的 pm_sb_bucket 保持一致）
  * 每个区间都用真实二进制做过 `sing-box check`，见 README 的“sing-box 版本矩阵”。 */
@@ -26,12 +27,12 @@ var SB_BUCKETS = {
 };
 
 var ERR_TEXT = {
-	ERR_NETWORK:      '下载失败（网络不可达或源不可用），可换镜像或改用本地导入',
-	ERR_SHA_MISMATCH: 'SHA-256 校验不通过，文件已丢弃',
-	ERR_UNVERIFIED:   '该版本官方未提供 checksum，需要勾选“允许未校验安装”',
-	ERR_ARCH:         '二进制架构与本机不匹配',
+	ERR_NETWORK:      '所有下载源都失败（含内置加速镜像）。请检查网络/DNS/证书，或换一个源重试',
+	ERR_SHA_MISMATCH: 'SHA-256 与官方值不一致（镜像可能给了错误或旧文件），文件已丢弃、未安装',
+	ERR_UNVERIFIED:   '官方未提供 SHA-256，安装被拦截；确认来源可信才可勾选“允许未校验安装”',
+	ERR_ARCH:         '二进制架构与本机不匹配，请选择对应变体（详情见失败原因）',
 	ERR_LIBC:         '二进制依赖 glibc，本固件为 musl',
-	ERR_DISK_FULL:    '磁盘空间不足（至少需要 8MB 可用）',
+	ERR_DISK_FULL:    '磁盘空间不足（详情里给出可用/所需 MB）',
 	ERR_EXTRACT:      '解压失败或包内没有可执行文件',
 	ERR_EXEC:         '二进制无法执行（架构或依赖不匹配）',
 	ERR_VERSION_MISMATCH: '二进制版本与所选版本不一致',
@@ -55,6 +56,7 @@ return baseclass.extend({
 	callMirrors: callMirrors,
 	callMirrorSet: callMirrorSet,
 	callMirrorTest: callMirrorTest,
+	callSourceSet: callSourceSet,
 
 	bucketOf: function(version) {
 		var m = String(version || '').match(/([0-9]+)\.([0-9]+)/);

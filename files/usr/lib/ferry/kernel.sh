@@ -1,34 +1,41 @@
 #!/bin/sh
 # ferry 内核管理：版本库、下载校验、原子替换、切换与回滚
 #
-# 数据落位：
+# 数据落位（全部在插件专属目录，不写 /usr/bin、不覆盖系统已有内核）：
 #   $PMK_STORE/<kernel>/<tag>/{<bin>,meta}   已安装版本（持久化，重启保留）
-#   $PMK_STORE/<kernel>/active -> <tag>      当前启用版本
+#   $PMK_STORE/<kernel>/active -> <tag>      该内核当前启用版本
 #   $PMK_STORE/<kernel>/previous -> <tag>    回滚目标（上一版本）
-#   /usr/bin/<bin> -> $PMK_STORE/.../<bin>   实际运行路径（符号链接，原子替换）
-#   $PMK_STORE/mirrors.json                  可编辑镜像源列表
+#   $PMK_STORE/current/<bin> -> ../<kernel>/<tag>/<bin>
+#                                            服务实际执行路径（current 指针，原子替换）
+#   $PMK_STORE/mirrors.json                  源清单（官方 + 内置加速镜像）
+#   $PMK_LIB_DIR/kernels-builtin.tsv         内置版本清单（含官方 SHA-256/大小）
 #
 # 所有会改变运行态的操作都走 job：写 $PMK_JOB，由 rpcd 侧轮询进度。
 
 PMK_STORE=${PMK_STORE:-/etc/ferry/kernels}
+PMK_CUR=${PMK_CUR:-$PMK_STORE/current}
+PMK_BIN_DIR=${PMK_BIN_DIR:-$PMK_CUR}
+PMK_SYS_BIN_DIR=${PMK_SYS_BIN_DIR:-/usr/bin}
 PMK_RUN=${PMK_RUN:-/var/etc/ferry}
-PMK_BIN_DIR=${PMK_BIN_DIR:-/usr/bin}
 PMK_LIB_DIR=${PMK_LIB_DIR:-/usr/lib/ferry}
 PMK_UCI=${PMK_UCI:-uci}
 PMK_SERVICE=${PMK_SERVICE:-/etc/init.d/ferry}
 PMK_MIRRORS=${PMK_MIRRORS:-$PMK_STORE/mirrors.json}
+PMK_BUILTIN=${PMK_BUILTIN:-$PMK_LIB_DIR/kernels-builtin.tsv}
 PMK_JOB=${PMK_JOB:-$PMK_RUN/kernel-job.json}
 PMK_LOCK=${PMK_LOCK:-$PMK_RUN/kernel.lock}
 PMK_STAGE=${PMK_STAGE:-$PMK_STORE/.stage}
 PMK_JAIL=${PMK_JAIL:-/tmp/kernel-jail}
+PMK_FETCH_TIMEOUT=${PMK_FETCH_TIMEOUT:-600}
 PMK_CFG_MIHOMO=${PMK_CFG_MIHOMO:-/etc/mihomo/config.yaml}
 PMK_CFG_SINGBOX=${PMK_CFG_SINGBOX:-/etc/sing-box/config.json}
 
 # 后台任务子进程（sh $PMK_LIB_DIR/kernel.sh run）需要继承这些路径；
 # 默认值不变，仅在离线测试时用环境变量覆盖
-export PMK_STORE PMK_RUN PMK_BIN_DIR PMK_LIB_DIR PMK_UCI PMK_SERVICE PMK_MIRRORS \
-	PMK_JOB PMK_LOCK PMK_STAGE PMK_JAIL PMK_CFG_MIHOMO PMK_CFG_SINGBOX
-export PM_BIN_DIR="$PMK_BIN_DIR" PM_RUN_DIR="$PMK_RUN"
+export PMK_STORE PMK_CUR PMK_BIN_DIR PMK_SYS_BIN_DIR PMK_RUN PMK_LIB_DIR PMK_UCI \
+	PMK_SERVICE PMK_MIRRORS PMK_BUILTIN PMK_JOB PMK_LOCK PMK_STAGE PMK_JAIL \
+	PMK_FETCH_TIMEOUT PMK_CFG_MIHOMO PMK_CFG_SINGBOX
+export PM_BIN_DIR="$PMK_BIN_DIR" PM_RUN_DIR="$PMK_RUN" PM_KERNEL_DIR="$PMK_CUR"
 
 pmk_log() { logger -t ferry-kernel -- "$*" 2>/dev/null; echo "$*" >&2; }
 
@@ -83,6 +90,40 @@ pmk_arch_family() {
 	esac
 }
 
+# 本机可用的资产变体（界面展示用：mihomo 的 mipsle-softfloat / arm64 等）
+pmk_variants() {
+	local k arch
+	k=$(pmk_norm_kernel "$1"); arch=$(pmk_host_arch)
+	case "$k:$arch" in
+		mihomo:amd64) echo 'amd64-compatible amd64' ;;
+		mihomo:arm64) echo 'arm64' ;;
+		mihomo:armv7) echo 'armv7' ;;
+		mihomo:armv6) echo 'armv6' ;;
+		mihomo:mipsle) echo 'mipsle-softfloat mipsle-hardfloat' ;;
+		mihomo:mips) echo 'mips-softfloat mips-hardfloat' ;;
+		mihomo:386) echo '386' ;;
+		mihomo:riscv64) echo 'riscv64' ;;
+		singbox:*) echo "$arch" ;;
+		*) echo unknown ;;
+	esac
+}
+
+# 二进制架构与本机是否兼容：优先精确匹配，再容忍 ELF 无法区分的同族
+pmk_arch_ok() { # host binarch endian
+	local h="$1" b="$2" e="${3:-}"
+	[ "$b" = "$h" ] && return 0
+	case "$h:$b" in
+		armv6:arm|armv7:arm) return 0 ;;
+		# e_machine 都是 8（EM_MIPS），只能靠大小端区分；端序未知时放行，交给 -v 执行验证
+		mips:mips|mipsle:mips)
+			case "$h:$e" in
+				mips:le|mipsle:be) return 1 ;;
+			esac
+			return 0 ;;
+	esac
+	return 1
+}
+
 pmk_size() { wc -c < "$1" 2>/dev/null | tr -d ' '; }
 
 # 精简固件不一定有 timeout（busybox 未编译该 applet），退化为直接执行
@@ -111,11 +152,24 @@ pmk_elf_arch() {
 	[ -f "$1" ] || { echo unknown; return 1; }
 	mkdir -p "$PMK_RUN"
 	dd if="$1" bs=1 skip=18 count=2 2>/dev/null > "$d"
-	for pair in 'amd64:\076\000' 'arm64:\267\000' 'arm:\050\000' '386:\003\000' 'riscv64:\363\000' 'mips:\010\000'; do
+	for pair in 'amd64:\076\000' 'arm64:\267\000' 'arm:\050\000' '386:\003\000' 'riscv64:\363\000' 'mips:\010\000' 'mips:\000\010'; do
 		name=${pair%%:*}; esc=${pair#*:}
 		printf "$esc" > "$e"
 		if cmp -s "$d" "$e"; then echo "$name"; return 0; fi
 	done
+	echo unknown
+}
+
+# ELF EI_DATA（offset 5：1=小端 2=大端）；mips 与 mipsle 的 e_machine 相同，只能靠它区分
+pmk_elf_endian() {
+	local d="$PMK_RUN/elf-data.bin" e="$PMK_RUN/elf-data.exp"
+	[ -f "$1" ] || { echo unknown; return 1; }
+	mkdir -p "$PMK_RUN"
+	dd if="$1" bs=1 skip=5 count=1 2>/dev/null > "$d"
+	printf '\001' > "$e"
+	cmp -s "$d" "$e" && { echo le; return 0; }
+	printf '\002' > "$e"
+	cmp -s "$d" "$e" && { echo be; return 0; }
 	echo unknown
 }
 
@@ -177,10 +231,11 @@ pmk_unlock() { rm -rf "$PMK_LOCK"; }
 
 pmk_job_set() { # phase message bytes done ok code version
 	PMK_JOB_PHASE=$1 PMK_JOB_MSG=$2
-	printf '{"id":"%s","op":"%s","kernel":"%s","version":"%s","phase":"%s","message":"%s","bytes":%s,"done":%s,"ok":%s,"code":"%s","started":"%s","updated":"%s"}\n' \
+	printf '{"id":"%s","op":"%s","kernel":"%s","version":"%s","phase":"%s","message":"%s","bytes":%s,"done":%s,"ok":%s,"code":"%s","source":"%s","fallback":%s,"started":"%s","updated":"%s"}\n' \
 		"$(pmk_esc "$PMK_JOB_ID")" "$(pmk_esc "$PMK_JOB_OP")" "$(pmk_esc "$PMK_JOB_KERNEL")" \
 		"$(pmk_esc "${7:-$PMK_JOB_VERSION}")" "$(pmk_esc "$1")" "$(pmk_esc "$2")" "${3:-0}" "${4:-false}" \
-		"${5:-null}" "$(pmk_esc "$6")" "$PMK_JOB_START" "$(date -u +%H:%M:%S)" > "$PMK_JOB.tmp" 2>/dev/null &&
+		"${5:-null}" "$(pmk_esc "$6")" "$(pmk_esc "${PMK_JOB_SRC:-}")" "${PMK_JOB_FALLBACK:-false}" \
+		"$PMK_JOB_START" "$(date -u +%H:%M:%S)" > "$PMK_JOB.tmp" 2>/dev/null &&
 		mv "$PMK_JOB.tmp" "$PMK_JOB"
 }
 
@@ -209,32 +264,131 @@ pmk_free_kb() {
 	echo "${kb:-0}"
 }
 
-# ---------- 镜像源 ----------
+# ---------- 源清单（官方 + 内置加速镜像） ----------
 
-pmk_mirrors_init() {
-	mkdir -p "$PMK_STORE"
-	[ -f "$PMK_MIRRORS" ] || cat > "$PMK_MIRRORS" <<'EOF'
+# 默认清单：官方源 + 两个实测可用的 GitHub 加速前缀（ghfast.top / ghproxy.net），
+# 另附 jsDelivr（只能映射仓库内文件，Release 资产通常 404，默认关闭）。
+# 镜像只改变传输路径，不改变校验：SHA-256 始终取官方值。
+pmk_mirrors_default() { # custom-prefix
+	cat <<EOF
 {
+  "version": 2,
   "mirrors": [
-    { "name": "github", "label": "GitHub 官方", "prefix": "", "enabled": true, "official": true },
-    { "name": "ghproxy", "label": "ghproxy 加速", "prefix": "https://ghproxy.net/", "enabled": false, "official": false },
-    { "name": "custom", "label": "自定义反代", "prefix": "", "enabled": false, "official": false }
+    { "name": "github", "label": "GitHub 官方", "prefix": "", "enabled": true, "official": true, "kind": "official" },
+    { "name": "ghfast", "label": "ghfast.top 加速", "prefix": "https://ghfast.top/", "enabled": true, "official": false, "kind": "prefix" },
+    { "name": "ghproxy", "label": "ghproxy.net 加速", "prefix": "https://ghproxy.net/", "enabled": true, "official": false, "kind": "prefix" },
+    { "name": "jsdelivr", "label": "jsDelivr（仅仓库内文件）", "prefix": "https://cdn.jsdelivr.net/gh/", "enabled": false, "official": false, "kind": "jsdelivr" },
+    { "name": "custom", "label": "自定义反代", "prefix": "${1:-}", "enabled": false, "official": false, "kind": "prefix" }
   ]
 }
 EOF
+}
+
+pmk_mirror_get() { # name field
+	local line
+	pmk_mirrors_init
+	if command -v jsonfilter >/dev/null 2>&1; then
+		jsonfilter -i "$PMK_MIRRORS" -e "@.mirrors[@.name=\"$1\"].$2" 2>/dev/null
+		return 0
+	fi
+	# 无 jsonfilter（离线/测试环境）时按行解析默认清单结构，避免镜像被误判为未配置
+	line=$(grep -F "\"name\": \"$1\"" "$PMK_MIRRORS" 2>/dev/null | head -1)
+	[ -n "$line" ] || return 0
+	case "$2" in
+		enabled|official)
+			printf '%s' "$line" | grep -q "\"$2\": true" && echo true || echo false ;;
+		*)
+			printf '%s\n' "$line" | sed -n "s/.*\"$2\": \"\([^\"]*\)\".*/\1/p" ;;
+	esac
+}
+
+pmk_mirrors_init() {
+	local old_custom=''
+	mkdir -p "$PMK_STORE"
+	if [ -s "$PMK_MIRRORS" ]; then
+		grep -q '"version": 2' "$PMK_MIRRORS" && return 0
+		# 旧版清单（只有官方+disabled 的 ghproxy）升级为内置多源；
+		# 保留用户填过的自定义前缀，其余按新默认值重建
+		local old_custom
+		old_custom=$(pmk_mirror_get custom prefix | sed 's/[\\"]/ /g')
+	fi
+	pmk_mirrors_default "$old_custom" > "$PMK_MIRRORS.tmp" 2>/dev/null &&
+		mv "$PMK_MIRRORS.tmp" "$PMK_MIRRORS"
 	return 0
+}
+
+pmk_mirror_names() {
+	pmk_mirrors_init
+	grep -o '"name"[[:space:]]*:[[:space:]]*"[^"]*"' "$PMK_MIRRORS" 2>/dev/null |
+		sed 's/.*"name"[[:space:]]*:[[:space:]]*"//; s/"$//'
+}
+
+pmk_mirror_enabled() { pmk_mirror_get "$1" enabled; }
+
+pmk_source_label() { # name -> 界面可读名称
+	local l
+	l=$(pmk_mirror_get "$1" label)
+	[ -n "$l" ] || l="$1"
+	echo "$l"
 }
 
 pmk_mirror_prefix() { # name -> prefix
 	pmk_mirrors_init
 	[ "$1" = github ] && { echo ''; return 0; }
-	jsonfilter -i "$PMK_MIRRORS" -e "@.mirrors[@.name=\"$1\"].prefix" 2>/dev/null
+	pmk_mirror_get "$1" prefix
+}
+
+pmk_source_selected() { # 当前选定的下载源（auto 表示按顺序自动回退）
+	local sel
+	sel=$($PMK_UCI -q get ferry.main.kernel_mirror 2>/dev/null)
+	case "$sel" in
+		''|auto) echo auto ;;
+		*) case "$sel" in *[!A-Za-z0-9_-]*) echo auto ;; *) echo "$sel" ;; esac ;;
+	esac
+}
+
+# 候选源顺序：显式选定的源优先，其余按清单顺序自动回退
+pmk_source_chain() { # selected
+	local sel="${1:-auto}" n out=''
+	case "$sel" in *[!A-Za-z0-9_-]*) sel='' ;; esac
+	[ "$sel" = auto ] && sel=''
+	for n in $(pmk_mirror_names); do
+		if [ -n "$sel" ] && [ "$n" = "$sel" ]; then
+			out="$sel $out"
+			continue
+		fi
+		[ "$(pmk_mirror_enabled "$n")" = true ] || continue
+		[ "$n" = custom ] && [ -z "$(pmk_mirror_prefix custom)" ] && continue
+		out="$out $n"
+	done
+	out=$(echo "$out" | sed 's/^ *//; s/  */ /g')
+	[ -n "$out" ] || out=github
+	echo "$out"
 }
 
 pmk_source_url() { # url mirror
-	local url="$1" mirror="$2" prefix
+	local url="$1" mirror="$2" prefix kind u user rest repo tag file
 	[ "$mirror" = github ] && { echo "$url"; return 0; }
 	prefix=$(pmk_mirror_prefix "$mirror")
+	kind=$(pmk_mirror_get "$mirror" kind)
+	[ -n "$kind" ] || kind=prefix
+
+	if [ "$kind" = jsdelivr ]; then
+		case "$url" in
+			https://github.com/*/releases/download/*/*)
+				u=${url#https://github.com/}
+				user=${u%%/*}; rest=${u#*/}
+				repo=${rest%%/*}; rest=${rest#*/}
+				rest=${rest#releases/download/}
+				tag=${rest%%/*}; file=${rest#*/}
+				[ -n "$user" ] && [ -n "$repo" ] && [ -n "$tag" ] && [ -n "$file" ] || return 1
+				echo "${prefix%/}/${user}/${repo}@${tag}/${file}"
+				return 0 ;;
+		esac
+		# jsDelivr 无法映射 Release 资产：明确跳过，而不是伪装成官方源
+		return 1
+	fi
+
 	if [ -z "$prefix" ]; then
 		pmk_log "镜像 $mirror 未配置前缀，改用官方源"
 		echo "$url"
@@ -261,13 +415,14 @@ pmk_fetch_cmd() {
 }
 
 pmk_fetch() { # url out
-	local cmd
+	local cmd t
 	cmd=$(pmk_fetch_cmd)
 	[ -n "$cmd" ] || return 127
+	t=$PMK_FETCH_TIMEOUT
 	case "$cmd" in
-		uclient-fetch) uclient-fetch -q -T 120 -O "$2" "$1" >/dev/null 2>&1 ;;
-		wget) wget -q -T 120 -O "$2" "$1" >/dev/null 2>&1 ;;
-		curl) curl -fsSL --max-time 120 -o "$2" "$1" >/dev/null 2>&1 ;;
+		uclient-fetch) uclient-fetch -q -T "$t" -O "$2" "$1" >/dev/null 2>&1 ;;
+		wget) wget -q -T "$t" -O "$2" "$1" >/dev/null 2>&1 ;;
+		curl) curl -fsSL --max-time "$t" -o "$2" "$1" >/dev/null 2>&1 ;;
 	esac
 }
 
@@ -279,150 +434,80 @@ pmk_http_json() { # url out
 	pmk_fetch "$1" "$2"
 }
 
-pmk_download() { # url out
-	local pid bytes rc
-	pmk_job_set download "开始下载：$1" 0 false null ""
+pmk_download() { # url out [label]
+	local pid bytes rc label="${3:-}"
+	pmk_job_set download "开始下载${label:+（$label）}：$1" 0 false null ""
 	pmk_fetch "$1" "$2" &
 	pid=$!
 	while kill -0 "$pid" 2>/dev/null; do
 		bytes=$(pmk_size "$2" 2>/dev/null)
-		pmk_job_set download "已下载 ${bytes:-0} 字节" "${bytes:-0}" false null ""
+		pmk_job_set download "已下载 ${bytes:-0} 字节${label:+（$label）}" "${bytes:-0}" false null ""
 		sleep 1
 	done
 	wait "$pid"
 	rc=$?
 	bytes=$(pmk_size "$2" 2>/dev/null)
-	pmk_job_set download "下载完成：${bytes:-0} 字节" "${bytes:-0}" false null ""
+	if [ "$rc" = 0 ] && [ -s "$2" ]; then
+		pmk_job_set download "下载完成：${bytes:-0} 字节${label:+（$label）}" "${bytes:-0}" false null ""
+	else
+		pmk_job_set download "下载失败（rc=$rc，已收 ${bytes:-0} 字节${label:+，$label}）" "${bytes:-0}" false null ""
+	fi
 	return "$rc"
 }
 
-# ---------- 版本清单 ----------
+# ---------- 版本清单（内置清单） ----------
 
-pmk_repo() {
-	case "$1" in
-		mihomo) echo MetaCubeX/mihomo ;;
-		singbox) echo SagerNet/sing-box ;;
-	esac
+# 内置清单格式（Tab 分隔，首行注释带生成日期）：
+# kernel  tag  elf-arch  size-bytes  sha256  asset-name  download-url
+pmk_builtin_date() {
+	sed -n '1s/.*generated=//p' "$PMK_BUILTIN" 2>/dev/null | head -1
 }
 
-pmk_asset_terms() { # kernel -> 候选子串（优先顺序）
-	local arch
-	arch=$(pmk_host_arch)
-	case "$1" in
-		mihomo)
-			case "$arch" in
-				amd64) echo 'linux-amd64-' ;;
-				arm64) echo 'linux-arm64-' ;;
-				armv7) echo 'linux-armv7-' ;;
-				armv6) echo 'linux-armv6-' ;;
-				mips) echo 'linux-mips-softfloat-' ; echo 'linux-mips-hardfloat-' ;;
-				mipsle) echo 'linux-mipsle-softfloat-' ; echo 'linux-mipsle-hardfloat-' ;;
-				386) echo 'linux-386-' ;;
-				riscv64) echo 'linux-riscv64-' ;;
-			esac
-			;;
-		singbox)
-			case "$arch" in
-				amd64) echo 'linux-amd64' ;;
-				arm64) echo 'linux-arm64' ;;
-				armv7) echo 'linux-armv7' ;;
-				armv6) echo 'linux-armv6' ;;
-				mips) echo 'linux-mips' ;;
-				mipsle) echo 'linux-mipsle' ;;
-				386) echo 'linux-386' ;;
-				riscv64) echo 'linux-riscv64' ;;
-			esac
-			;;
-	esac
+pmk_builtin_records() { # kernel arch
+	local tab
+	tab=$(printf '\t')
+	[ -s "$PMK_BUILTIN" ] || return 0
+	awk -F"$tab" -v k="$1" -v a="$2" '
+		$0 ~ /^#/ { next }
+		NF < 7 { next }
+		$1 == k && $3 == a { print }
+	' "$PMK_BUILTIN"
 }
 
-pmk_asset_rank() { # kernel url -> 优先级（越小越好），不匹配输出空
-	local kernel="$1" url="$2" name
-	name=$(basename "$url")
-	case "$name" in
-		*.sig|*.sha256|*.sha512|*.txt|*checksums*|*.asc) return 0 ;;
-	esac
-	case "$kernel" in
-		mihomo)
-			case "$name" in
-				# amd64 默认包要求 x86-64-v3（AVX2），多数路由器/虚拟机只有 v1；
-				# 优先 compatible 构建，避免“装完却跑不起来”
-				*-compatible-*) echo 8 ;;
-				*-go1*) echo 20 ;;
-				*-linux-*.gz) echo 30 ;;
-			esac
-			;;
-		singbox)
-			case "$name" in
-				*-musl.tar.gz) echo 10 ;;
-				*linux*.tar.gz) case "$name" in *-glibc*) echo 30 ;; *) echo 20 ;; esac ;;
-				*linux*.gz|*linux*.zip) echo 40 ;;
-			esac
-			;;
-	esac
-}
-
-pmk_releases_json() { # kernel out
-	local repo url
-	repo=$(pmk_repo "$1")
-	url="https://api.github.com/repos/$repo/releases?per_page=30"
-	pmk_fetch "$url" "$2"
+pmk_builtin_first_url() { # kernel arch
+	local rk tag arch size sha name url
+	pmk_builtin_records "$1" "$2" | while IFS="$(printf '\t')" read -r rk tag arch size sha name url; do
+		[ -n "$url" ] && { echo "$url"; break; }
+	done | head -1
 }
 
 pmk_api_versions() {
-	local kernel arch repo tmp urls tag pre rank best bestrank name out sep
-	kernel=$(pmk_norm_kernel "$(pmk_arg kernel)") || echo '{"ok":false,"error":"unknown kernel"}'
+	local kernel arch out sep rk tag rarch size sha name url date tab
+	kernel=$(pmk_norm_kernel "$(pmk_arg kernel)") || { echo '{"ok":false,"error":"unknown kernel"}'; return 0; }
 	arch=$(pmk_host_arch)
-	tmp="$PMK_RUN/releases.json"
-	mkdir -p "$PMK_RUN"
-	repo=$(pmk_repo "$kernel")
-
-	if ! pmk_releases_json "$kernel" "$tmp" || [ ! -s "$tmp" ]; then
-		echo "{\"ok\":false,\"error\":\"无法获取版本清单（需要能访问 api.github.com，或改用自定义 URL/本地导入）\",\"arch\":\"$arch\",\"repo\":\"$repo\"}"
+	tab=$(printf '\t')
+	date=$(pmk_builtin_date)
+	out=''; sep=''
+	while IFS="$tab" read -r rk tag rarch size sha name url; do
+		[ -n "$rk" ] || continue
+		out="$out$sep{\"version\":\"$(pmk_esc "$tag")\",\"prerelease\":false,\"asset\":\"$(pmk_esc "$name")\",\"url\":\"$(pmk_esc "$url")\",\"size\":${size:-0},\"sha256\":\"$(pmk_esc "$sha")\"}"
+		sep=','
+	done <<EOF
+$(pmk_builtin_records "$kernel" "$arch")
+EOF
+	if [ -z "$out" ]; then
+		echo "{\"ok\":false,\"error\":\"内置清单里没有 $kernel/$arch 的资产（本机可用变体：$(pmk_variants "$kernel")），请改用自定义 URL 或本地导入\",\"arch\":\"$arch\",\"variants\":\"$(pmk_variants "$kernel")\"}"
 		return 0
 	fi
-
-	urls="$PMK_RUN/urls.txt"
-	grep -o '"browser_download_url":"[^"]*"' "$tmp" | sed 's/^"browser_download_url":"//; s/"$//' > "$urls"
-
-	# 每个 release 的 tag + prerelease：按 prerelease 字段切块
-	tr -d '\n' < "$tmp" | awk '{gsub(/,"prerelease":/,"\n\"prerelease\":")}1' > "$PMK_RUN/presplit.txt"
-
-	out='['; sep=''
-	while IFS= read -r chunk; do
-		tag=$(printf '%s' "$chunk" | grep -o '"tag_name":"[^"]*"' | tail -1 | cut -d'"' -f4)
-		[ -n "$tag" ] || continue
-		case "$chunk" in
-			*'"prerelease":true'*) pre=true ;;
-			*) pre=false ;;
-		esac
-		[ "$(pmk_arg prerelease)" = 1 ] || [ "$pre" = false ] || continue
-		best=''; bestrank=99
-		while IFS= read -r u; do
-			case "$u" in
-				*/download/"$tag"/*) ;;
-				*) continue ;;
-			esac
-			rank=$(pmk_asset_rank "$kernel" "$u" | head -1)
-			[ -n "$rank" ] || continue
-			if [ "$rank" -lt "$bestrank" ]; then
-				bestrank=$rank; best=$u
-			fi
-		done < "$urls"
-		[ -n "$best" ] || continue
-		name=$(basename "$best")
-		out="$out$sep{\"version\":\"$(pmk_esc "$tag")\",\"prerelease\":$pre,\"asset\":\"$(pmk_esc "$name")\",\"url\":\"$(pmk_esc "$best")\"}"
-		sep=','
-	done < "$PMK_RUN/presplit.txt"
-
-	out="$out]"
-	echo "{\"ok\":true,\"kernel\":\"$kernel\",\"arch\":\"$arch\",\"repo\":\"$repo\",\"versions\":$out}"
+	echo "{\"ok\":true,\"kernel\":\"$kernel\",\"arch\":\"$arch\",\"variants\":\"$(pmk_variants "$kernel")\",\"list\":\"builtin\",\"generated\":\"$(pmk_esc "$date")\",\"versions\":[$out]}"
 }
 
 pmk_api_mirrors() {
+	local sel
 	pmk_mirrors_init
-	if jsonfilter -i "$PMK_MIRRORS" -t '@' >/dev/null 2>&1; then
-		echo "{\"ok\":true,\"mirrors\":$(cat "$PMK_MIRRORS")}"
+	sel=$(pmk_source_selected)
+	if grep -q '"mirrors"' "$PMK_MIRRORS"; then
+		echo "{\"ok\":true,\"selected\":\"$sel\",\"chain\":\"$(pmk_source_chain "$sel")\",\"mirrors\":$(cat "$PMK_MIRRORS")}"
 	else
 		echo '{"ok":false,"error":"mirrors.json 语法无效"}'
 	fi
@@ -442,19 +527,41 @@ pmk_api_mirror_set() {
 	fi
 }
 
-# 手动检测镜像是否可用（不做自动轮询）：下载最新 release 首字节，计时
+pmk_api_source_set() {
+	local name
+	name=$(pmk_arg name)
+	case "$name" in
+		''|*[!A-Za-z0-9_-]*) echo '{"ok":false,"error":"源名无效"}'; return 0 ;;
+	esac
+	if [ "$name" != auto ] && ! pmk_mirror_names | grep -qx "$name"; then
+		echo '{"ok":false,"error":"未知的源名"}'; return 0
+	fi
+	if $PMK_UCI -q set ferry.main.kernel_mirror="$name" 2>/dev/null && $PMK_UCI -q commit ferry 2>/dev/null; then
+		echo "{\"ok\":true,\"selected\":\"$name\",\"chain\":\"$(pmk_source_chain "$name")\"}"
+	else
+		echo '{"ok":false,"error":"写入 UCI 失败"}'
+	fi
+}
+
+# 手动检测镜像是否可用（不做自动轮询）：下载首包 6 秒，计时
 pmk_api_mirror_test() {
-	local name url prefix start end rc size tmp
+	local name url prefix start end rc size tmp fp i
 	name=$(pmk_arg name)
 	mkdir -p "$PMK_RUN"
 	tmp="$PMK_RUN/mirror-test.bin"
-	url="https://github.com/MetaCubeX/mihomo/releases/download/v1.19.33/mihomo-linux-amd64-v1.19.33.gz"
-	url=$(pmk_source_url "$url" "$name")
+	# 取样 URL 取内置清单里本机架构的第一条，避免把失效地址写死
+	url=$(pmk_builtin_first_url mihomo "$(pmk_host_arch)")
+	[ -n "$url" ] || url='https://github.com/MetaCubeX/mihomo/releases/latest'
+	url=$(pmk_source_url "$url" "$name") || {
+		echo "{\"ok\":false,\"name\":\"$(pmk_esc "$name")\",\"error\":\"该源无法映射此类 URL（jsDelivr 只支持仓库内文件）\"}"
+		return 0
+	}
 	start=$(date +%s)
 	# 手动取样：只跑 6 秒就断开，避免整包下载（固件没有 timeout 时也不能卡死）
 	if command -v uclient-fetch >/dev/null 2>&1; then
 		uclient-fetch -q -O "$tmp" "$url" >/dev/null 2>&1 &
-		local fp=$! i=0
+		fp=$!
+		i=0
 		while [ $i -lt 6 ] && kill -0 "$fp" 2>/dev/null; do
 			sleep 1
 			i=$((i + 1))
@@ -550,8 +657,19 @@ pmk_api_status() {
 	ccheck=''
 	[ -s "$PMK_RUN/config-check-report.txt" ] && ccheck=$(tail -c 1200 "$PMK_RUN/config-check-report.txt" | tail -n 24)
 
+	# 服务实际取哪个二进制：插件 current 指针优先，其次系统自带（只读回退，绝不覆盖）
+	local sysbin binsrc
+	sysbin="$PMK_SYS_BIN_DIR/$bin"
+	binsrc=missing
+	if [ -x "$PMK_CUR/$bin" ]; then binsrc=plugin
+	elif [ -x "$sysbin" ]; then binsrc=system
+	fi
+	local selfree runfree
+	selfree=$(pmk_free_kb "$PMK_STORE" 2>/dev/null)
+	runfree=$(pmk_free_kb "$PMK_RUN" 2>/dev/null)
+
 	out=$(cat <<EOF
-{"ok":true,"arch":"$arch","uci_kernel":"$kcur","uci_kernel_norm":"$kk","running":$okj,"bin_path":"$(pmk_esc "$kernelpath")","bin_exists":$([ -x "$kernelpath" ] && echo true || echo false),"config_path":"$(pmk_esc "$cfg_path")","config_compatible":$compat,"free_kb":$(pmk_free_kb "$PMK_STORE" 2>/dev/null || echo 0),"active":"$(pmk_esc "$tag")","previous":"$(pmk_esc "$(pmk_previous "$kk")")","active_version":"$(pmk_esc "$aver")","active_sha256":"$asha","active_size":${asize:-0},"active_arch":"$(pmk_esc "$aarch")","active_libc":"$(pmk_esc "$alibc")","arch_match":$amatch,"sb_bucket":"$(pmk_esc "$sbbucket")","config_check":"$(pmk_esc "$ccheck")","installed":$(pmk_installed_json),"job":$job}
+{"ok":true,"arch":"$arch","variants":"$(pmk_variants "$kcur")","uci_kernel":"$kcur","uci_kernel_norm":"$kk","running":$okj,"bin_path":"$(pmk_esc "$kernelpath")","bin_exists":$([ -x "$kernelpath" ] && echo true || echo false),"bin_source":"$binsrc","kernel_dir":"$(pmk_esc "$PMK_STORE")","current_link":"$(pmk_esc "$PMK_CUR/$bin")","system_bin":"$(pmk_esc "$sysbin")","system_bin_exists":$([ -x "$sysbin" ] && echo true || echo false),"download_dir":"$(pmk_esc "$PMK_STAGE")","free_kb":${selfree:-0},"free_run_kb":${runfree:-0},"config_path":"$(pmk_esc "$cfg_path")","config_compatible":$compat,"source_selected":"$(pmk_source_selected)","source_chain":"$(pmk_source_chain "$(pmk_source_selected)")","active":"$(pmk_esc "$tag")","previous":"$(pmk_esc "$(pmk_previous "$kk")")","active_version":"$(pmk_esc "$aver")","active_sha256":"$asha","active_size":${asize:-0},"active_arch":"$(pmk_esc "$aarch")","active_libc":"$(pmk_esc "$alibc")","arch_match":$amatch,"sb_bucket":"$(pmk_esc "$sbbucket")","config_check":"$(pmk_esc "$ccheck")","installed":$(pmk_installed_json),"job":$job}
 EOF
 )
 	echo "$out"
@@ -671,35 +789,19 @@ pmk_link_atomic() { # target link
 	}
 }
 
-pmk_adopt_external() { # kernel tag-override
-	local k bin path ver dir tag
+# 清理旧版（r6 及以前）写在 /usr/bin 的符号链接；只删指向本插件目录的链接，
+# 绝不碰用户自己安装的真实二进制（不覆盖系统已有 mihomo/xray/clash）。
+pmk_clean_legacy_link() { # kernel
+	local k bin p t
 	k=$(pmk_norm_kernel "$1")
 	bin=$(pmk_bin_name "$k")
-	path="$PMK_BIN_DIR/$bin"
-	[ -f "$path" ] && [ ! -L "$path" ] || return 0
-	ver=$(pmk_detect_version "$path")
-	tag=${2:-}
-	[ -n "$tag" ] || tag=$(printf 'external-%s' "$(date +%Y%m%d%H%M%S)")
-	dir="$PMK_STORE/$k/$tag"
-	# 同 tag 目录里已有二进制时绝不覆盖（否则会把已安装版本顶掉），改存独立 tag
-	if [ -e "$dir/$bin" ]; then
-		tag=$(printf 'external-%s' "$(date +%Y%m%d%H%M%S)")
-		dir="$PMK_STORE/$k/$tag"
-	fi
-	mkdir -p "$dir" || return 1
-	mv "$path" "$dir/$bin" || return 1
-	chmod 0755 "$dir/$bin"
-	{
-		echo "version=${ver:-unknown}"
-		echo "sha256=$(pmk_sha256 "$dir/$bin")"
-		echo "size=$(pmk_size "$dir/$bin")"
-		echo "arch=$(pmk_elf_arch "$dir/$bin")"
-		echo "libc=$(pmk_elf_libc "$dir/$bin")"
-		echo "verified=self"
-		echo "source=adopted"
-		echo "installed=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-	} > "$dir/meta"
-	pmk_log "已接管现有内核 ${path} -> ${dir}（版本 ${ver:-unknown}）"
+	p="$PMK_SYS_BIN_DIR/$bin"
+	[ -L "$p" ] || return 0
+	t=$(readlink "$p" 2>/dev/null)
+	case "$t" in
+		"$PMK_STORE"/*) rm -f "$p"; pmk_log "已移除旧版遗留的系统符号链接 $p（现由 $PMK_CUR/$bin 提供）" ;;
+	esac
+	return 0
 }
 
 pmk_activate() { # kernel tag restart force
@@ -732,8 +834,8 @@ pmk_activate() { # kernel tag restart force
 	pmk_job_set switch "停止服务" 0 false null "" "$tag"
 	pmk_service_stop
 
-	pmk_job_set switch "接管现有二进制/原子替换" 0 false null "" "$tag"
-	pmk_adopt_external "$k" "$prev_of_target" || pmk_job_fail ERR_ADOPT "接管现有内核失败" 0 "$tag"
+	pmk_job_set switch "清理旧版系统链接并切换 current 指针" 0 false null "" "$tag"
+	pmk_clean_legacy_link "$k"
 	pmk_link_atomic "$PMK_STORE/$k/$tag/$bin" "$PMK_BIN_DIR/$bin" || {
 		# 同一内核换版本时把链接指回旧版本，再按原状态恢复服务
 		if [ "$cur_kernel" = "$k" ] && [ -n "$active_of_cur" ] && [ -d "$PMK_STORE/$k/$active_of_cur" ]; then
@@ -814,106 +916,145 @@ pmk_url_allowed() {
 }
 
 pmk_install_staged() { # kernel tag srcbin sha version verified source
-	local k=$1 tag=$2 src=$3 sha=$4 ver=$5 verified=$6 source=$7 dir
+	local k=$1 tag=$2 src=$3 sha=$4 ver=$5 verified=$6 source=$7 dir stage old bin
+	bin=$(pmk_bin_name "$k")
 	dir="$PMK_STORE/$k/$tag"
-	mkdir -p "$dir" || return 1
-	mv -f "$src" "$dir/$(pmk_bin_name "$k")" || return 1
-	chmod 0755 "$dir/$(pmk_bin_name "$k")"
+	stage="$PMK_STAGE/install.$$"
+	old="$PMK_STORE/$k/.old.$tag.$$"
+	rm -rf "$stage"; mkdir -p "$stage" || return 1
+	mkdir -p "$PMK_STORE/$k" || return 1
+	cp -f "$src" "$stage/$bin" || return 1
+	chmod 0755 "$stage/$bin" || return 1
 	{
 		echo "version=${ver}"
 		echo "sha256=${sha}"
-		echo "size=$(pmk_size "$dir/$(pmk_bin_name "$k")")"
-		echo "arch=$(pmk_elf_arch "$dir/$(pmk_bin_name "$k")")"
-		echo "libc=$(pmk_elf_libc "$dir/$(pmk_bin_name "$k")")"
+		echo "size=$(pmk_size "$stage/$bin")"
+		echo "arch=$(pmk_elf_arch "$stage/$bin")"
+		echo "libc=$(pmk_elf_libc "$stage/$bin")"
 		echo "verified=${verified}"
 		echo "source=${source}"
 		echo "installed=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-	} > "$dir/meta"
+	} > "$stage/meta" || return 1
+	# 目录级原子替换：先把旧版本挪开，再整体改名；失败时把旧版本挪回来
+	if [ -d "$dir" ]; then
+		mv "$dir" "$old" || { rm -rf "$stage"; return 1; }
+	fi
+	if ! mv "$stage" "$dir"; then
+		[ -d "$old" ] && mv "$old" "$dir"
+		rm -rf "$stage"
+		return 1
+	fi
+	rm -rf "$old"
 	return 0
 }
 
 pmk_run_install() { # 参数已通过环境/变量传入
-	local k tag candidates cand url out src url_used start end elapsed expected verified ver arch_host fam_bin fam_host outbytes sha mirror_used
+	local k tag candidates cand url out url_used start end elapsed expected verified ver
+	local arch_host binarch binendian outbytes sha mirror_used chain name nsrc i need_kb free_kb
+	local want_size official_url drc fallback need_txt first
 	k=$PMK_OP_KERNEL
 	tag=$PMK_OP_VERSION
 	elapsed=0
-	mirror_used=github
+	mirror_used=auto
 	case "$tag" in
 		*[!A-Za-z0-9._-]*|'') pmk_job_fail ERR_TAG "非法版本名：$tag" 0 ;;
 	esac
-	out="$PMK_RUN/download.bin"
-	mkdir -p "$PMK_RUN" "$PMK_STORE" "$PMK_JAIL"
-	rm -rf "$PMK_JAIL"; mkdir -p "$PMK_JAIL"; rm -f "$out"
+	out="$PMK_STAGE/download.bin"
+	mkdir -p "$PMK_STAGE" "$PMK_STORE" "$PMK_CUR" "$PMK_JAIL"
+	rm -rf "$PMK_JAIL"; mkdir -p "$PMK_JAIL"; rm -f "$out" "$out.sha256"
 
-	# 磁盘：至少要能放下压缩包 + 解压后二进制
-	if [ "$(pmk_free_kb "$PMK_STORE" 2>/dev/null || echo 0)" -lt 8192 ]; then
-		pmk_job_fail ERR_DISK_FULL "磁盘可用空间不足 8MB（$PMK_STORE）" 0 "$tag"
+	# 下载前空间检查：按「压缩包 + 解压后二进制 + 保留旧版本」估算，检查真正写入的目录
+	want_size=${PMK_OP_SIZE:-0}
+	case "$want_size" in ''|*[!0-9]*) want_size=0 ;; esac
+	if [ "$want_size" -gt 0 ]; then
+		need_kb=$((want_size / 1024 * 6 + 8192))
+		need_txt="下载包 $((want_size / 1048576)) MB + 解压临时 + 保留旧版本"
+	else
+		need_kb=65536
+		need_txt="目标大小未知，按 64 MB 预留（下载 + 解压 + 旧版本）"
+	fi
+	free_kb=$(pmk_free_kb "$PMK_STORE" 2>/dev/null)
+	case "$free_kb" in ''|*[!0-9]*) free_kb=0 ;; esac
+	if [ "$free_kb" -lt "$need_kb" ]; then
+		pmk_job_fail ERR_DISK_FULL "空间不足：$PMK_STORE 可用 $((free_kb / 1024)) MB，需要至少 $((need_kb / 1024)) MB（$need_txt）；请先删除旧版本或改用本地导入" 0 "$tag"
 	fi
 
 	if [ "$PMK_OP_LOCAL" = 1 ]; then
 		pmk_job_set download "本地导入：$PMK_OP_URLS" 0 false null "" "$tag"
 		cp "$PMK_OP_URLS" "$out" || pmk_job_fail ERR_LOCAL "读取本地文件失败：$PMK_OP_URLS" 0 "$tag"
 		url_used="local:$PMK_OP_URLS"
+		mirror_used=local
 	else
-		pmk_job_set download "准备下载源" 0 false null "" "$tag"
 		candidates="$PMK_OP_URLS"
+		official_url=$(printf '%s' "$candidates" | awk '{print $1}')
 		url_used=''
 		for cand in $candidates; do
-			url=$(pmk_source_url "$cand" "$PMK_OP_MIRROR")
-			if ! pmk_url_allowed "$url"; then
-				pmk_log "拒绝非 HTTPS 源（仅允许 https:// 或本机回环 http）：$url"
-				continue
-			fi
-			start=$(date +%s)
-			if pmk_download "$url" "$out" && [ -s "$out" ]; then
-				end=$(date +%s); elapsed=$((end - start))
-				url_used="$url"
-				mirror_used=$PMK_OP_MIRROR
-				pmk_log "下载成功：$url（镜像 $mirror_used）用时 ${elapsed}s 大小 $(pmk_size "$out") 字节"
-				break
-			fi
-			pmk_log "下载失败，尝试下一个候选：$url"
-			rm -f "$out"
+			chain=$(pmk_source_chain "$PMK_OP_MIRROR")
+			nsrc=$(printf '%s' "$chain" | wc -w)
+			i=0
+			for name in $chain; do
+				i=$((i + 1))
+				url=$(pmk_source_url "$cand" "$name")
+				if [ -z "$url" ] || ! pmk_url_allowed "$url"; then
+					pmk_log "源 $name 无法映射该 URL 或不是 HTTPS，跳过"
+					continue
+				fi
+				fallback=false
+				[ "$i" -gt 1 ] && fallback=true
+				PMK_JOB_SRC="$name"; PMK_JOB_FALLBACK=$fallback
+				start=$(date +%s)
+				pmk_download "$url" "$out" "$(pmk_source_label "$name")（第 $i/$nsrc 源）"
+				drc=$?
+				if [ "$drc" = 0 ] && [ -s "$out" ]; then
+					end=$(date +%s); elapsed=$((end - start))
+					url_used="$url"; mirror_used="$name"
+					pmk_log "下载成功：$url（源 $name，回退=$fallback，用时 ${elapsed}s，$(pmk_size "$out") 字节）"
+					break 2
+				fi
+				pmk_log "源 $name 下载失败（rc=$drc），按顺序回退下一个源"
+				rm -f "$out"
+			done
 		done
-		[ -n "$url_used" ] || pmk_job_fail ERR_NETWORK "所有候选源都下载失败（检查网络/镜像/URL，或改用本地导入）" 0 "$tag"
+		PMK_JOB_SRC="$mirror_used"
+		first=$(pmk_source_chain "$PMK_OP_MIRROR" | awk '{print $1}')
+		PMK_JOB_FALLBACK=$([ "$mirror_used" != "$first" ] && echo true || echo false)
+		[ -n "$url_used" ] || pmk_job_fail ERR_NETWORK "所有候选源都下载失败（已尝试：$(pmk_source_chain "$PMK_OP_MIRROR")）；请检查网络/DNS/证书，或改用本地导入" 0 "$tag"
 	fi
 
 	outbytes=$(pmk_size "$out")
 
-	pmk_job_set verify "校验 SHA-256（源 ${url_used}，用时 ${elapsed}s）" "$outbytes" false null "" "$tag"
+	pmk_job_set verify "校验 SHA-256（源 ${mirror_used}，用时 ${elapsed}s）" "$outbytes" false null "" "$tag"
 	expected=$PMK_OP_SHA256
 	verified=sha256
 	if [ -z "$expected" ]; then
-		# 侧车文件 <url>.sha256（部分镜像/发布页提供）
-		if pmk_fetch "$url_used.sha256" "$out.sha256" 2>/dev/null && [ -s "$out.sha256" ]; then
+		# 校验值只允许来自官方 URL 的侧车文件；绝不用镜像给的校验值（镜像可能给错/旧值）
+		if [ "$PMK_OP_LOCAL" != 1 ] && pmk_fetch "$official_url.sha256" "$out.sha256" 2>/dev/null && [ -s "$out.sha256" ]; then
 			expected=$(awk '{print $1}' "$out.sha256" | head -1)
-			pmk_log "使用侧车校验值：$expected"
+			pmk_log "使用官方侧车校验值：$expected"
 		fi
 	fi
+	expected=$(printf '%s' "$expected" | tr 'A-F' 'a-f')
+	sha=$(pmk_sha256 "$out")
 	if [ -z "$expected" ]; then
 		if [ "$PMK_OP_ALLOW_UNVERIFIED" != 1 ]; then
 			rm -f "$out"
-			pmk_job_fail ERR_UNVERIFIED "官方未提供 checksum，需显式确认「未校验安装」后才能继续" "$outbytes" "$tag"
+			pmk_job_fail ERR_UNVERIFIED "官方未提供 SHA-256，安装被拦截（如确认来源可信，可显式选择「未校验安装」）" "$outbytes" "$tag"
 		fi
 		verified=unverified
-	else
-		if ! pmk_sha256 "$out" | grep -qx "$expected"; then
-			rm -f "$out"
-			pmk_job_fail ERR_SHA_MISMATCH "SHA-256 不匹配（期望 $expected，实际 $(pmk_sha256 "$out")）" "$outbytes" "$tag"
-		fi
-		verified=sha256
+	elif [ "$sha" != "$expected" ]; then
+		rm -f "$out"
+		pmk_job_fail ERR_SHA_MISMATCH "SHA-256 不匹配（文件来自源 $mirror_used：期望 $expected，实际 $sha），文件已丢弃、未安装" "$outbytes" "$tag"
 	fi
-	sha=$(pmk_sha256 "$out")
 
 	pmk_job_set extract "解压并检查架构" "$outbytes" false null "" "$tag"
 	if ! pmk_extract "$out" "$(pmk_bin_name "$k")" "$PMK_JAIL/$(pmk_bin_name "$k")"; then
 		pmk_job_fail ERR_EXTRACT "解压/识别二进制失败（包内没有可执行文件？）" "$outbytes" "$tag"
 	fi
 	arch_host=$(pmk_host_arch)
-	fam_host=$(pmk_arch_family "$arch_host")
-	fam_bin=$(pmk_arch_family "$(pmk_elf_arch "$PMK_JAIL/$(pmk_bin_name "$k")")")
-	if [ "$fam_bin" = unknown ] || [ "$fam_bin" != "$fam_host" ]; then
-		pmk_job_fail ERR_ARCH "二进制架构不匹配：本机 $arch_host，包内 $(pmk_elf_arch "$PMK_JAIL/$(pmk_bin_name "$k")")" "$outbytes" "$tag"
+	binarch=$(pmk_elf_arch "$PMK_JAIL/$(pmk_bin_name "$k")")
+	binendian=$(pmk_elf_endian "$PMK_JAIL/$(pmk_bin_name "$k")")
+	if [ "$binarch" = unknown ] || ! pmk_arch_ok "$arch_host" "$binarch" "$binendian"; then
+		pmk_job_fail ERR_ARCH "架构不匹配：本机 $arch_host（可用变体：$(pmk_variants "$k")），包内 $binarch（$(basename "$url_used")）；请选择对应变体后重试" "$outbytes" "$tag"
 	fi
 	if [ "$(pmk_elf_libc "$PMK_JAIL/$(pmk_bin_name "$k")")" = glibc ]; then
 		pmk_job_fail ERR_LIBC "二进制依赖 glibc，本固件为 musl（无法执行）" "$outbytes" "$tag"
@@ -922,7 +1063,7 @@ pmk_run_install() { # 参数已通过环境/变量传入
 	pmk_job_set version "读取二进制版本" "$outbytes" false null "" "$tag"
 	ver=$(pmk_detect_version "$PMK_JAIL/$(pmk_bin_name "$k")")
 	if [ -z "$ver" ]; then
-		pmk_job_fail ERR_EXEC "二进制无法执行（架构/依赖不匹配？）" "$outbytes" "$tag"
+		pmk_job_fail ERR_EXEC "二进制无法执行（架构/依赖不匹配？本机 $arch_host，包内 $binarch）" "$outbytes" "$tag"
 	fi
 	if [ -n "$PMK_OP_EXPECT_VERSION" ]; then
 		case "$PMK_OP_EXPECT_VERSION" in
@@ -944,7 +1085,7 @@ pmk_run_install() { # 参数已通过环境/变量传入
 		pmk_activate "$k" "$tag" "${PMK_OP_RESTART:-1}" "${PMK_OP_FORCE:-0}"
 		return $?
 	fi
-	pmk_job_ok "已安装 $k $tag（未启用；源 $mirror_used，用时 ${elapsed}s）" "$outbytes"
+	pmk_job_ok "已安装 $k $tag 到 $PMK_STORE/$k/$tag（未启用；源 $mirror_used，用时 ${elapsed}s）" "$outbytes"
 }
 
 pmk_run_switch() { # 不传版本时切到该内核当前 active 版本（用于 mihomo/sing-box 一键互切）
@@ -1032,7 +1173,7 @@ pmk_api_remove() {
 
 # ---------- API 入口 ----------
 
-PMK_ARGS=''
+: "${PMK_ARGS:=}"
 pmk_arg() { # key
 	case "$PMK_ARGS" in
 		'') return 0 ;;
@@ -1056,8 +1197,9 @@ pmk_start_job() { # op -> 启动后台任务
 	PMK_OP_RESTART=$(pmk_arg restart)
 	PMK_OP_FORCE=$(pmk_arg force)
 	PMK_OP_MIRROR=$(pmk_arg mirror)
-	[ -n "$PMK_OP_MIRROR" ] || PMK_OP_MIRROR=github
+	[ -n "$PMK_OP_MIRROR" ] || PMK_OP_MIRROR=$(pmk_source_selected)
 	PMK_OP_URLS=$(pmk_arg urls)
+	PMK_OP_SIZE=$(pmk_arg size)
 	PMK_OP_FILE=$(pmk_arg file)
 	PMK_OP_EXPECT_VERSION=$(pmk_arg expect_version)
 
@@ -1102,7 +1244,7 @@ pmk_start_job() { # op -> 启动后台任务
 		PMK_OP_SHA256=$PMK_OP_SHA256 PMK_OP_ALLOW_UNVERIFIED=$PMK_OP_ALLOW_UNVERIFIED \
 		PMK_OP_ACTIVATE=$PMK_OP_ACTIVATE PMK_OP_RESTART=$PMK_OP_RESTART \
 		PMK_OP_FORCE=$PMK_OP_FORCE PMK_OP_MIRROR=$PMK_OP_MIRROR \
-		PMK_OP_URLS=$PMK_OP_URLS PMK_OP_FILE=$PMK_OP_FILE \
+		PMK_OP_URLS=$PMK_OP_URLS PMK_OP_SIZE=$PMK_OP_SIZE PMK_OP_FILE=$PMK_OP_FILE \
 		PMK_OP_LOCAL=$PMK_OP_LOCAL \
 		PMK_OP_EXPECT_VERSION=$PMK_OP_EXPECT_VERSION \
 		sh "$PMK_LIB_DIR/kernel.sh" run "$op"
@@ -1121,9 +1263,10 @@ pmk_api_job() {
 # CLI
 case "${1:-}" in
 	status) pmk_api_status ;;
-	versions) pmk_api_versions ;;
+	versions) PMK_ARGS=$(cat); pmk_api_versions ;;
 	mirrors) pmk_api_mirrors ;;
 	mirror-set) PMK_ARGS=$(cat); pmk_api_mirror_set ;;
+	source-set) PMK_ARGS=$(cat); pmk_api_source_set ;;
 	mirror-test) PMK_ARGS=$(cat); pmk_api_mirror_test ;;
 	preview) PMK_ARGS=$(cat); pmk_api_preview ;;
 	remove) PMK_ARGS=$(cat); pmk_api_remove ;;

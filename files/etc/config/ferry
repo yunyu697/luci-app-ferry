@@ -45,13 +45,16 @@ config ferry 'main'
 	#   mihomo：填 YAML 路径；singbox：填 JSON 路径
 	option config_path ''
 
-	# 内核二进制路径，留空则自动使用 /usr/bin/mihomo 或 /usr/bin/sing-box
+	# 内核二进制路径，留空则使用插件专属目录的 current 指针：
+	#   /etc/ferry/kernels/current/<mihomo|sing-box>  -> ../<内核>/<版本>/<二进制>
+	# 插件不会写入 /usr/bin、不会覆盖系统已有的 mihomo/clash/xray；
+	# 若插件目录没有内核而系统里有 /usr/bin/mihomo，则只读回退使用它。
 	# （若设置了 bin_path，内核管理页不会覆盖该路径）
 	option bin_path ''
 
-	# 内核下载默认源（仅“内核”页使用）：github 或 mirrors.json 里的镜像名
-	# 首次安装由页面选择；自动更新默认不开启，也不提供静默更新
-	option kernel_mirror 'github'
+	# 内核下载源（仅“内核”页使用）：auto（官方 + 内置加速镜像按序回退）
+	# 或 mirrors.json 里的源名（github/ghfast/ghproxy/jsdelivr/custom）
+	option kernel_mirror 'auto'
 
 	# 日志级别：silent | error | warning | info | debug
 	option log_level 'info'

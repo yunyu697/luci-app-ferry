@@ -12,7 +12,7 @@ case "$1" in
   "versions": { "kernel": "", "prerelease": "" },
   "start": {
     "op": "", "kernel": "", "version": "", "urls": "", "file": "",
-    "sha256": "", "expect_version": "", "mirror": "",
+    "sha256": "", "expect_version": "", "mirror": "", "size": "",
     "allow_unverified": "", "activate": "", "restart": "", "force": ""
   },
   "job": {},
@@ -20,7 +20,8 @@ case "$1" in
   "remove": { "kernel": "", "version": "" },
   "mirrors": {},
   "mirror_set": { "json": "" },
-  "mirror_test": { "name": "" }
+  "mirror_test": { "name": "" },
+  "source_set": { "name": "" }
 }
 EOF
 		;;
@@ -35,6 +36,7 @@ EOF
 			mirrors) "$K" mirrors ;;
 			mirror_set) "$K" mirror-set ;;
 			mirror_test) "$K" mirror-test ;;
+			source_set) "$K" source-set ;;
 			*)
 				echo '{"ok":false,"error":"unknown method"}'
 				;;

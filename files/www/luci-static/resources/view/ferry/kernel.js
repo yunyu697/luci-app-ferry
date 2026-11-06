@@ -53,10 +53,12 @@ return view.extend({
 			selUrl: '',
 			preview: null,
 			previewFor: '',
-			src: 'github',
+			src: (st && st.source_selected) || 'auto',
 			prerelease: false,
 			mirrors: null,
 			mirrorMsg: '',
+			curSize: 0,
+			lastInstall: null,
 			busy: false
 		};
 
@@ -99,6 +101,13 @@ return view.extend({
 				[ '运行状态', s.running ? E('span', { 'style': 'color:#2e7d32' }, [ '运行中' ]) : E('span', { 'style': 'color:#b12704' }, [ '未运行' ]) ],
 				[ '当前版本', s.active_version ? (s.active_version + '（' + (s.active || '') + '）') : (cur ? cur.version : '无（未纳入内核管理）') ],
 				[ '二进制路径', s.bin_path || '—' ],
+				[ '二进制来源', s.bin_source === 'plugin' ? '插件目录（current 指针）'
+					: (s.bin_source === 'system' ? '系统自带（只读回退，未被覆盖）' : '未找到可执行文件') ],
+				[ '内核目录', s.kernel_dir || '—' ],
+				[ 'current 指针', s.current_link || '—' ],
+				[ '系统内核', s.system_bin
+					? (s.system_bin + (s.system_bin_exists ? '（存在，插件不会覆盖）' : '（不存在）'))
+					: '—' ],
 				[ '文件大小', size ? K.fmtBytes(size) : '—' ],
 				[ 'SHA-256', sha ? E('code', { 'title': sha }, [ K.shortSha(sha) ]) : '—' ],
 				[ '架构匹配', binArch ? (binArch + ' / 本机 ' + (s.arch || '?') + (s.arch_match ? '（匹配）' : '（不匹配）'))
@@ -109,8 +118,11 @@ return view.extend({
 					? E('pre', { 'style': 'white-space:pre-wrap;max-height:12em;overflow:auto;margin:0' }, [ s.config_check ])
 					: '尚无自检记录（切换或重启服务后更新）' ],
 				[ '回滚目标', s.previous || '无' ],
-				[ '本机架构', s.arch || '未知' ],
-				[ '可用空间', (Math.round((s.free_kb || 0) / 1024)) + ' MiB' ]
+				[ '本机架构', (s.arch || '未知') + (s.variants ? '（可用变体：' + s.variants + '）' : '') ],
+				[ '下载源', (s.source_selected || 'auto') + (s.source_chain ? '（顺序：' + s.source_chain + '）' : '') ],
+				[ '下载暂存', s.download_dir || '—' ],
+				[ '可用空间', '内核目录 ' + Math.round((s.free_kb || 0) / 1024) + ' MB；运行目录 '
+					+ Math.round((s.free_run_kb || 0) / 1024) + ' MB' ]
 			];
 			clear(boxStatus);
 			add(boxStatus, table([ '项目', '值' ], rows.map(function(r) { return [ r[0], r[1] ]; })));
@@ -122,7 +134,7 @@ return view.extend({
 			var l = installedList(), s = state.st;
 			clear(boxInstalled);
 			if (!l.length) {
-				add(boxInstalled, info('还没有纳入管理的版本。可在下方「获取新版本」里下载安装，或把已有二进制交给内核管理（首次切换时自动接管 /usr/bin 下的文件）。'));
+				add(boxInstalled, info('还没有纳入管理的版本。可在下方「获取新版本」里下载安装（内置官方源 + 加速镜像）；系统自带的 /usr/bin/mihomo 不会被接管或覆盖，只作为只读回退。'));
 				return;
 			}
 			var rows = l.map(function(v) {
@@ -312,16 +324,32 @@ return view.extend({
 			if (!j) return;
 			var stepPct = { queued: 10, download: 35, verify: 55, extract: 70, version: 75, install: 82, switch: 90 };
 			var pct = j.done ? 100 : (stepPct[j.phase] || 10);
+			var bytesTxt = '';
+			if (j.phase === 'download' && !j.done) {
+				var total = state.curSize || 0;
+				bytesTxt = '，已下载 ' + K.fmtBytes(j.bytes || 0) + (total ? ' / ' + K.fmtBytes(total) : '');
+				if (total > 0) pct = Math.min(54, 10 + Math.round(45 * Math.min(1, (j.bytes || 0) / total)));
+			} else if (j.bytes) {
+				bytesTxt = '，共 ' + K.fmtBytes(j.bytes);
+			}
 			add(boxJob, E('div', { 'class': 'cbi-progressbar', 'title': pct + '%' }, [
 				E('div', { 'style': 'width:' + pct + '%' }, [ pct + '%' ])
 			]));
-			add(boxJob, E('p', {}, [ '阶段：' + (j.phase || '—') + '　' + (j.message || '') ]));
+			add(boxJob, E('p', {}, [ '阶段：' + (j.phase || '—') + '　' + (j.message || '') + bytesTxt ]));
+			if (j.source)
+				add(boxJob, E('p', { 'style': 'margin:0' }, [
+					'下载源：' + j.source + (j.fallback ? '（已回退到 ' + j.source + ' 源）' : '')
+				]));
 			if (j.done) {
 				if (j.ok)
 					add(boxJob, info('完成：' + (j.message || '')));
 				else {
 					add(boxJob, warn('失败（' + (j.code || '') + '）：' + (j.message || '')));
-					add(boxJob, hint(K.errText(j.code)));
+					add(boxJob, hint('原因：' + K.errText(j.code)));
+					if (state.lastInstall)
+						add(boxJob, button('重试（沿用上次参数）', 'cbi-button-action', function() {
+							startInstall(state.lastInstall);
+						}));
 				}
 			}
 		}
@@ -358,17 +386,34 @@ return view.extend({
 			clear(boxInstall);
 			var mirrors = state.mirrors ? state.mirrors.mirrors || [] : [];
 			var srcSel = select(
-				mirrors.filter(function(m) { return m.enabled || m.official; }).map(function(m) {
-					return [ m.name, m.label + (m.official ? '（默认）' : ''), state.src === m.name ];
-				}).concat([ [ '__custom', '自定义 URL / 本地文件', state.src === '__custom' ] ]),
-				function(ev) { state.src = ev.target.value; renderInstall(); });
+				[ [ 'auto', '自动（按顺序回退：内置官方 + 加速镜像）', state.src === 'auto' ] ].concat(
+					mirrors.filter(function(m) { return m.name !== 'custom' || m.prefix; }).map(function(m) {
+						return [ m.name, m.label + (m.official ? '（官方）' : (m.enabled ? '' : '（未启用，手动选用）')),
+							state.src === m.name ];
+					})).concat([ [ '__custom', '自定义 URL / 本地文件', state.src === '__custom' ] ]),
+				function(ev) {
+					state.src = ev.target.value;
+					renderInstall();
+					// 选源持久化到 UCI（ferry.main.kernel_source），下次打开仍是该源
+					if (state.src !== '__custom')
+						K.callSourceSet(state.src).then(function() { refreshStatus(); }).catch(function() {});
+				});
 
 			var verSel = select(
-				[ [ '', state.versions ? '— 选择版本 —' : '（先点「获取版本清单」）', !state.selUrl ] ].concat(
+				[ [ '', state.versions ? '— 选择版本 —' : '（内置清单加载中…）', !state.selUrl ] ].concat(
 					(state.versions || []).map(function(v) {
-						return [ v.url, v.version + (v.prerelease ? '（预发布）' : '') + '  ' + v.asset, state.selUrl === v.url ];
+						return [ v.url, v.version + (v.prerelease ? '（预发布）' : '') + '  ' + v.asset
+							+ (v.size ? '  ' + K.fmtBytes(v.size) : ''), state.selUrl === v.url ];
 					})),
-				function(ev) { state.selUrl = ev.target.value; renderInstall(); });
+				function(ev) {
+					state.selUrl = ev.target.value;
+					var v = (state.versions || []).filter(function(x) { return x.url === state.selUrl; })[0];
+					state.curSize = v ? (v.size || 0) : 0;
+					// 内置清单自带官方 SHA-256：选中即填入，避免用户忘记校验
+					var shaEl = document.getElementById('k-sha');
+					if (shaEl && v && v.sha256) shaEl.value = v.sha256;
+					renderInstall();
+				});
 
 			var customUrl = E('input', { 'type': 'text', 'class': 'cbi-input-text', 'style': 'width:100%',
 				'placeholder': 'https://…（完整 URL，必须是 HTTPS）', 'id': 'k-custom-url' });
@@ -382,10 +427,14 @@ return view.extend({
 			preBox.addEventListener('change', function(ev) { state.prerelease = !!ev.target.checked; });
 
 			var srcHint = '';
-			if (state.src !== '__custom') {
+			if (state.src === 'auto') {
+				var chain = (state.st && state.st.source_chain) || 'github ghfast ghproxy';
+				srcHint = '按顺序自动回退：' + chain + '；失败会在任务里显示「已回退到 X 源」';
+			} else if (state.src !== '__custom') {
 				var sm = mirrors.filter(function(x) { return x.name === state.src; })[0];
 				if (sm)
-					srcHint = sm.official ? '官方 GitHub Release（https://github.com）' : ('前缀：' + (sm.prefix || '（未配置，将回落官方源）'));
+					srcHint = sm.official ? '官方 GitHub Release（https://github.com）'
+						: ('前缀：' + (sm.prefix || '（未配置，将回落官方源）') + '；失败会自动回退到其余源');
 			}
 
 			var progress = E('div', { 'id': 'k-progress' });
@@ -415,15 +464,17 @@ return view.extend({
 						' ',
 						button('下载并安装', 'cbi-button-apply', function() {
 							var u = (document.getElementById('k-custom-url') || {}).value || '';
-							var urls = u || state.selUrl;
-							if (!urls) { ui.addNotification(null, E('p', {}, [ '请选择版本或填写自定义 URL' ]), 'warning'); return; }
+							var vsel = u ? null : (state.versions || []).filter(function(v) { return v.url === state.selUrl; })[0];
+							var urls = u || (vsel && vsel.url) || state.selUrl;
 							var version = u ? 'custom-' + new Date().toISOString().replace(/[-:T.Z]/g, '').slice(0, 14)
-								: versionOfUrl(state.selUrl);
-							if (!version) { ui.addNotification(null, E('p', {}, [ '所选版本无法识别，请重新获取版本清单' ]), 'warning'); return; }
+								: (vsel ? vsel.version : '');
+							if (!urls || !version) { ui.addNotification(null, E('p', {}, [ '请选择版本或填写自定义 URL' ]), 'warning'); return; }
+							state.curSize = vsel ? (vsel.size || 0) : 0;
 							startInstall({
 								op: 'install', kernel: state.selKernel, version: version, urls: urls,
-								sha256: (document.getElementById('k-sha') || {}).value || '',
-								mirror: (u ? 'github' : (state.src === '__custom' ? 'github' : state.src)),
+								sha256: (document.getElementById('k-sha') || {}).value || (vsel && vsel.sha256) || '',
+								size: vsel ? (vsel.size || 0) : 0,
+								mirror: (u ? 'github' : (state.src === '__custom' ? 'auto' : state.src)),
 								allow_unverified: (document.getElementById('k-allow-unverified') || {}).checked ? 1 : 0,
 								activate: (document.getElementById('k-activate') || {}).checked ? 1 : 0,
 								restart: 1
@@ -464,23 +515,34 @@ return view.extend({
 				]),
 				progress
 			]));
-			add(boxInstall, hint('下载会依次尝试所选源的候选包（sing-box 优先 musl）。SHA-256 不匹配、架构不符、glibc 依赖、磁盘不足都会直接失败且不落位。'));
+			add(boxInstall, hint('版本清单来自包内置清单（含官方 SHA-256 与大小，离线可用），生成日期 '
+				+ ((state.versionsMeta && state.versionsMeta.generated) || '未知') + '。下载会按当前源顺序回退；'
+				+ 'SHA-256 不匹配、架构不符、glibc 依赖、磁盘不足都会直接失败且不落位，旧版本保留可回滚。'));
 			if (state.versionsErr) add(boxInstall, warn(state.versionsErr));
 		}
 
-		function loadVersions() {
+		function loadVersions(silent) {
 			state.versionsErr = '';
-			if (!state.mirrors) { loadMirrors(function() { loadVersions(); }); return; }
-			ui.addNotification(null, E('p', {}, [ '正在获取 ' + state.selKernel + ' 版本清单…' ]), 'info');
+			if (!state.mirrors) { loadMirrors(function() { loadVersions(silent); }); return; }
+			if (!silent) ui.addNotification(null, E('p', {}, [ '正在读取 ' + state.selKernel + ' 版本清单…' ]), 'info');
 			K.callVersions(state.selKernel, state.prerelease ? 1 : 0).then(function(r) {
 				if (!r || !r.ok) { state.versions = null; state.versionsErr = (r && r.error) || '获取失败'; }
-				else { state.versions = r.versions || []; state.versionsErr = ''; }
+				else {
+					state.versions = r.versions || [];
+					state.versionsErr = '';
+					state.versionsMeta = { arch: r.arch, variants: r.variants, generated: r.generated, list: r.list };
+					if (!state.selUrl && state.versions.length) {
+						state.selUrl = state.versions[0].url;
+						state.curSize = state.versions[0].size || 0;
+					}
+				}
 				renderInstall();
 			}).catch(function(e) { state.versionsErr = '' + e; renderInstall(); });
 		}
 
 		function startInstall(args) {
 			if (state.busy) { ui.addNotification(null, E('p', {}, [ '已有任务在执行' ]), 'warning'); return; }
+			state.lastInstall = args;
 			state.busy = true;
 			K.callStart(args).then(function(r) {
 				if (!r || !r.ok) throw new Error((r && r.error) || '任务提交失败');
@@ -545,7 +607,7 @@ return view.extend({
 					})
 				])
 			]));
-			add(boxMirrors, hint('镜像只做 URL 前缀替换（例如 https://ghproxy.net/ + 原始 GitHub 链接），不改变校验策略：仍然要求官方/侧车 SHA-256，否则标注未校验。默认只启用官方源，第三方镜像需你手动勾选。'));
+			add(boxMirrors, hint('镜像只做传输加速（GitHub 前缀或 jsDelivr 映射），不改变校验策略：SHA-256 始终以官方值/官方侧车为准，镜像给错或给旧文件会被校验拦住。默认启用官方 + ghfast.top + ghproxy.net，失败按顺序自动回退。'));
 		}
 
 		function renderLicense() {
@@ -573,7 +635,7 @@ return view.extend({
 		renderInstallTable();
 		renderInstall();
 		renderJob();
-		loadMirrors();
+		loadMirrors(function() { loadVersions(true); });
 
 		if (state.st.job && state.st.job.phase && !state.st.job.done)
 			startPoll();

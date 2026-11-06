@@ -69,6 +69,8 @@ stop_service() {
 	fi
 	# init 脚本已不在（例如包已卸掉后手工补清理）：直接结束内核进程
 	info "未找到 $PM_INIT_SCRIPT，直接结束内核进程"
+	pkill -f "$PM_CONF_DIR/kernels/current/mihomo" 2>/dev/null
+	pkill -f "$PM_CONF_DIR/kernels/current/sing-box" 2>/dev/null
 	pkill -f '/usr/bin/mihomo' 2>/dev/null
 	pkill -f '/usr/bin/sing-box' 2>/dev/null
 	return 0
@@ -170,7 +172,10 @@ cleanup_state() {
 			info "按显式选择删除内核版本库 $PM_CONF_DIR/kernels"
 			rm -rf "$PM_CONF_DIR/kernels" "$PM_CONF_DIR/mirrors.json" 2>/dev/null
 		else
-			info "保留内核版本库 $PM_CONF_DIR/kernels（如需删除请显式执行 --purge-kernels）"
+			local kept
+			kept=$(ls -1 "$PM_CONF_DIR/kernels" 2>/dev/null | grep -vx current | tr '\n' ' ')
+			info "保留内核版本库 $PM_CONF_DIR/kernels${kept:+（$kept）}；当前内核指针 $PM_CONF_DIR/kernels/current 仍在，重新安装插件即可继续使用"
+			info "如需连同内核一起删除，请显式执行 --purge-kernels"
 			# 没有内核版本库时目录里已无可保留内容，直接清掉空壳目录
 			[ -d "$PM_CONF_DIR/kernels" ] || rm -rf "$PM_CONF_DIR" 2>/dev/null
 		fi

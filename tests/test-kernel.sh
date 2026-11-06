@@ -19,6 +19,7 @@ note() { echo "  - $*"; }
 
 cleanup() {
 	[ -n "${HTTP_PID:-}" ] && kill "$HTTP_PID" 2>/dev/null
+	[ -n "${MIRROR_PID:-}" ] && kill "$MIRROR_PID" 2>/dev/null
 	# mock 服务会拉起真实内核进程，退出时一并清理
 	[ -f "${T:-}/svc.state" ] && kill "$(cat "$T/svc.state")" 2>/dev/null
 	rm -rf "$T"
@@ -102,11 +103,14 @@ except Exception:
     sys.exit(1 if test else 3)
 if test:
     sys.exit(0)
-m = re.match(r'^@\.mirrors\[@\.name="([^"]+)"\]\.prefix$', expr or '')
+m = re.match(r'^@\.mirrors\[@\.name="([^"]+)"\]\.([A-Za-z_][A-Za-z0-9_]*)$', expr or '')
 if m:
     for it in obj.get('mirrors', []):
         if it.get('name') == m.group(1):
-            print(it.get('prefix', ''))
+            if m.group(2) not in it:
+                sys.exit(6)
+            v = it.get(m.group(2))
+            print(v if not isinstance(v, bool) else str(v).lower())
             sys.exit(0)
     sys.exit(6)
 m = re.match(r'^@\.([A-Za-z_][A-Za-z0-9_]*)$', expr or '')
@@ -149,6 +153,7 @@ printf '%s' '1' > "$T/uci-state/ferry.main.enabled"
 printf '%s' '0' > "$T/uci-state/ferry.main.rule_update"
 
 export PMK_STORE="$T/store" PMK_RUN="$T/run" PMK_BIN_DIR="$T/bin" PMK_LIB_DIR="$SRC"
+export PMK_CUR="$T/bin" PMK_SYS_BIN_DIR="$T/sysbin" PMK_BUILTIN="$SRC/kernels-builtin.tsv"
 export PMK_UCI="$T/fake/uci" PMK_SERVICE="$T/fake/initd-ferry"
 export PMK_MIRRORS="$T/store/mirrors.json" PMK_JOB="$T/run/kernel-job.json"
 export PMK_LOCK="$T/run/kernel.lock" PMK_STAGE="$T/store/.stage" PMK_JAIL="$T/jail"
@@ -318,14 +323,18 @@ PMK_OP_SHA256="$(sha_of "$T/www/fake-arm64.gz")" PMK_OP_ACTIVATE=1 run_op instal
 if ! job_ok && [ "$(job_code)" = ERR_ARCH ]; then pass "架构不匹配被拒绝（ERR_ARCH）"; else
 	fail "架构检查未拦截：$(job_code) $(job_msg)"
 fi
+job_msg | grep -q '可用变体' && pass "架构错误提示包含本机可用变体（$(job_msg)）" || fail "架构错误提示太含糊：$(job_msg)"
+job_msg | grep -q 'amd64' && pass "架构错误提示包含本机架构" || fail "架构错误提示缺少本机架构"
 [ ! -d "$PMK_STORE/singbox/vfake-arm" ] && pass "架构不符未落位" || fail "架构不符仍落位"
 
 echo "===== 11. 磁盘空间不足 ====="
 FAKE_DF=1 PMK_OP_KERNEL=singbox PMK_OP_VERSION=v1.12.0 PMK_OP_URLS="$URL/sing-box-1.12.0-linux-amd64.tar.gz" \
-PMK_OP_SHA256="$(sha_of "$T/www/sing-box-1.12.0-linux-amd64.tar.gz")" PMK_OP_ACTIVATE=1 run_op install
+PMK_OP_SHA256="$(sha_of "$T/www/sing-box-1.12.0-linux-amd64.tar.gz")" PMK_OP_SIZE=22893972 PMK_OP_ACTIVATE=1 run_op install
 if ! job_ok && [ "$(job_code)" = ERR_DISK_FULL ]; then pass "磁盘不足被拦截（ERR_DISK_FULL）"; else
 	fail "磁盘检查未拦截：$(job_code) $(job_msg)"
 fi
+job_msg | grep -q '空间不足' && job_msg | grep -q '可用' \
+	&& pass "空间错误给出可用/所需（$(job_msg)）" || fail "空间错误信息不可读：$(job_msg)"
 
 echo "===== 12. 后台任务路径（start + job 轮询） ====="
 printf '{"op":"install","kernel":"singbox","version":"v1.10.7","urls":"%s/sing-box-1.10.7-linux-amd64.tar.gz","sha256":"%s","activate":0,"expect_version":"1.10.7"}' \
@@ -343,10 +352,11 @@ job_is done true && pass "后台任务完成（$(job_msg)）" || fail "后台任
 echo "===== 13. 镜像前缀与校验策略（单元） ====="
 cat > "$PMK_MIRRORS" <<'EOF'
 {
+  "version": 2,
   "mirrors": [
-    { "name": "github", "label": "GitHub 官方", "prefix": "", "enabled": true, "official": true },
-    { "name": "ghproxy", "label": "ghproxy 加速", "prefix": "https://ghproxy.net/", "enabled": false, "official": false },
-    { "name": "insecure", "label": "非 HTTPS", "prefix": "http://evil.example/", "enabled": false, "official": false }
+    { "name": "github", "label": "GitHub 官方", "prefix": "", "enabled": true, "official": true, "kind": "official" },
+    { "name": "ghproxy", "label": "ghproxy 加速", "prefix": "https://ghproxy.net/", "enabled": false, "official": false, "kind": "prefix" },
+    { "name": "insecure", "label": "非 HTTPS", "prefix": "http://evil.example/", "enabled": false, "official": false, "kind": "prefix" }
   ]
 }
 EOF
@@ -379,6 +389,86 @@ out=$(sh "$SRC/uninstall.sh" --purge 2>&1)
 out=$(sh "$SRC/uninstall.sh" --purge-kernels 2>&1)
 [ ! -d "$PM_CONF_DIR/kernels" ] && pass "--purge-kernels 显式删除内核版本库" || fail "--purge-kernels 未删除"
 note "uninstall 输出：$(echo "$out" | tr '\n' ' ' | head -c 200)"
+
+echo "===== 16. 内置源清单（官方 + ≥2 加速镜像，默认启用） ====="
+rm -f "$PMK_MIRRORS"
+out=$(sh "$SRC/kernel.sh" mirrors)
+echo "$out" | grep -q '"ok":true' && pass "mirrors 接口可用" || fail "mirrors 异常：$out"
+if echo "$out" | grep -q '"name": "ghfast"' && echo "$out" | grep -q '"name": "ghproxy"' \
+	&& echo "$out" | grep -q '"name": "jsdelivr"'; then
+	pass "内置清单含 ghfast.top / ghproxy.net / jsDelivr 三类镜像"
+else
+	fail "内置镜像缺失：$out"
+fi
+echo "$out" | grep -q '"selected":"auto"' && pass "默认源为 auto（按序回退）" || fail "默认源不是 auto：$out"
+out=$(sh -c '. "$0"; pmk_source_chain auto' "$SRC/kernel.sh")
+[ "$out" = "github ghfast ghproxy" ] && pass "默认回退顺序：$out" || fail "回退顺序异常：$out"
+out=$(sh -c '. "$0"; pmk_source_url "https://github.com/a/b/releases/download/v1/x.gz" jsdelivr' "$SRC/kernel.sh")
+case "$out" in
+	https://cdn.jsdelivr.net/gh/a/b@v1/x.gz) pass "jsDelivr 映射 GitHub 资产：$out" ;;
+	*) fail "jsDelivr 映射异常：$out" ;;
+esac
+out=$(sh -c '. "$0"; pmk_source_url "https://example.com/x.gz" jsdelivr' "$SRC/kernel.sh")
+[ -z "$out" ] && pass "jsDelivr 对非 GitHub URL 明确跳过（不伪装官方源）" || fail "jsDelivr 错误映射：$out"
+
+echo "===== 17. 镜像失败自动回退并在任务里标注（反例） ====="
+cat > "$PMK_MIRRORS" <<'EOF'
+{ "version": 2, "mirrors": [
+  { "name": "github", "label": "GitHub 官方", "prefix": "", "enabled": true, "official": true, "kind": "official" },
+  { "name": "ghfast", "label": "坏镜像", "prefix": "https://127.0.0.1:19999/", "enabled": true, "official": false, "kind": "prefix" }
+] }
+EOF
+PMK_OP_KERNEL=singbox PMK_OP_VERSION=v1.12.0 PMK_OP_URLS="$URL/sing-box-1.12.0-linux-amd64.tar.gz" \
+PMK_OP_SHA256="$(sha_of "$T/www/sing-box-1.12.0-linux-amd64.tar.gz")" PMK_OP_MIRROR=ghfast PMK_OP_ACTIVATE=0 run_op install
+job_ok && pass "首选镜像不可用时自动回退并安装成功" || fail "回退后仍失败：$(job_msg)"
+grep -q '"source":"github"' "$PMK_JOB" && pass "任务记录实际源=github（回退后）" || fail "未记录实际源：$(cat "$PMK_JOB")"
+grep -q '"fallback":true' "$PMK_JOB" && pass "任务标注已回退（fallback=true）" || fail "未标注回退"
+[ -x "$PMK_STORE/singbox/v1.12.0/sing-box" ] && pass "回退下载的文件通过校验并落位" || fail "回退产物未落位"
+rm -f "$PMK_MIRRORS"
+
+echo "===== 18. 镜像给错/旧文件被 SHA-256 拦住（反例） ====="
+mkdir -p "$T/www-mirror"
+cp "$T/www/sing-box-1.10.7-linux-amd64.tar.gz" "$T/www-mirror/sing-box-1.12.0-linux-amd64.tar.gz"
+python3 -m http.server 18081 --bind 127.0.0.1 --directory "$T/www-mirror" >/dev/null 2>&1 &
+MIRROR_PID=$!
+for i in $(seq 1 20); do
+	curl -s -o /dev/null "http://127.0.0.1:18081/sing-box-1.12.0-linux-amd64.tar.gz" && break
+	sleep 0.3
+done
+rm -rf "$PMK_STORE/mihomo/.probe" "$PMK_STORE/singbox/v1.13.0"
+PMK_OP_KERNEL=singbox PMK_OP_VERSION=v1.13.0 PMK_OP_URLS="http://127.0.0.1:18081/sing-box-1.12.0-linux-amd64.tar.gz" \
+PMK_OP_SHA256="$(sha_of "$T/www/sing-box-1.12.0-linux-amd64.tar.gz")" PMK_OP_ACTIVATE=1 run_op install
+if ! job_ok && [ "$(job_code)" = ERR_SHA_MISMATCH ]; then pass "镜像旧文件被 SHA-256 拦截（ERR_SHA_MISMATCH）"; else
+	fail "错误文件未被拦截：$(job_code) $(job_msg)"
+fi
+job_msg | grep -q '期望' && job_msg | grep -q '实际' && pass "校验失败给出期望/实际摘要" || fail "校验失败信息不全：$(job_msg)"
+[ ! -d "$PMK_STORE/singbox/v1.13.0" ] && pass "校验失败未落位（旧版本保留可回退）" || fail "校验失败仍落位"
+kill "$MIRROR_PID" 2>/dev/null
+
+echo "===== 19. 安装路径在插件目录 + 不覆盖系统内核（反例） ====="
+mkdir -p "$PMK_SYS_BIN_DIR"
+cp "$PMK_STORE/mihomo/v1.18.8/mihomo" "$PMK_SYS_BIN_DIR/mihomo"
+sys_sha=$(sha_of "$PMK_SYS_BIN_DIR/mihomo")
+PMK_OP_KERNEL=mihomo PMK_OP_VERSION=v1.18.8 PMK_OP_URLS="$URL/mihomo-linux-amd64-v1.18.8.gz" \
+PMK_OP_SHA256="$(sha_of "$T/www/mihomo-linux-amd64-v1.18.8.gz")" PMK_OP_ACTIVATE=1 PMK_OP_RESTART=0 run_op install
+link="$PMK_BIN_DIR/mihomo"
+[ -L "$link" ] && pass "current 指针是符号链接：$link" || fail "current 指针缺失"
+case "$(readlink "$link")" in
+	"$PMK_STORE"/*) pass "指针指向插件目录内版本：$(readlink "$link")" ;;
+	*) fail "指针指向异常：$(readlink "$link")" ;;
+esac
+[ "$(sha_of "$PMK_SYS_BIN_DIR/mihomo")" = "$sys_sha" ] && pass "系统自带二进制未被覆盖（sha 不变）" || fail "系统二进制被改写"
+[ -f "$PMK_STORE/mihomo/v1.18.8/mihomo" ] && pass "内核按「内核名/版本」分层存放" || fail "分层目录缺失"
+out=$(sh -c '. "$0"; export PM_KERNEL=mihomo PM_KERNEL_DIR="'"$PMK_BIN_DIR"'" PM_BIN_DIR=/usr/bin; pm_kernel_bin' "$SRC/common.sh")
+[ "$out" = "$PMK_BIN_DIR/mihomo" ] && pass "服务取二进制优先插件目录：$out" || fail "服务仍依赖 /usr/bin：$out"
+
+echo "===== 20. 内置版本清单（离线可用、带官方 SHA-256/大小） ====="
+out=$(printf '{"kernel":"mihomo"}' | sh "$SRC/kernel.sh" versions)
+echo "$out" | grep -q '"ok":true' && pass "内置版本清单可用（离线）" || fail "内置清单不可用：$out"
+echo "$out" | grep -q '"list":"builtin"' && pass "清单来源标注 builtin" || fail "清单来源未标注"
+n=$(echo "$out" | grep -o '"sha256":"[0-9a-f]\{64\}"' | wc -l)
+[ "$n" -ge 3 ] && pass "清单含官方 SHA-256 的条目 $n 条" || fail "SHA-256 条目过少：$n"
+echo "$out" | grep -q '"size":[1-9]' && pass "清单含资产大小（用于下载前空间检查）" || fail "清单缺少 size"
 
 echo
 if [ "$FAILED" -eq 0 ]; then

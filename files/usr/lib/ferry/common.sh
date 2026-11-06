@@ -273,12 +273,16 @@ pm_mgmt_cidrs() {
 }
 
 pm_kernel_bin() {
+	local b
+	if [ "$PM_KERNEL" = singbox ]; then b=sing-box; else b=mihomo; fi
 	if [ -n "${PM_BIN_PATH:-}" ]; then
 		echo "$PM_BIN_PATH"
-	elif [ "$PM_KERNEL" = singbox ]; then
-		echo "${PM_BIN_DIR:-/usr/bin}/sing-box"
+	elif [ -x "${PM_KERNEL_DIR:-/etc/ferry/kernels/current}/$b" ]; then
+		# 插件专属目录里的 current 指针（内核管理安装的版本）
+		echo "${PM_KERNEL_DIR:-/etc/ferry/kernels/current}/$b"
 	else
-		echo "${PM_BIN_DIR:-/usr/bin}/mihomo"
+		# 兼容：插件没有安装内核时，仍可用系统自带二进制（只读，不覆盖）
+		echo "${PM_BIN_DIR:-/usr/bin}/$b"
 	fi
 }
 
