@@ -194,8 +194,15 @@ pt_claim() {
 	# 锁超过 60 秒视为崩溃残留（正常还原远低于这个时间）
 	local ts now
 	ts=$(cat "$PM_TXN_LOCK/ts" 2>/dev/null)
+	# ts 可能还没落盘（刚 mkdir 成功的进程正在写）：用锁目录 mtime 兜底。
+	# 这里不能把缺失的 ts 当 0，否则并发时第二个进程会把刚建立的新锁当残留抢走，
+	# 导致同一事务被回滚两次（历史重复、UCI 反复还原）。
+	case "$ts" in ''|*[!0-9]*)
+		ts=$(stat -c %Y "$PM_TXN_LOCK" 2>/dev/null)
+		case "$ts" in ''|*[!0-9]*) ts=0 ;; esac
+		;;
+	esac
 	now=$(pt_now)
-	case "$ts" in ''|*[!0-9]*) ts=0 ;; esac
 	if [ $((now - ts)) -gt 60 ]; then
 		rm -rf "$PM_TXN_LOCK"
 		mkdir "$PM_TXN_LOCK" 2>/dev/null || return 1

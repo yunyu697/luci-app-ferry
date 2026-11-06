@@ -5,6 +5,9 @@ set -euo pipefail
 
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 DIST="${1:-${DIST:-$REPO/dist}}"
+# 解包前会 cd 到临时目录，这里必须先转成绝对路径（CI 传的是相对 dist）
+[ -d "$DIST" ] || { echo "ERROR: dist 目录不存在：$DIST" >&2; exit 1; }
+DIST="$(cd "$DIST" && pwd)"
 APK_STATIC="${APK_STATIC:-$REPO/.ci/tools/apk.static}"
 META="$DIST/build-meta.txt"
 
