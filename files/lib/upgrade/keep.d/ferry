@@ -1,0 +1,6 @@
+# ferry: sysupgrade 保留插件专属内核目录（<内核>/<版本>/ + active/previous/current 指针）
+# 机制：OpenWrt sysupgrade 只会备份 /etc/sysupgrade.conf 与 /lib/upgrade/keep.d/* 里列出的路径，
+# overlay 上的其它文件在升级时全部丢弃（实测见 F1-PROGRESS r8）。
+# 注意：内核是几十 MB 的二进制，打进备份会显著增大升级包；建议把 ferry.main.kernel_dir
+# 指到外置存储（如 /mnt/sda1/ferry-kernels），那样无需依赖本文件。
+/etc/ferry/kernels

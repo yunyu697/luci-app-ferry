@@ -12,14 +12,21 @@
 #
 # 所有会改变运行态的操作都走 job：写 $PMK_JOB，由 rpcd 侧轮询进度。
 
-PMK_STORE=${PMK_STORE:-/etc/ferry/kernels}
+PMK_STORE_DEFAULT=/etc/ferry/kernels
+PMK_UCI=${PMK_UCI:-uci}
+if [ -z "${PMK_STORE:-}" ]; then
+	PMK_STORE=$($PMK_UCI -q get ferry.main.kernel_dir 2>/dev/null)
+	case "$PMK_STORE" in
+		''|*..*|*[!A-Za-z0-9._/-]*) PMK_STORE=$PMK_STORE_DEFAULT ;;
+	esac
+fi
 PMK_CUR=${PMK_CUR:-$PMK_STORE/current}
 PMK_BIN_DIR=${PMK_BIN_DIR:-$PMK_CUR}
 PMK_SYS_BIN_DIR=${PMK_SYS_BIN_DIR:-/usr/bin}
 PMK_RUN=${PMK_RUN:-/var/etc/ferry}
 PMK_LIB_DIR=${PMK_LIB_DIR:-/usr/lib/ferry}
-PMK_UCI=${PMK_UCI:-uci}
 PMK_SERVICE=${PMK_SERVICE:-/etc/init.d/ferry}
+PMK_KEEP_D=${PMK_KEEP_D:-/lib/upgrade/keep.d/ferry}
 PMK_MIRRORS=${PMK_MIRRORS:-$PMK_STORE/mirrors.json}
 PMK_BUILTIN=${PMK_BUILTIN:-$PMK_LIB_DIR/kernels-builtin.tsv}
 PMK_JOB=${PMK_JOB:-$PMK_RUN/kernel-job.json}
@@ -33,8 +40,8 @@ PMK_CFG_SINGBOX=${PMK_CFG_SINGBOX:-/etc/sing-box/config.json}
 # 后台任务子进程（sh $PMK_LIB_DIR/kernel.sh run）需要继承这些路径；
 # 默认值不变，仅在离线测试时用环境变量覆盖
 export PMK_STORE PMK_CUR PMK_BIN_DIR PMK_SYS_BIN_DIR PMK_RUN PMK_LIB_DIR PMK_UCI \
-	PMK_SERVICE PMK_MIRRORS PMK_BUILTIN PMK_JOB PMK_LOCK PMK_STAGE PMK_JAIL \
-	PMK_FETCH_TIMEOUT PMK_CFG_MIHOMO PMK_CFG_SINGBOX
+	PMK_SERVICE PMK_KEEP_D PMK_MIRRORS PMK_BUILTIN PMK_JOB PMK_LOCK PMK_STAGE \
+	PMK_JAIL PMK_FETCH_TIMEOUT PMK_CFG_MIHOMO PMK_CFG_SINGBOX
 export PM_BIN_DIR="$PMK_BIN_DIR" PM_RUN_DIR="$PMK_RUN" PM_KERNEL_DIR="$PMK_CUR"
 
 pmk_log() { logger -t ferry-kernel -- "$*" 2>/dev/null; echo "$*" >&2; }
@@ -264,6 +271,33 @@ pmk_free_kb() {
 	echo "${kb:-0}"
 }
 
+pmk_store_device() {
+	local p=$PMK_STORE
+	while [ ! -d "$p" ] && [ "$p" != / ]; do p=$(dirname "$p"); done
+	df -k "$p" 2>/dev/null | awk 'NR==2{print $1}'
+}
+
+# 持久性判定（实测依据见 F1-PROGRESS）：
+#   rootfs  -> 在 overlay 上，sysupgrade 会整体清空，只有登记到
+#              /lib/upgrade/keep.d/ferry 才会进备份
+#   external-> 独立挂载（如 /mnt/sda1），固件升级不碰，天然持久
+#   volatile-> /tmp、/var 是 tmpfs，重启即丢，不能装内核
+pmk_store_persist() {
+	local p=$PMK_STORE dev rootdev
+	case "$p" in
+		/tmp/*|/var/*|/run/*) echo volatile; return 0 ;;
+	esac
+	dev=$(pmk_store_device)
+	rootdev=$(df -k / 2>/dev/null | awk 'NR==2{print $1}')
+	if [ "$dev" = "$rootdev" ]; then echo rootfs; else echo external; fi
+}
+
+pmk_store_backup_kb() {
+	local kb
+	kb=$(du -sk "$PMK_STORE" 2>/dev/null | awk '{print $1}' | head -1)
+	echo "${kb:-0}"
+}
+
 # ---------- 源清单（官方 + 内置加速镜像） ----------
 
 # 默认清单：官方源 + 两个实测可用的 GitHub 加速前缀（ghfast.top / ghproxy.net），
@@ -458,48 +492,59 @@ pmk_download() { # url out [label]
 # ---------- 版本清单（内置清单） ----------
 
 # 内置清单格式（Tab 分隔，首行注释带生成日期）：
-# kernel  tag  elf-arch  size-bytes  sha256  asset-name  download-url
+# kernel  tag  elf-arch  size-bytes  sha256  asset-name  download-url  [state]
+#   state 由审计脚本（tests/qemu/audit-assets.sh）写入：
+#     ok    = 已真实下载并校验 SHA-256
+#     probe = 仅探测到 HTTP 200/大小一致，未全量校验
+#     dead  = 探测失败（源上不存在/不可下载），界面直接隐藏，不让用户点了才失败
+#   旧清单没有第 8 列时按 unknown 处理（仍可用）
 pmk_builtin_date() {
 	sed -n '1s/.*generated=//p' "$PMK_BUILTIN" 2>/dev/null | head -1
 }
 
-pmk_builtin_records() { # kernel arch
+pmk_builtin_records() { # kernel arch [include-dead]
 	local tab
 	tab=$(printf '\t')
 	[ -s "$PMK_BUILTIN" ] || return 0
-	awk -F"$tab" -v k="$1" -v a="$2" '
+	awk -F"$tab" -v k="$1" -v a="$2" -v inc="${3:-0}" '
 		$0 ~ /^#/ { next }
 		NF < 7 { next }
-		$1 == k && $3 == a { print }
+		$1 == k && $3 == a {
+			st = (NF >= 8 && $8 != "") ? $8 : "unknown"
+			if (st == "dead" && inc != 1) next
+			print
+		}
 	' "$PMK_BUILTIN"
 }
 
 pmk_builtin_first_url() { # kernel arch
-	local rk tag arch size sha name url
-	pmk_builtin_records "$1" "$2" | while IFS="$(printf '\t')" read -r rk tag arch size sha name url; do
+	local rk tag arch size sha name url st
+	pmk_builtin_records "$1" "$2" | while IFS="$(printf '\t')" read -r rk tag arch size sha name url st; do
 		[ -n "$url" ] && { echo "$url"; break; }
 	done | head -1
 }
 
 pmk_api_versions() {
-	local kernel arch out sep rk tag rarch size sha name url date tab
+	local kernel arch out sep rk tag rarch size sha name url date tab st dead
 	kernel=$(pmk_norm_kernel "$(pmk_arg kernel)") || { echo '{"ok":false,"error":"unknown kernel"}'; return 0; }
 	arch=$(pmk_host_arch)
 	tab=$(printf '\t')
 	date=$(pmk_builtin_date)
 	out=''; sep=''
-	while IFS="$tab" read -r rk tag rarch size sha name url; do
+	while IFS="$tab" read -r rk tag rarch size sha name url st; do
 		[ -n "$rk" ] || continue
-		out="$out$sep{\"version\":\"$(pmk_esc "$tag")\",\"prerelease\":false,\"asset\":\"$(pmk_esc "$name")\",\"url\":\"$(pmk_esc "$url")\",\"size\":${size:-0},\"sha256\":\"$(pmk_esc "$sha")\"}"
+		[ -n "$st" ] || st=unknown
+		out="$out$sep{\"version\":\"$(pmk_esc "$tag")\",\"prerelease\":false,\"asset\":\"$(pmk_esc "$name")\",\"url\":\"$(pmk_esc "$url")\",\"size\":${size:-0},\"sha256\":\"$(pmk_esc "$sha")\",\"state\":\"$(pmk_esc "$st")\"}"
 		sep=','
 	done <<EOF
 $(pmk_builtin_records "$kernel" "$arch")
 EOF
+	dead=$(pmk_builtin_records "$kernel" "$arch" 1 | awk -F"$tab" 'NF>=8 && $8=="dead"' | wc -l | tr -d ' ')
 	if [ -z "$out" ]; then
 		echo "{\"ok\":false,\"error\":\"内置清单里没有 $kernel/$arch 的资产（本机可用变体：$(pmk_variants "$kernel")），请改用自定义 URL 或本地导入\",\"arch\":\"$arch\",\"variants\":\"$(pmk_variants "$kernel")\"}"
 		return 0
 	fi
-	echo "{\"ok\":true,\"kernel\":\"$kernel\",\"arch\":\"$arch\",\"variants\":\"$(pmk_variants "$kernel")\",\"list\":\"builtin\",\"generated\":\"$(pmk_esc "$date")\",\"versions\":[$out]}"
+	echo "{\"ok\":true,\"kernel\":\"$kernel\",\"arch\":\"$arch\",\"variants\":\"$(pmk_variants "$kernel")\",\"list\":\"builtin\",\"generated\":\"$(pmk_esc "$date")\",\"unavailable\":${dead:-0},\"versions\":[$out]}"
 }
 
 pmk_api_mirrors() {
@@ -541,6 +586,48 @@ pmk_api_source_set() {
 	else
 		echo '{"ok":false,"error":"写入 UCI 失败"}'
 	fi
+}
+
+# 设置内核存储目录（留空=插件默认 /etc/ferry/kernels，会登记进 sysupgrade 备份）
+pmk_api_store_set() {
+	local dir=$PMK_STORE_DEFAULT persist dev freekb
+	local newdir
+	newdir=$(pmk_arg dir)
+	case "$newdir" in
+		'') $PMK_UCI -q delete ferry.main.kernel_dir 2>/dev/null ;;
+		*)
+			case "$newdir" in
+				/*) ;;
+				*) echo '{"ok":false,"error":"必须是绝对路径"}'; return 0 ;;
+			esac
+			case "$newdir" in
+				*..*|*[!A-Za-z0-9._/-]*) echo '{"ok":false,"error":"路径字符不合法"}'; return 0 ;;
+				/tmp/*|/var/*|/run/*) echo '{"ok":false,"error":"/tmp、/var、/run 是内存盘，重启会丢，不能放内核"}'; return 0 ;;
+			esac
+			if [ "$newdir" != "$PMK_STORE_DEFAULT" ]; then
+				local parent
+				parent=$(dirname "$newdir")
+				if [ ! -d "$parent" ]; then
+					echo "{\"ok\":false,\"error\":\"上级目录不存在：$(pmk_esc "$parent")（外置存储请先挂载）\"}"
+					return 0
+				fi
+				if [ ! -w "$parent" ] && [ ! -w "$newdir" ]; then
+					echo "{\"ok\":false,\"error\":\"目录不可写：$(pmk_esc "$newdir")\"}"
+					return 0
+				fi
+			fi
+			$PMK_UCI -q set ferry.main.kernel_dir="$newdir" 2>/dev/null ;;
+	esac
+	$PMK_UCI -q commit ferry 2>/dev/null || {
+		echo '{"ok":false,"error":"写入 UCI 失败"}'
+		return 0
+	}
+	PMK_STORE=$($PMK_UCI -q get ferry.main.kernel_dir 2>/dev/null)
+	case "$PMK_STORE" in ''|*..*) PMK_STORE=$PMK_STORE_DEFAULT ;; esac
+	persist=$(pmk_store_persist)
+	dev=$(pmk_store_device)
+	freekb=$(pmk_free_kb "$PMK_STORE")
+	echo "{\"ok\":true,\"kernel_dir\":\"$(pmk_esc "$PMK_STORE")\",\"store_persist\":\"$persist\",\"store_device\":\"$(pmk_esc "$dev")\",\"free_kb\":${freekb:-0},\"keepd_installed\":$([ -f "$PMK_KEEP_D" ] && echo true || echo false)}"
 }
 
 # 手动检测镜像是否可用（不做自动轮询）：下载首包 6 秒，计时
@@ -667,9 +754,16 @@ pmk_api_status() {
 	local selfree runfree
 	selfree=$(pmk_free_kb "$PMK_STORE" 2>/dev/null)
 	runfree=$(pmk_free_kb "$PMK_RUN" 2>/dev/null)
+	local spersist sdev skeepd sbackup sdir_cfg
+	spersist=$(pmk_store_persist)
+	sdev=$(pmk_store_device)
+	skeepd=false
+	[ -f "$PMK_KEEP_D" ] && skeepd=true
+	sbackup=$(pmk_store_backup_kb)
+	sdir_cfg=$($PMK_UCI -q get ferry.main.kernel_dir 2>/dev/null)
 
 	out=$(cat <<EOF
-{"ok":true,"arch":"$arch","variants":"$(pmk_variants "$kcur")","uci_kernel":"$kcur","uci_kernel_norm":"$kk","running":$okj,"bin_path":"$(pmk_esc "$kernelpath")","bin_exists":$([ -x "$kernelpath" ] && echo true || echo false),"bin_source":"$binsrc","kernel_dir":"$(pmk_esc "$PMK_STORE")","current_link":"$(pmk_esc "$PMK_CUR/$bin")","system_bin":"$(pmk_esc "$sysbin")","system_bin_exists":$([ -x "$sysbin" ] && echo true || echo false),"download_dir":"$(pmk_esc "$PMK_STAGE")","free_kb":${selfree:-0},"free_run_kb":${runfree:-0},"config_path":"$(pmk_esc "$cfg_path")","config_compatible":$compat,"source_selected":"$(pmk_source_selected)","source_chain":"$(pmk_source_chain "$(pmk_source_selected)")","active":"$(pmk_esc "$tag")","previous":"$(pmk_esc "$(pmk_previous "$kk")")","active_version":"$(pmk_esc "$aver")","active_sha256":"$asha","active_size":${asize:-0},"active_arch":"$(pmk_esc "$aarch")","active_libc":"$(pmk_esc "$alibc")","arch_match":$amatch,"sb_bucket":"$(pmk_esc "$sbbucket")","config_check":"$(pmk_esc "$ccheck")","installed":$(pmk_installed_json),"job":$job}
+{"ok":true,"arch":"$arch","variants":"$(pmk_variants "$kcur")","uci_kernel":"$kcur","uci_kernel_norm":"$kk","running":$okj,"bin_path":"$(pmk_esc "$kernelpath")","bin_exists":$([ -x "$kernelpath" ] && echo true || echo false),"bin_source":"$binsrc","kernel_dir":"$(pmk_esc "$PMK_STORE")","current_link":"$(pmk_esc "$PMK_CUR/$bin")","system_bin":"$(pmk_esc "$sysbin")","system_bin_exists":$([ -x "$sysbin" ] && echo true || echo false),"download_dir":"$(pmk_esc "$PMK_STAGE")","free_kb":${selfree:-0},"kernel_dir_cfg":"$(pmk_esc "$sdir_cfg")","store_persist":"$spersist","store_device":"$(pmk_esc "$sdev")","keepd_installed":$skeepd,"store_backup_kb":${sbackup:-0},"free_run_kb":${runfree:-0},"config_path":"$(pmk_esc "$cfg_path")","config_compatible":$compat,"source_selected":"$(pmk_source_selected)","source_chain":"$(pmk_source_chain "$(pmk_source_selected)")","active":"$(pmk_esc "$tag")","previous":"$(pmk_esc "$(pmk_previous "$kk")")","active_version":"$(pmk_esc "$aver")","active_sha256":"$asha","active_size":${asize:-0},"active_arch":"$(pmk_esc "$aarch")","active_libc":"$(pmk_esc "$alibc")","arch_match":$amatch,"sb_bucket":"$(pmk_esc "$sbbucket")","config_check":"$(pmk_esc "$ccheck")","installed":$(pmk_installed_json),"job":$job}
 EOF
 )
 	echo "$out"
@@ -973,10 +1067,17 @@ pmk_run_install() { # 参数已通过环境/变量传入
 		need_kb=65536
 		need_txt="目标大小未知，按 64 MB 预留（下载 + 解压 + 旧版本）"
 	fi
+	# 内存盘不能作为内核目录（重启即丢）
+	if [ "$(pmk_store_persist)" = volatile ]; then
+		pmk_job_fail ERR_STORE "内核目录 $PMK_STORE 在内存盘（/tmp、/var、/run），重启即丢；请在「内核管理」把内核目录改到 overlay 或外置存储" 0 "$tag"
+	fi
 	free_kb=$(pmk_free_kb "$PMK_STORE" 2>/dev/null)
 	case "$free_kb" in ''|*[!0-9]*) free_kb=0 ;; esac
 	if [ "$free_kb" -lt "$need_kb" ]; then
-		pmk_job_fail ERR_DISK_FULL "空间不足：$PMK_STORE 可用 $((free_kb / 1024)) MB，需要至少 $((need_kb / 1024)) MB（$need_txt）；请先删除旧版本或改用本地导入" 0 "$tag"
+		local store_hint
+		store_hint="请先删除旧版本，或把内核目录改到外置存储（如 /mnt/sda1/ferry-kernels）"
+		[ "$(pmk_store_persist)" = external ] || store_hint="$store_hint；当前目录在 overlay：$(pmk_store_device) 同一分区，扩容/升级都可能不够"
+		pmk_job_fail ERR_DISK_FULL "空间不足：$PMK_STORE 可用 $((free_kb / 1024)) MB，需要至少 $((need_kb / 1024)) MB（$need_txt）；$store_hint" 0 "$tag"
 	fi
 
 	if [ "$PMK_OP_LOCAL" = 1 ]; then
@@ -1267,6 +1368,7 @@ case "${1:-}" in
 	mirrors) pmk_api_mirrors ;;
 	mirror-set) PMK_ARGS=$(cat); pmk_api_mirror_set ;;
 	source-set) PMK_ARGS=$(cat); pmk_api_source_set ;;
+	store-set) PMK_ARGS=$(cat); pmk_api_store_set ;;
 	mirror-test) PMK_ARGS=$(cat); pmk_api_mirror_test ;;
 	preview) PMK_ARGS=$(cat); pmk_api_preview ;;
 	remove) PMK_ARGS=$(cat); pmk_api_remove ;;

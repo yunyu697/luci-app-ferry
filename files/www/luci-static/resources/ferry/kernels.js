@@ -16,6 +16,7 @@ var callMirrors = rpc.declare({ object: 'luci-ferry-kernel', method: 'mirrors' }
 var callMirrorSet = rpc.declare({ object: 'luci-ferry-kernel', method: 'mirror_set', params: [ 'json' ] });
 var callMirrorTest = rpc.declare({ object: 'luci-ferry-kernel', method: 'mirror_test', params: [ 'name' ] });
 var callSourceSet = rpc.declare({ object: 'luci-ferry-kernel', method: 'source_set', params: [ 'name' ] });
+var callStoreSet = rpc.declare({ object: 'luci-ferry-kernel', method: 'store_set', params: [ 'dir' ] });
 
 /* sing-box 配置模板矩阵（与 generate.sh 的 pm_sb_bucket 保持一致）
  * 每个区间都用真实二进制做过 `sing-box check`，见 README 的“sing-box 版本矩阵”。 */
@@ -32,7 +33,8 @@ var ERR_TEXT = {
 	ERR_UNVERIFIED:   '官方未提供 SHA-256，安装被拦截；确认来源可信才可勾选“允许未校验安装”',
 	ERR_ARCH:         '二进制架构与本机不匹配，请选择对应变体（详情见失败原因）',
 	ERR_LIBC:         '二进制依赖 glibc，本固件为 musl',
-	ERR_DISK_FULL:    '磁盘空间不足（详情里给出可用/所需 MB）',
+	ERR_DISK_FULL:    '磁盘空间不足（详情里给出可用/所需 MB，可改到外置存储或删旧版本）',
+	ERR_STORE:        '内核目录在内存盘，重启即丢；请改到 overlay 或外置存储',
 	ERR_EXTRACT:      '解压失败或包内没有可执行文件',
 	ERR_EXEC:         '二进制无法执行（架构或依赖不匹配）',
 	ERR_VERSION_MISMATCH: '二进制版本与所选版本不一致',
@@ -57,6 +59,7 @@ return baseclass.extend({
 	callMirrorSet: callMirrorSet,
 	callMirrorTest: callMirrorTest,
 	callSourceSet: callSourceSet,
+	callStoreSet: callStoreSet,
 
 	bucketOf: function(version) {
 		var m = String(version || '').match(/([0-9]+)\.([0-9]+)/);

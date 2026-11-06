@@ -35,6 +35,18 @@ function hint(text)  { return E('div', { 'class': 'cbi-value-help' }, [ text ]);
 function warn(text)  { return E('div', { 'class': 'alert-message warning' }, [ text ]); }
 function info(text)  { return E('div', { 'class': 'alert-message' }, [ text ]); }
 
+// 内核目录的持久性（对应后端 store_persist）
+function storePersistText(s) {
+	if (s.store_persist === 'rootfs')
+		return 'overlay / ' + (s.store_device || '?') + '（sysupgrade 会清空，只有 keep.d 登记才进备份：'
+			+ (s.keepd_installed ? '已登记，当前备份约 ' + Math.round((s.store_backup_kb || 0) / 1024) + ' MB' : '未登记') + '）';
+	if (s.store_persist === 'external')
+		return '外置存储（固件升级不影响，不占用 overlay）';
+	if (s.store_persist === 'volatile')
+		return '内存盘（重启即丢，不能用于安装）';
+	return '未知';
+}
+
 return view.extend({
 	load: function() {
 		return K.callStatus().catch(function() { return {}; });
@@ -103,7 +115,8 @@ return view.extend({
 				[ '二进制路径', s.bin_path || '—' ],
 				[ '二进制来源', s.bin_source === 'plugin' ? '插件目录（current 指针）'
 					: (s.bin_source === 'system' ? '系统自带（只读回退，未被覆盖）' : '未找到可执行文件') ],
-				[ '内核目录', s.kernel_dir || '—' ],
+				[ '内核目录', (s.kernel_dir || '—') + (s.store_device ? '（分区 ' + s.store_device + '）' : '') ],
+				[ '目录持久性', storePersistText(s) ],
 				[ 'current 指针', s.current_link || '—' ],
 				[ '系统内核', s.system_bin
 					? (s.system_bin + (s.system_bin_exists ? '（存在，插件不会覆盖）' : '（不存在）'))
@@ -128,6 +141,10 @@ return view.extend({
 			add(boxStatus, table([ '项目', '值' ], rows.map(function(r) { return [ r[0], r[1] ]; })));
 			if (s.config_compatible === false)
 				add(boxStatus, warn('自备配置与当前内核格式不一致，切换前请先修正 ferry.main.config_path。'));
+			if (s.store_persist === 'rootfs')
+				add(boxStatus, warn('内核目录在 overlay 上：sysupgrade 只保留 /etc/sysupgrade.conf 与 /lib/upgrade/keep.d 登记的路径。'
+					+ (s.keepd_installed ? '本插件已登记 keep.d，升级时会打进备份（当前 ' + Math.round((s.store_backup_kb || 0) / 1024)
+						+ ' MB，备份过大可能导致升级失败，建议放外置存储）。' : '但本机没有 keep.d 登记，升级固件会丢内核，请重装本插件或改目录。'));
 		}
 
 		function renderInstallTable() {
@@ -382,6 +399,24 @@ return view.extend({
 			return '';
 		}
 
+		function saveStoreDir() {
+			var v = ((document.getElementById('k-store-dir') || {}).value || '').trim();
+			K.callStoreSet(v).then(function(r) {
+				if (!r || !r.ok) throw new Error((r && r.error) || '保存失败');
+				state.st.kernel_dir = r.kernel_dir;
+				state.st.store_persist = r.store_persist;
+				state.st.store_device = r.store_device;
+				state.st.free_kb = r.free_kb;
+				state.st.keepd_installed = r.keepd_installed;
+				state.st.kernel_dir_cfg = v;
+				renderStatus();
+				renderInstall();
+				ui.addNotification(null, E('p', {}, [ '内核目录已切换为 ' + r.kernel_dir + '（' + storePersistText(r) + '）' ]), 'info');
+			}).catch(function(e) {
+				ui.addNotification(null, E('p', {}, [ '' + (e && e.message ? e.message : e) ]), 'danger');
+			});
+		}
+
 		function renderInstall() {
 			clear(boxInstall);
 			var mirrors = state.mirrors ? state.mirrors.mirrors || [] : [];
@@ -440,6 +475,23 @@ return view.extend({
 			var progress = E('div', { 'id': 'k-progress' });
 
 			add(boxInstall, E('div', { 'class': 'cbi-section' }, [
+				E('div', { 'class': 'cbi-value' }, [
+					E('label', { 'class': 'cbi-value-title' }, [ '内核目录' ]),
+					E('div', { 'class': 'cbi-value-field' }, [
+						E('input', {
+							'id': 'k-store-dir', 'type': 'text', 'class': 'cbi-input-text',
+							'value': state.st.kernel_dir_cfg || '',
+							'placeholder': state.st.kernel_dir || '/etc/ferry/kernels'
+						}),
+						' ',
+						button('保存目录', 'cbi-button-action', saveStoreDir),
+						E('div', { 'class': 'cbi-value-help' }, [
+							'留空 = 插件默认 /etc/ferry/kernels（在 overlay 上，已用 keep.d 登记，sysupgrade 会打进备份）；'
+							+ '外置存储请填已挂载目录，如 /mnt/sda1/ferry-kernels（不占 overlay，升级固件也不受影响）。'
+							+ '当前：' + (state.st.kernel_dir || '/etc/ferry/kernels') + '，' + storePersistText(state.st)
+						])
+					])
+				]),
 				E('div', { 'class': 'cbi-value' }, [
 					E('label', { 'class': 'cbi-value-title' }, [ '下载源' ]),
 					E('div', { 'class': 'cbi-value-field' }, [
@@ -517,7 +569,9 @@ return view.extend({
 			]));
 			add(boxInstall, hint('版本清单来自包内置清单（含官方 SHA-256 与大小，离线可用），生成日期 '
 				+ ((state.versionsMeta && state.versionsMeta.generated) || '未知') + '。下载会按当前源顺序回退；'
-				+ 'SHA-256 不匹配、架构不符、glibc 依赖、磁盘不足都会直接失败且不落位，旧版本保留可回滚。'));
+				+ 'SHA-256 不匹配、架构不符、glibc 依赖、磁盘不足都会直接失败且不落位，旧版本保留可回滚。'
+				+ ((state.versionsMeta && state.versionsMeta.unavailable)
+					? '已隐藏 ' + state.versionsMeta.unavailable + ' 条源上不可用的资产（审计标记 dead，不展示以免点了才失败）。' : ''));
 			if (state.versionsErr) add(boxInstall, warn(state.versionsErr));
 		}
 
@@ -530,7 +584,8 @@ return view.extend({
 				else {
 					state.versions = r.versions || [];
 					state.versionsErr = '';
-					state.versionsMeta = { arch: r.arch, variants: r.variants, generated: r.generated, list: r.list };
+					state.versionsMeta = { arch: r.arch, variants: r.variants, generated: r.generated, list: r.list,
+						unavailable: r.unavailable || 0 };
 					if (!state.selUrl && state.versions.length) {
 						state.selUrl = state.versions[0].url;
 						state.curSize = state.versions[0].size || 0;

@@ -17,7 +17,7 @@ include $(TOPDIR)/rules.mk
 
 PKG_NAME:=luci-app-ferry
 PKG_VERSION:=1.0.0
-PKG_RELEASE:=7
+PKG_RELEASE:=8
 
 PKG_LICENSE:=GPL-2.0-only
 PKG_MAINTAINER:=yunyu697
@@ -97,6 +97,7 @@ define Package/luci-app-ferry/install
 	$(INSTALL_BIN) ./files/usr/lib/ferry/kernel.sh $(1)/usr/lib/ferry/kernel.sh
 	# 内置版本清单（含官方 SHA-256/大小）：离线也能列出可下载版本
 	$(INSTALL_DATA) ./files/usr/lib/ferry/kernels-builtin.tsv $(1)/usr/lib/ferry/kernels-builtin.tsv
+	$(INSTALL_DATA) ./files/lib/upgrade/keep.d/ferry $(1)/lib/upgrade/keep.d/ferry
 	$(INSTALL_BIN) ./files/usr/lib/ferry/transaction.sh $(1)/usr/lib/ferry/transaction.sh
 	$(INSTALL_BIN) ./files/usr/lib/ferry/watchdog.sh $(1)/usr/lib/ferry/watchdog.sh
 

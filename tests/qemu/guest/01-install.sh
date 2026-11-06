@@ -105,7 +105,24 @@ else
 	V=$(apk info -e luci-app-ferry 2>/dev/null | head -1)
 fi
 echo "installed_version=$V"
-echo "$V" | grep -q '1\.0\.0-r7' && ok "包元数据版本 = 1.0.0-r7" || bad "包元数据版本异常（$V）"
+echo "$V" | grep -q '1\.0\.0-r8' && ok "包元数据版本 = 1.0.0-r8" || bad "包元数据版本异常（$V）"
+
+# sysupgrade 保留：keep.d 登记才能让 /etc/ferry/kernels 进备份（/etc 其余部分升级即清空）
+KB=/lib/upgrade/keep.d/ferry
+if [ -s "$KB" ] && grep -q '^/etc/ferry/kernels$' "$KB"; then
+	ok "随包安装 /lib/upgrade/keep.d/ferry（登记 /etc/ferry/kernels）"
+else
+	bad "keep.d 缺失或未登记内核目录"
+fi
+mkdir -p /etc/ferry/kernels/probe && echo x > /etc/ferry/kernels/probe/bin
+# 必须移到 keep.d 目录之外：include_keep 用 /lib/upgrade/keep.d/* 通配，原地改名仍会被读到
+N0=$(mv "$KB" /tmp/ferry-keep.off 2>/dev/null; sysupgrade -l 2>/dev/null | grep -c '/etc/ferry/kernels')
+N1=$(mv /tmp/ferry-keep.off "$KB" 2>/dev/null; sysupgrade -l 2>/dev/null | grep -c '/etc/ferry/kernels')
+echo "sysupgrade_keep_probe: without=$N0 with=$N1"
+[ "${N0:-0}" -eq 0 ] && ok "无 keep.d 时内核目录不在升级保留清单（证明 /etc 不自动保留）" \
+	|| bad "无 keep.d 仍被保留（机制理解有误，without=$N0）"
+[ "${N1:-0}" -ge 1 ] && ok "有 keep.d 时内核目录进入升级保留清单" || bad "keep.d 登记无效（with=$N1）"
+rm -rf /etc/ferry/kernels/probe
 
 command -v nft >/dev/null 2>&1 && ok "nft 可用" || bad "nft 缺失"
 nft list tables >/dev/null 2>&1 && ok "nft 内核接口可用" || bad "nft 不可用"

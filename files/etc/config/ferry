@@ -52,6 +52,11 @@ config ferry 'main'
 	# （若设置了 bin_path，内核管理页不会覆盖该路径）
 	option bin_path ''
 
+	# 内核存储目录，留空 = /etc/ferry/kernels（overlay，已用 /lib/upgrade/keep.d/ferry
+	# 登记进 sysupgrade 备份）；可填外置存储已挂载目录（如 /mnt/sda1/ferry-kernels），
+	# 不占 overlay 且固件升级不影响。内存盘（/tmp、/var）会被拒绝。
+	option kernel_dir ''
+
 	# 内核下载源（仅“内核”页使用）：auto（官方 + 内置加速镜像按序回退）
 	# 或 mirrors.json 里的源名（github/ghfast/ghproxy/jsdelivr/custom）
 	option kernel_mirror 'auto'

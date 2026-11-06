@@ -9,7 +9,10 @@ set -u
 REPO=$(cd "$(dirname "$0")/.." && pwd)
 SRC="$REPO/files/usr/lib/ferry"
 KSRC='/mnt/d/Users/Tyler Zhang/Documents/Trae-CN/temp_20261104_07/qemu/kernels'
-T=$(mktemp -d /tmp/ferry-kernel-test.XXXXXX) || exit 1
+# 夹具目录不能放 /tmp、/var（内核目录在内存盘会被拒装，这是 r8 的保护逻辑）
+TEST_ROOT=${FERRY_TEST_ROOT:-${HOME:-/home/$(id -un)}}
+mkdir -p "$TEST_ROOT" 2>/dev/null
+T=$(mktemp -d "$TEST_ROOT/ferry-kernel-test.XXXXXX") || exit 1
 PORT=18080
 FAILED=0
 
@@ -70,6 +73,17 @@ if [ "${FAKE_DF:-0}" = 1 ]; then
 	echo "Filesystem 1024-blocks Used Available Capacity Mounted on"
 	echo "fake 1024 1024 100 100% /"
 	exit 0
+fi
+# 模拟外置存储：$FAKE_DF_EXT 前缀的路径单独一个分区（设备名 extdev）
+if [ -n "${FAKE_DF_EXT:-}" ]; then
+	_p=''
+	for _a in "$@"; do case "$_a" in -*) ;; *) _p=$_a ;; esac; done
+	case "$_p" in
+		"$FAKE_DF_EXT"*)
+			echo "Filesystem 1024-blocks Used Available Capacity Mounted on"
+			echo "extdev 2000000 100000 1900000 5% $FAKE_DF_EXT"
+			exit 0 ;;
+	esac
 fi
 exec /usr/bin/df "$@"
 EOF
@@ -469,6 +483,60 @@ echo "$out" | grep -q '"list":"builtin"' && pass "清单来源标注 builtin" ||
 n=$(echo "$out" | grep -o '"sha256":"[0-9a-f]\{64\}"' | wc -l)
 [ "$n" -ge 3 ] && pass "清单含官方 SHA-256 的条目 $n 条" || fail "SHA-256 条目过少：$n"
 echo "$out" | grep -q '"size":[1-9]' && pass "清单含资产大小（用于下载前空间检查）" || fail "清单缺少 size"
+
+echo "===== 21. sysupgrade 保留：keep.d 登记 ====="
+keepd="$REPO/files/lib/upgrade/keep.d/ferry"
+if [ -s "$keepd" ] && grep -q '^/etc/ferry/kernels$' "$keepd"; then
+	pass "随包 keep.d 登记内核目录：$(grep -v '^#' "$keepd" | tail -1)"
+else
+	fail "keep.d 缺失或未登记 /etc/ferry/kernels"
+fi
+grep -q 'keep.d/ferry' "$REPO/Makefile" && pass "Makefile 安装 keep.d" || fail "Makefile 未安装 keep.d"
+PMK_KEEP_D="$T/keepd-none" sh -c '. "$0"; pmk_api_status' "$SRC/kernel.sh" | grep -q '"keepd_installed":false' \
+	&& pass "未装 keep.d 时状态标注 false（提示升级会丢内核）" || fail "keepd_installed 状态异常"
+echo '/etc/ferry/kernels' > "$T/keepd"
+PMK_KEEP_D="$T/keepd" sh -c '. "$0"; pmk_api_status' "$SRC/kernel.sh" | grep -q '"keepd_installed":true' \
+	&& pass "已装 keep.d 时状态标注 true" || fail "keepd 检测失败"
+out=$(PMK_KEEP_D="$T/keepd" sh -c '. "$0"; pmk_api_status' "$SRC/kernel.sh")
+echo "$out" | grep -q '"store_persist":"rootfs"' && pass "默认目录判为 rootfs（overlay，需 keep.d）" || fail "默认目录持久性判定错误：$out"
+
+echo "===== 22. 外置存储与内存盘判定（反例） ====="
+mkdir -p "$T/extstore"
+PMK_STORE="$T/extstore" FAKE_DF_EXT="$T/extstore" sh -c '. "$0"; pmk_store_persist; pmk_store_device' "$SRC/kernel.sh" > "$T/ext.out"
+[ "$(head -1 "$T/ext.out")" = external ] && pass "独立分区判为 external（升级不影响）" || fail "外置判定错误：$(cat "$T/ext.out")"
+[ "$(tail -1 "$T/ext.out")" = extdev ] && pass "外置分区设备名正确：$(tail -1 "$T/ext.out")" || fail "分区识别错误"
+out=$(PMK_STORE=/tmp/ferry-k sh -c '. "$0"; pmk_store_persist' "$SRC/kernel.sh")
+[ "$out" = volatile ] && pass "内存盘判为 volatile（重启即丢）" || fail "内存盘判定错误：$out"
+PMK_STORE=/tmp/ferry-k PMK_OP_KERNEL=singbox PMK_OP_VERSION=v1.12.0 \
+PMK_OP_URLS="$URL/sing-box-1.12.0-linux-amd64.tar.gz" \
+PMK_OP_SHA256="$(sha_of "$T/www/sing-box-1.12.0-linux-amd64.tar.gz")" run_op install
+if ! job_ok && [ "$(job_code)" = ERR_STORE ]; then pass "内核目录在内存盘时拒装（ERR_STORE）"; else
+	fail "内存盘未拒装：$(job_code) $(job_msg)"
+fi
+[ ! -d /tmp/ferry-k/singbox ] && pass "内存盘未落位" || fail "内存盘仍落位"
+out=$(printf '{"dir":"/tmp/ferry-k"}' | sh "$SRC/kernel.sh" store-set)
+echo "$out" | grep -q '"ok":false' && pass "store-set 拒绝 /tmp：$out" || fail "store-set 未拒绝内存盘"
+
+echo "===== 23. 资产状态：不可用条目隐藏（反例） ====="
+cp "$PMK_BUILTIN" "$T/builtin-state.tsv"
+awk -F'\t' -v OFS='\t' '/^#/{print;next}
+	$1=="mihomo" && $2=="v1.19.33" && $3=="amd64" && NF>=7 {$8="dead"; print; next}
+	NF>=7 && NF<8 {$8="probe"} {print}' "$T/builtin-state.tsv" > "$T/builtin-state.new"
+mv "$T/builtin-state.new" "$T/builtin-state.tsv"
+out=$(PMK_BUILTIN="$T/builtin-state.tsv" printf '{"kernel":"mihomo"}' | PMK_BUILTIN="$T/builtin-state.tsv" sh "$SRC/kernel.sh" versions)
+echo "$out" | grep -q '"unavailable":2' && pass "status 汇总隐藏的不可用资产数=2" || fail "unavailable 计数错误：$out"
+echo "$out" | grep -q '"version":"v1.19.33","prerelease"' && fail "dead 条目仍出现在列表中" || pass "dead 条目已从可选列表隐藏"
+echo "$out" | grep -q '"state":"probe"' && pass "未全量校验条目标注 probe（可用）" || fail "probe 状态缺失"
+out=$(PMK_BUILTIN="$T/builtin-state.tsv" sh -c '. "$0"; pmk_builtin_first_url mihomo amd64' "$SRC/kernel.sh")
+case "$out" in *mihomo-linux-amd64-v1.19.33*) fail "首个可用 URL 取到了 dead 条目：$out" ;; *) pass "首个可用 URL 跳过 dead 条目" ;; esac
+
+echo "===== 24. 变体映射与资产名一致 ====="
+out=$(sh -c '. "$0"; pmk_builtin_records mihomo arm64' "$SRC/kernel.sh")
+case "$out" in *mihomo-linux-arm64-v*) pass "arm64 映射到 mihomo-linux-arm64 资产" ;; *) fail "arm64 资产名映射错误" ;; esac
+out=$(sh -c '. "$0"; pmk_builtin_records mihomo mipsle' "$SRC/kernel.sh")
+case "$out" in *mipsle-softfloat*) pass "mipsle 映射到 mipsle-softfloat 资产（软浮点）" ;; *) fail "mipsle 资产名映射错误" ;; esac
+out=$(sh -c '. "$0"; pmk_variants mihomo' "$SRC/kernel.sh")
+case "$out" in *amd64*) pass "本机变体列表正确：$out" ;; *) fail "变体列表缺项：$out" ;; esac
 
 echo
 if [ "$FAILED" -eq 0 ]; then

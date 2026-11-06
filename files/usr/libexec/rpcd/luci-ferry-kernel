@@ -21,7 +21,8 @@ case "$1" in
   "mirrors": {},
   "mirror_set": { "json": "" },
   "mirror_test": { "name": "" },
-  "source_set": { "name": "" }
+  "source_set": { "name": "" },
+  "store_set": { "dir": "" }
 }
 EOF
 		;;
@@ -37,6 +38,7 @@ EOF
 			mirror_set) "$K" mirror-set ;;
 			mirror_test) "$K" mirror-test ;;
 			source_set) "$K" source-set ;;
+			store_set) "$K" store-set ;;
 			*)
 				echo '{"ok":false,"error":"unknown method"}'
 				;;

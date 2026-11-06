@@ -366,5 +366,73 @@ return notice ? E('div', {}, [ notice, node ]) : node;
 - 一致性：ipk / apk 各 32 文件 `diff -r` **NO_DIFF**；与源码逐文件 `cmp` **ALL_MATCH**。
 - ipk control：`Version: 1.0.0-r7`；apk adbdump：`version: 1.0.0-r7`（与发布版本一致）。
 
+## r8：内核目录持久化 + 内置资产可用性审计（v1.0.0-r8，2026-11-06）
+
+### 结论 1：`/etc/ferry/kernels` 不会被子升级保留（实测，不是推断）
+
+- 机制：OpenWrt sysupgrade 是**白名单**备份，只备份 `/etc/sysupgrade.conf` 与
+  `/lib/upgrade/keep.d/*` 里列出的路径（目录会被 `find` 递归展开成文件），overlay 上其余文件
+  在升级时全部丢弃；不存在「整个 `/etc` 自动保留」。
+- guest 实测（OpenWrt 24.10.4 x86_64，headless QEMU，SSH 2223）：
+  - 建 `/etc/ferry/kernels/probe/bin` 后 `sysupgrade -l` 共 **28** 条，`/etc/ferry/kernels` 命中 **0**；
+    同一镜像里已存在的 `/etc/config/ferry` 命中也是 **0**（直接证明不是 `/etc` 整体保留）。
+  - 写入 `/lib/upgrade/keep.d/ferry`（内容 `/etc/ferry/kernels`）后共 **29** 条、命中 **1**，
+    且展开为具体文件 `/etc/ferry/kernels/probe/bin`。
+  - 反例（本次踩到并固化）：把 keep.d 文件**原地改名**为 `ferry.off` 仍会被 `keep.d/*` 通配读到
+    （without=1）；必须移出该目录才等价于「未登记」。smoke 首轮唯一的 FAIL 就是这条测试脚本缺陷，
+    改为移到 `/tmp` 后 `without=0 with=1`。
+- 方案（两条同时落地）：
+  1. 随包安装 `/lib/upgrade/keep.d/ferry`（Makefile 安装；包内实测存在）；
+  2. 新增 UCI `ferry.main.kernel_dir`（空 = 默认 `/etc/ferry/kernels`），可指到外置存储；
+     `store-set` RPC 校验：必须是绝对路径、拒绝 `/tmp` `/var` `/run` 内存盘、外置父目录必须存在且可写。
+- 持久性分级（`status` 暴露 `kernel_dir_cfg` / `store_persist` / `store_device` /
+  `keepd_installed` / `store_backup_kb`）：
+  - `rootfs`（与 `/` 同设备）→ 依赖 keep.d，界面黄色警告并显示「备份体积」；
+  - `external`（独立分区）→ 升级不影响，无需 keep.d；
+  - `volatile`（`/tmp` `/var` `/run`）→ 安装前直接 `ERR_STORE` 拒装。
+
+### 结论 2：overlay 装不下解包内核，必须支持外置（实测数字）
+
+- `df -k /`（已装 ferry 的真实值）：`/dev/root 100,692 KB 总 / 87,048 KB 已用 / 11,516 KB 可用（88%）`
+  → 总量 ≈ 98.3 MiB，可用 ≈ **11.2 MiB**。
+- mihomo v1.19.33 amd64：压缩 22,893,972 B（21.8 MiB），解包 **62,079,102 B（59.2 MiB）**。
+  11.2 MiB 可用装不下 59.2 MiB，预检（目标大小 ×6 + 8 MB）会先报 `ERR_DISK_FULL`。
+- 因此：空间不足提示补上「改到外置存储（如 `/mnt/sda1/ferry-kernels`）」与 overlay 说明；
+  同时提示 keep.d 备份会把几十 MB 内核打进升级包，外置目录则完全不需要进备份。
+
+### 结论 3：34 条内置资产全部实测可达，2 条做了全量校验
+
+- 新增 `tests/qemu/audit-assets.sh`：抽样条目全量下载 + SHA-256 + 解压 + ELF 架构断言；
+  其余条目 HTTP Range 探测（接受 200/206，`Content-Range` 总长必须等于清单 `size`）；失败标 `dead`。
+- 实测（`AUDIT_MIRROR=https://ghfast.top/`，清单落款 `# audited=2026-11-06T10:12:35`）：
+  - `ok` **2**：mihomo v1.19.33 arm64（20,824,326 B，SHA `ba408b31…6187`，ELF arm64/LE/64bit）、
+    mihomo v1.19.33 mipsle（资产名 `mihomo-linux-mipsle-softfloat-v1.19.33.gz`，20,397,891 B，
+    SHA `ad6b3837…71c4`，ELF mipsle/LE/32bit）；
+  - `probe` **32**：全部 HTTP 206 且 `Content-Range` 总长与清单一致；
+  - `dead` **0**：本次没有不可用条目；若出现会标记 `dead` 并从界面版本列表隐藏，
+    同时 `versions` 返回 `unavailable` 计数，界面提示「已隐藏 N 条源上不可用的资产」。
+- 清单第 8 列 `state`：`pmk_builtin_records` 默认过滤 `dead`，`pmk_builtin_first_url` 跳过 `dead`；
+  反例断言覆盖「dead 隐藏 + 首个可用 URL 不取 dead 条目 + unavailable 计数 = 2」。
+- 变体映射断言：arm64 → `mihomo-linux-arm64`；mipsle → `mipsle-softfloat`（软浮点命名差异）。
+
+### 验证（后台执行）
+
+- 离线 `tests/test-kernel.sh` 24 组：**PASS=98 FAIL=0**（新增 21–24：keep.d 登记与安装、
+  external/volatile 判定与 `ERR_STORE` 拒装、dead 隐藏、变体映射）。
+- 真实网络 E2E（WSL 宿主，非 mock）：arm64 与 mipsle-softfloat 两个变体全量下载 → SHA-256
+  通过 → ELF 架构正确；在 amd64 宿主上安装被 `ERR_ARCH` 拦截且**未落位**；
+  amd64 安装 13s 成功，`mihomo -v` `rc=0`。
+- smoke（OpenWrt 24.10.4 x86_64 headless QEMU，`--suite smoke`）：两轮 **88/1**；
+  首轮唯一 FAIL 为 keep.d 改名反例（脚本缺陷，已修），安装段 25/1；
+  次轮安装段 **26/0**（含 `without=0 with=1`、keep.d 随包安装、34 条清单、版本 1.0.0-r8），
+  唯一 FAIL 为 `client 无法出网`（WSL slirp 环境类，与 r5/r6/r7 同源）。
+
+### 出包与门禁
+
+- ipk：`luci-app-ferry_1.0.0-r8_all.ipk`，95,161 B，`258420786e49199aa7c90eb0fd3aaab5122403dcf526f7d9a632be6df4ed0f1b`
+- apk：`luci-app-ferry-1.0.0-r8.apk`，95,017 B，`af141ff07e3d439e60900a42dd64f4ac822a275e43e139af6f7080bc38fc0558`
+- 一致性：ipk / apk 各 **33** 文件 `diff -r` **NO_DIFF**；与源码逐文件 `cmp` **ALL_MATCH**。
+- ipk control：`Version: 1.0.0-r8`；apk 由 `mkpkg -I version:1.0.0-r8` 生成（同一 VERSION）。
+
 
 
