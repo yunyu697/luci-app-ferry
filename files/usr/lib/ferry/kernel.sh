@@ -236,13 +236,53 @@ pmk_spin_lock() {
 
 pmk_unlock() { rm -rf "$PMK_LOCK"; }
 
+# 任务阶段（前端按同一个顺序渲染阶段条，改这里要同步 kernel.js 的 STAGES）
+#   0 排队  1 预检  2 下载  3 校验 SHA-256  4 解压/识别  5 落位  6 切换指针  7 完成
+PMK_JOB_STAGES=8
+
+pmk_num() { # 只保留十进制数字，其余按 0
+	case "$1" in ''|*[!0-9]*) echo 0 ;; *) echo "$1" ;; esac
+}
+
 pmk_job_set() { # phase message bytes done ok code version
-	PMK_JOB_PHASE=$1 PMK_JOB_MSG=$2
-	printf '{"id":"%s","op":"%s","kernel":"%s","version":"%s","phase":"%s","message":"%s","bytes":%s,"done":%s,"ok":%s,"code":"%s","source":"%s","fallback":%s,"started":"%s","updated":"%s"}\n' \
+	local phase="$1" msg="$2" bytes done ok code ver total pct stage speed now elapsed
+	bytes=$(pmk_num "${3:-0}")
+	done="${4:-false}"; ok="${5:-null}"; code="${6:-}"; ver="${7:-$PMK_JOB_VERSION}"
+	total=$(pmk_num "${PMK_JOB_TOTAL:-0}")
+	speed=$(pmk_num "${PMK_JOB_SPEED:-0}")
+	now=$(date +%s)
+	elapsed=$((now - $(pmk_num "${PMK_JOB_START_TS:-$now}")))
+	stage=${PMK_JOB_STAGE:-0}
+	pct=${PMK_JOB_PCT:-2}
+	case "$phase" in
+		queued)   stage=0; pct=2 ;;
+		precheck) stage=1; pct=5 ;;
+		download)
+			stage=2
+			if [ "$total" -gt 0 ]; then
+				pct=$((bytes * 100 / total))
+				[ "$pct" -gt 55 ] && pct=55
+				[ "$pct" -lt 5 ] && pct=5
+			else
+				pct=8
+			fi ;;
+		verify)   stage=3; pct=60 ;;
+		extract|version) stage=4; pct=74 ;;
+		install)  stage=5; pct=86 ;;
+		switch)   stage=6; pct=94 ;;
+		done)     stage=7; pct=100 ;;
+		failed|*) ;; # 失败保留失败发生时的阶段与百分比
+	esac
+	PMK_JOB_STAGE=$stage; PMK_JOB_PCT=$pct
+	PMK_JOB_PHASE=$phase
+	printf '{"id":"%s","op":"%s","kernel":"%s","version":"%s","phase":"%s","message":"%s","bytes":%s,"total":%s,"percent":%s,"stage":%s,"stages":%s,"speed":%s,"http_code":"%s","detail":"%s","dest":"%s","size":%s,"elapsed":%s,"running":"%s","done":%s,"ok":%s,"code":"%s","source":"%s","fallback":%s,"started":"%s","updated":"%s","updated_ts":%s}\n' \
 		"$(pmk_esc "$PMK_JOB_ID")" "$(pmk_esc "$PMK_JOB_OP")" "$(pmk_esc "$PMK_JOB_KERNEL")" \
-		"$(pmk_esc "${7:-$PMK_JOB_VERSION}")" "$(pmk_esc "$1")" "$(pmk_esc "$2")" "${3:-0}" "${4:-false}" \
-		"${5:-null}" "$(pmk_esc "$6")" "$(pmk_esc "${PMK_JOB_SRC:-}")" "${PMK_JOB_FALLBACK:-false}" \
-		"$PMK_JOB_START" "$(date -u +%H:%M:%S)" > "$PMK_JOB.tmp" 2>/dev/null &&
+		"$(pmk_esc "$ver")" "$(pmk_esc "$phase")" "$(pmk_esc "$msg")" "$bytes" "$total" "$pct" "$stage" \
+		"$PMK_JOB_STAGES" "$speed" "$(pmk_esc "${PMK_JOB_HTTP:-}")" "$(pmk_esc "${PMK_JOB_DETAIL:-}")" \
+		"$(pmk_esc "${PMK_JOB_DEST:-}")" "$(pmk_num "${PMK_JOB_SIZE:-0}")" "$elapsed" \
+		"$(pmk_esc "${PMK_JOB_RUNNING:-}")" "$done" "$ok" "$(pmk_esc "$code")" \
+		"$(pmk_esc "${PMK_JOB_SRC:-}")" "${PMK_JOB_FALLBACK:-false}" \
+		"$PMK_JOB_START" "$(date -u +%H:%M:%S)" "$now" > "$PMK_JOB.tmp" 2>/dev/null &&
 		mv "$PMK_JOB.tmp" "$PMK_JOB"
 }
 
@@ -421,7 +461,7 @@ pmk_source_chain() { # selected
 		[ "$n" = custom ] && [ -z "$(pmk_mirror_prefix custom)" ] && continue
 		out="$out $n"
 	done
-	out=$(echo "$out" | sed 's/^ *//; s/  */ /g')
+	out=$(echo "$out" | sed 's/^ *//; s/ *$//; s/  */ /g')
 	[ -n "$out" ] || out=github
 	echo "$out"
 }
@@ -474,45 +514,86 @@ pmk_fetch_cmd() {
 	else echo ''; fi
 }
 
-pmk_fetch() { # url out
-	local cmd t
+pmk_fetch() { # url out -> 同时写 $out.http（HTTP 状态码）与 $out.err（失败原文）
+	local cmd t logf="$2.fetchlog" rc code
 	cmd=$(pmk_fetch_cmd)
-	[ -n "$cmd" ] || return 127
+	: > "$2.http" 2>/dev/null
+	: > "$2.err" 2>/dev/null
+	rm -f "$logf"
+	if [ -z "$cmd" ]; then
+		echo '没有可用的下载工具（uclient-fetch/wget/curl 均缺失，请安装 uclient-fetch 或 curl）' > "$2.err"
+		return 127
+	fi
 	t=$PMK_FETCH_TIMEOUT
 	case "$cmd" in
-		uclient-fetch) uclient-fetch -q -T "$t" -O "$2" "$1" >/dev/null 2>&1 ;;
-		wget) wget -q -T "$t" -O "$2" "$1" >/dev/null 2>&1 ;;
-		curl) curl -fsSL --max-time "$t" -o "$2" "$1" >/dev/null 2>&1 ;;
+		uclient-fetch) uclient-fetch -T "$t" -O "$2" "$1" >"$logf" 2>&1 ;;
+		wget) wget -T "$t" -O "$2" "$1" >"$logf" 2>&1 ;;
+		curl) curl -sSL --max-time "$t" -o "$2" -w '%{http_code}' "$1" > "$2.code" 2>"$logf" ;;
 	esac
+	rc=$?
+	# HTTP 状态码：curl 直接写码；uclient-fetch/wget 从错误行里抠
+	case "$cmd" in
+		curl) code=$(cat "$2.code" 2>/dev/null | tr -cd '0-9') ;;
+		*) code=$(grep -oiE 'HTTP/[0-9.]+ [0-9][0-9][0-9]|HTTP error [0-9][0-9][0-9]|ERROR [0-9][0-9][0-9]' "$logf" 2>/dev/null \
+			| tail -1 | grep -oE '[0-9][0-9][0-9]') ;;
+	esac
+	code=$(pmk_num "$code")
+	[ "$code" -gt 0 ] && echo "$code" > "$2.http"
+	# 下载成功但工具没打印状态行（uclient-fetch）：按 200 记录
+	if [ "$rc" = 0 ] && [ -s "$2" ] && [ "$code" = 0 ]; then code=200; echo "$code" > "$2.http"; fi
+	# HTTP >= 400 即使工具返回 0 也算失败（curl 未用 -f 时会把错误页写进文件）
+	case "$code" in
+		''|0|2[0-9][0-9]) ;;
+		*) [ "$rc" = 0 ] && rc=22 ;;
+	esac
+	# 失败原文：优先带 error/failed/timeout/certificate 的行，否则最后一行输出
+	if [ "$rc" != 0 ]; then
+		local line
+		line=$(grep -iE 'error|failed|refused|timeout|timed out|certificate|resolve|not found|unable' "$logf" 2>/dev/null | tail -1)
+		[ -n "$line" ] || line=$(grep -v '^[[:space:]]*$' "$logf" 2>/dev/null | tail -1)
+		[ -n "$line" ] || line="下载工具 $cmd 返回 $rc"
+		printf '%s: %s' "$cmd" "$line" | cut -c1-200 > "$2.err"
+	fi
+	return "$rc"
 }
 
-pmk_http_json() { # url out
+pmk_download() { # url out [label]
+	local pid bytes prev=0 rc label="${3:-}" total speed
+	total=$(pmk_num "${PMK_JOB_TOTAL:-0}")
+	PMK_JOB_SPEED=0
+	pmk_job_set download "开始下载${label:+（$label）}：$1" 0 false null ""
+	pmk_fetch "$1" "$2" &
+	pid=$!
+	while kill -0 "$pid" 2>/dev/null; do
+		bytes=$(pmk_num "$(pmk_size "$2" 2>/dev/null)")
+		speed=$((bytes - prev))
+		[ "$speed" -lt 0 ] && speed=0
+		prev=$bytes
+		PMK_JOB_SPEED=$speed
+		pmk_job_set download "已下载 ${bytes} 字节${label:+（$label）}" "$bytes" false null ""
+		sleep 1
+	done
+	wait "$pid"
+	rc=$?
+	bytes=$(pmk_num "$(pmk_size "$2" 2>/dev/null)")
+	PMK_JOB_SPEED=0
+	PMK_JOB_HTTP=$(cat "$2.http" 2>/dev/null)
+	PMK_JOB_DETAIL=$(cat "$2.err" 2>/dev/null)
+	if [ "$rc" = 0 ] && [ -s "$2" ]; then
+		[ "$total" -gt 0 ] || PMK_JOB_TOTAL=$bytes
+		pmk_job_set download "下载完成：${bytes} 字节${label:+（$label）}" "$bytes" false null ""
+	else
+		pmk_job_set download "下载失败：HTTP ${PMK_JOB_HTTP:-?}，rc=$rc，已收 ${bytes} 字节${PMK_JOB_DETAIL:+（$PMK_JOB_DETAIL）}" "$bytes" false null ""
+	fi
+	return "$rc"
+}
+
+pmk_http_json() { # url out（只允许本机 mock 或 https，避免明文外网请求）
 	case "$1" in
 		http://127.0.0.1:*|http://localhost:*|https://*) ;;
 		*) return 3 ;;
 	esac
 	pmk_fetch "$1" "$2"
-}
-
-pmk_download() { # url out [label]
-	local pid bytes rc label="${3:-}"
-	pmk_job_set download "开始下载${label:+（$label）}：$1" 0 false null ""
-	pmk_fetch "$1" "$2" &
-	pid=$!
-	while kill -0 "$pid" 2>/dev/null; do
-		bytes=$(pmk_size "$2" 2>/dev/null)
-		pmk_job_set download "已下载 ${bytes:-0} 字节${label:+（$label）}" "${bytes:-0}" false null ""
-		sleep 1
-	done
-	wait "$pid"
-	rc=$?
-	bytes=$(pmk_size "$2" 2>/dev/null)
-	if [ "$rc" = 0 ] && [ -s "$2" ]; then
-		pmk_job_set download "下载完成：${bytes:-0} 字节${label:+（$label）}" "${bytes:-0}" false null ""
-	else
-		pmk_job_set download "下载失败（rc=$rc，已收 ${bytes:-0} 字节${label:+，$label}）" "${bytes:-0}" false null ""
-	fi
-	return "$rc"
 }
 
 # ---------- 版本清单（内置清单） ----------
@@ -550,10 +631,23 @@ pmk_builtin_first_url() { # kernel arch
 	done | head -1
 }
 
+# 内置清单里该架构有哪些内核（用于前端「管理内核」下拉，纯离线，不依赖网络）
+pmk_builtin_kernels() { # arch
+	local tab
+	tab=$(printf '\t')
+	[ -s "$PMK_BUILTIN" ] || return 0
+	awk -F"$tab" -v a="$1" '
+		$0 ~ /^#/ { next }
+		NF < 7 { next }
+		$3 == a && $1 != "" && !seen[$1]++ { printf "%s%s", sep, $1; sep = "," }
+	' "$PMK_BUILTIN"
+}
+
 pmk_api_versions() {
-	local kernel arch out sep rk tag rarch size sha name url date tab st dead
+	local kernel arch out sep rk tag rarch size sha name url date tab st dead kernels
 	kernel=$(pmk_norm_kernel "$(pmk_arg kernel)") || { echo '{"ok":false,"error":"unknown kernel"}'; return 0; }
 	arch=$(pmk_host_arch)
+	kernels=$(pmk_builtin_kernels "$arch")
 	tab=$(printf '\t')
 	date=$(pmk_builtin_date)
 	out=''; sep=''
@@ -567,10 +661,10 @@ $(pmk_builtin_records "$kernel" "$arch")
 EOF
 	dead=$(pmk_builtin_records "$kernel" "$arch" 1 | awk -F"$tab" 'NF>=8 && $8=="dead"' | wc -l | tr -d ' ')
 	if [ -z "$out" ]; then
-		echo "{\"ok\":false,\"error\":\"内置清单里没有 $kernel/$arch 的资产（本机可用变体：$(pmk_variants "$kernel")），请改用自定义 URL 或本地导入\",\"arch\":\"$arch\",\"variants\":\"$(pmk_variants "$kernel")\"}"
+		echo "{\"ok\":false,\"error\":\"内置清单里没有 $kernel/$arch 的资产（本机可用变体：$(pmk_variants "$kernel")），请改用自定义 URL 或本地导入\",\"arch\":\"$arch\",\"variants\":\"$(pmk_variants "$kernel")\",\"kernels\":\"$kernels\",\"list\":\"builtin\",\"generated\":\"$(pmk_esc "$date")\"}"
 		return 0
 	fi
-	echo "{\"ok\":true,\"kernel\":\"$kernel\",\"arch\":\"$arch\",\"variants\":\"$(pmk_variants "$kernel")\",\"list\":\"builtin\",\"generated\":\"$(pmk_esc "$date")\",\"unavailable\":${dead:-0},\"versions\":[$out]}"
+	echo "{\"ok\":true,\"kernel\":\"$kernel\",\"arch\":\"$arch\",\"variants\":\"$(pmk_variants "$kernel")\",\"kernels\":\"$kernels\",\"list\":\"builtin\",\"generated\":\"$(pmk_esc "$date")\",\"unavailable\":${dead:-0},\"versions\":[$out]}"
 }
 
 pmk_api_mirrors() {
@@ -754,6 +848,7 @@ pmk_installed_json() {
 		[ -d "$d" ] || continue
 		for t in "$d"/*; do
 			[ -d "$t" ] || continue
+			[ -L "$t" ] && continue
 			case "$t" in */.stage*) continue ;; esac
 			[ -s "$t/meta" ] || continue
 			out="$out$sep$(pmk_meta_json "$k" "$(basename "$t")")"
@@ -1021,6 +1116,19 @@ pmk_activate() { # kernel tag restart force
 	pmk_job_ok "已启用 $k $tag" 0
 }
 
+# 安装/更新“当前没在运行的内核”时只更新该内核自己的 active/previous 指针：
+# 不动 current 运行指针、不改 UCI kernel、不重启服务、不碰流量。
+pmk_publish_local() { # kernel tag
+	local k=$1 tag=$2 prev
+	[ -d "$PMK_STORE/$k/$tag" ] || return 1
+	prev=$(pmk_links "$k")
+	if [ -n "$prev" ] && [ "$prev" != "$tag" ]; then
+		pmk_link_atomic "$PMK_STORE/$k/$prev" "$PMK_STORE/$k/previous" || return 1
+	fi
+	pmk_link_atomic "$PMK_STORE/$k/$tag" "$PMK_STORE/$k/active" || return 1
+	return 0
+}
+
 pmk_rollback_internal() { # old_kernel old_tag was_running
 	local ok=$1 otag=$2 wr=$3 bin
 	pmk_service_stop
@@ -1102,7 +1210,7 @@ pmk_install_staged() { # kernel tag srcbin sha version verified source
 pmk_run_install() { # 参数已通过环境/变量传入
 	local k tag candidates cand url out url_used start end elapsed expected verified ver
 	local arch_host binarch binendian outbytes sha mirror_used chain name nsrc i need_kb free_kb
-	local want_size official_url drc fallback need_txt first
+	local want_size official_url drc fallback need_txt first running
 	k=$PMK_OP_KERNEL
 	tag=$PMK_OP_VERSION
 	elapsed=0
@@ -1112,11 +1220,18 @@ pmk_run_install() { # 参数已通过环境/变量传入
 	esac
 	out="$PMK_STAGE/download.bin"
 	mkdir -p "$PMK_STAGE" "$PMK_STORE" "$PMK_CUR" "$PMK_JAIL"
-	rm -rf "$PMK_JAIL"; mkdir -p "$PMK_JAIL"; rm -f "$out" "$out.sha256"
+	rm -rf "$PMK_JAIL"; mkdir -p "$PMK_JAIL"; rm -f "$out" "$out.sha256" "$out.http" "$out.err" "$out.fetchlog"
+
+	# 前置校验只针对“要安装的那个内核”，与当前运行的内核无关
+	running=$(pmk_norm_kernel "$($PMK_UCI -q get ferry.main.kernel 2>/dev/null)")
+	[ -n "$running" ] || running=mihomo
+	PMK_JOB_RUNNING=$running
+	pmk_job_set precheck "预检：目标内核 $k $tag，本机架构 $(pmk_host_arch)，目录 $PMK_STORE" 0 false null "" "$tag"
 
 	# 下载前空间检查：按「压缩包 + 解压后二进制 + 保留旧版本」估算，检查真正写入的目录
 	want_size=${PMK_OP_SIZE:-0}
 	case "$want_size" in ''|*[!0-9]*) want_size=0 ;; esac
+	PMK_JOB_TOTAL=$want_size
 	if [ "$want_size" -gt 0 ]; then
 		need_kb=$((want_size / 1024 * 6 + 8192))
 		need_txt="下载包 $((want_size / 1048576)) MB + 解压临时 + 保留旧版本"
@@ -1138,10 +1253,12 @@ pmk_run_install() { # 参数已通过环境/变量传入
 	fi
 
 	if [ "$PMK_OP_LOCAL" = 1 ]; then
+		PMK_JOB_TOTAL=$(pmk_num "$(pmk_size "$PMK_OP_URLS" 2>/dev/null)")
 		pmk_job_set download "本地导入：$PMK_OP_URLS" 0 false null "" "$tag"
 		cp "$PMK_OP_URLS" "$out" || pmk_job_fail ERR_LOCAL "读取本地文件失败：$PMK_OP_URLS" 0 "$tag"
 		url_used="local:$PMK_OP_URLS"
 		mirror_used=local
+		pmk_job_set download "本地导入完成：$(pmk_size "$out") 字节" "$(pmk_num "$(pmk_size "$out")")" false null "" "$tag"
 	else
 		candidates="$PMK_OP_URLS"
 		official_url=$(printf '%s' "$candidates" | awk '{print $1}')
@@ -1176,7 +1293,14 @@ pmk_run_install() { # 参数已通过环境/变量传入
 		PMK_JOB_SRC="$mirror_used"
 		first=$(pmk_source_chain "$PMK_OP_MIRROR" | awk '{print $1}')
 		PMK_JOB_FALLBACK=$([ "$mirror_used" != "$first" ] && echo true || echo false)
-		[ -n "$url_used" ] || pmk_job_fail ERR_NETWORK "所有候选源都下载失败（已尝试：$(pmk_source_chain "$PMK_OP_MIRROR")）；请检查网络/DNS/证书，或改用本地导入" 0 "$tag"
+		if [ -z "$url_used" ]; then
+			local why
+			why=""
+			[ -n "$PMK_JOB_HTTP" ] && why="HTTP $PMK_JOB_HTTP"
+			[ -n "$PMK_JOB_DETAIL" ] && why="${why:+$why；}$PMK_JOB_DETAIL"
+			[ -n "$why" ] || why="网络不可达或 DNS/证书失败"
+			pmk_job_fail ERR_NETWORK "所有候选源都下载失败（已尝试：$(pmk_source_chain "$PMK_OP_MIRROR")）：$why。请检查网络/DNS/证书，或改用本地导入" 0 "$tag"
+		fi
 	fi
 
 	outbytes=$(pmk_size "$out")
@@ -1231,19 +1355,31 @@ pmk_run_install() { # 参数已通过环境/变量传入
 		[ "$ver" = "$exp" ] || pmk_job_fail ERR_VERSION_MISMATCH "版本不符：期望 $exp，实际 $ver" "$outbytes" "$tag"
 	fi
 
+	PMK_JOB_DEST="$PMK_STORE/$k/$tag"
 	pmk_job_set install "落位到 $PMK_STORE/$k/$tag" "$outbytes" false null "" "$tag"
 	pmk_install_staged "$k" "$tag" "$PMK_JAIL/$(pmk_bin_name "$k")" "$sha" "$ver" "$verified" "$url_used" || {
 		pmk_job_fail ERR_INSTALL "落位失败（磁盘空间？）" "$outbytes" "$tag"
 	}
+	PMK_JOB_SIZE=$(pmk_num "$(pmk_size "$PMK_STORE/$k/$tag/$(pmk_bin_name "$k")" 2>/dev/null)")
 
-	rm -f "$out" "$out.sha256"
+	rm -f "$out" "$out.sha256" "$out.http" "$out.err" "$out.fetchlog" "$out.code"
 	PMK_JOB_VERSION="$tag"
+	elapsed=$(( $(date +%s) - $(pmk_num "${PMK_JOB_START_TS:-$(date +%s)}") ))
 
-	if [ "$PMK_OP_ACTIVATE" = 1 ]; then
+	# 安装/更新正在运行的内核才动 current 指针并重启服务；
+	# 安装另一个内核只更新它自己的 active/previous，不中断流量。
+	if [ "$PMK_OP_ACTIVATE" = 1 ] && [ "$running" = "$k" ]; then
+		pmk_job_set switch "更新运行中的内核 $(pmk_bin_name "$k")（切换期间代理会中断约 5 秒）" "$outbytes" false null "" "$tag"
 		pmk_activate "$k" "$tag" "${PMK_OP_RESTART:-1}" "${PMK_OP_FORCE:-0}"
 		return $?
+	elif [ "$PMK_OP_ACTIVATE" = 1 ]; then
+		pmk_job_set switch "更新 $(pmk_bin_name "$k") 的启用指针（运行中的 $(pmk_bin_name "$running") 不受影响，不重启服务）" "$outbytes" false null "" "$tag"
+		pmk_publish_local "$k" "$tag" || \
+			pmk_job_fail ERR_LINK "写入 $(pmk_bin_name "$k") 的 active 指针失败（$PMK_STORE/$k/active）" "$outbytes" "$tag"
+		pmk_job_ok "已安装 $(pmk_bin_name "$k") $tag 到 $PMK_STORE/$k/$tag（未运行，切换到它后生效；当前运行 $(pmk_bin_name "$running") 不受影响；源 $mirror_used，用时 ${elapsed}s）" "$outbytes"
+		return 0
 	fi
-	pmk_job_ok "已安装 $k $tag 到 $PMK_STORE/$k/$tag（未启用；源 $mirror_used，用时 ${elapsed}s）" "$outbytes"
+	pmk_job_ok "已安装 $(pmk_bin_name "$k") $tag 到 $PMK_STORE/$k/$tag（未启用；源 $mirror_used，用时 ${elapsed}s）" "$outbytes"
 }
 
 pmk_run_switch() { # 不传版本时切到该内核当前 active 版本（用于 mihomo/sing-box 一键互切）
@@ -1388,16 +1524,23 @@ pmk_start_job() { # op -> 启动后台任务
 		return 0
 	fi
 
-	PMK_JOB_ID=$(date +%s)-$$ 
+	PMK_JOB_ID=$(date +%s)-$$
 	PMK_JOB_OP=$op
 	PMK_JOB_KERNEL=$k
 	PMK_JOB_VERSION=$PMK_OP_VERSION
 	PMK_JOB_START=$(date -u +%H:%M:%S)
+	PMK_JOB_START_TS=$(date +%s)
+	PMK_JOB_STAGE=0
+	PMK_JOB_PCT=2
+	PMK_JOB_RUNNING=$(pmk_norm_kernel "$($PMK_UCI -q get ferry.main.kernel 2>/dev/null)")
+	[ -n "$PMK_JOB_RUNNING" ] || PMK_JOB_RUNNING=mihomo
 	pmk_job_set queued "任务已排队" 0 false null "" "$PMK_JOB_VERSION"
 
 	(
 		PMK_JOB_ID=$PMK_JOB_ID PMK_JOB_OP=$PMK_JOB_OP PMK_JOB_KERNEL=$PMK_JOB_KERNEL \
 		PMK_JOB_VERSION=$PMK_JOB_VERSION PMK_JOB_START=$PMK_JOB_START \
+		PMK_JOB_START_TS=$PMK_JOB_START_TS PMK_JOB_RUNNING=$PMK_JOB_RUNNING \
+		PMK_JOB_STAGE=$PMK_JOB_STAGE PMK_JOB_PCT=$PMK_JOB_PCT \
 		PMK_OP_KERNEL=$PMK_OP_KERNEL PMK_OP_VERSION=$PMK_OP_VERSION \
 		PMK_OP_SHA256=$PMK_OP_SHA256 PMK_OP_ALLOW_UNVERIFIED=$PMK_OP_ALLOW_UNVERIFIED \
 		PMK_OP_ACTIVATE=$PMK_OP_ACTIVATE PMK_OP_RESTART=$PMK_OP_RESTART \

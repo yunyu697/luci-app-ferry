@@ -3,7 +3,10 @@
 'require rpc';
 
 var callStatus = rpc.declare({ object: 'luci-ferry-kernel', method: 'status' });
-var callVersions = rpc.declare({ object: 'luci-ferry-kernel', method: 'versions', params: [ 'kernel', 'prerelease' ] });
+// nobatch：本页初始化时会同时发起 versions + mirrors，LuCI 默认会把同一 tick 的
+// 调用合并成一个 JSON-RPC 批量请求；该批量在本固件的 rpcd/ubus 上会挂住（版本清单
+// 与镜像源一直停在“加载中”）。这两条必须各自独立发送。
+var callVersions = rpc.declare({ object: 'luci-ferry-kernel', method: 'versions', params: [ 'kernel', 'prerelease' ], nobatch: true });
 var callJob = rpc.declare({ object: 'luci-ferry-kernel', method: 'job' });
 var callPreview = rpc.declare({ object: 'luci-ferry-kernel', method: 'preview', params: [ 'kernel', 'version' ] });
 var callStart = rpc.declare({
@@ -12,7 +15,7 @@ var callStart = rpc.declare({
 	          'mirror', 'size', 'allow_unverified', 'activate', 'restart', 'force' ]
 });
 var callRemove = rpc.declare({ object: 'luci-ferry-kernel', method: 'remove', params: [ 'kernel', 'version' ] });
-var callMirrors = rpc.declare({ object: 'luci-ferry-kernel', method: 'mirrors' });
+var callMirrors = rpc.declare({ object: 'luci-ferry-kernel', method: 'mirrors', nobatch: true });
 var callMirrorSet = rpc.declare({ object: 'luci-ferry-kernel', method: 'mirror_set', params: [ 'json' ] });
 var callMirrorTest = rpc.declare({ object: 'luci-ferry-kernel', method: 'mirror_test', params: [ 'name' ] });
 var callSourceSet = rpc.declare({ object: 'luci-ferry-kernel', method: 'source_set', params: [ 'name' ] });
@@ -48,12 +51,24 @@ var ERR_TEXT = {
 	ERR_LOCAL:        '读取本地文件失败'
 };
 
+/* rpc.declare 的 params 是“按位置”映射：调用方传 { op, kernel, ... } 时会被当成
+ * params.op 的单个对象，导致 kernel 等字段丢失（后端报 unknown kernel）。这里统一
+ * 做一次对象 → 位置参数 的转换。 */
+function callStartArgs(a) {
+	a = a || {};
+	return callStart(a.op || '', a.kernel || '', a.version || '', a.urls || '',
+		a.file || '', a.sha256 || '', a.expect_version || '', a.mirror || '',
+		a.size != null ? a.size : '', a.allow_unverified != null ? a.allow_unverified : '',
+		a.activate != null ? a.activate : '', a.restart != null ? a.restart : '',
+		a.force != null ? a.force : '');
+}
+
 return baseclass.extend({
 	callStatus: callStatus,
 	callVersions: callVersions,
 	callJob: callJob,
 	callPreview: callPreview,
-	callStart: callStart,
+	callStart: callStartArgs,
 	callRemove: callRemove,
 	callMirrors: callMirrors,
 	callMirrorSet: callMirrorSet,

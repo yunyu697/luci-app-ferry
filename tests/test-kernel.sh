@@ -212,17 +212,28 @@ run_op() { # op
 cfg_sb() { echo "$PMK_CFG_SINGBOX"; }
 cfg_mh() { echo "$PMK_CFG_MIHOMO"; }
 
-echo "===== 1. 全新安装 sing-box 1.8.14（下载+SHA256+激活） ====="
+echo "===== 1. 安装 sing-box 1.8.14（目标内核未运行：只落位+写该内核指针，不动运行态） ====="
 PMK_OP_KERNEL=singbox PMK_OP_VERSION=v1.8.14 PMK_OP_URLS="$URL/sing-box-1.8.14-linux-amd64.tar.gz" \
 PMK_OP_SHA256="$(sha_of "$T/www/sing-box-1.8.14-linux-amd64.tar.gz")" PMK_OP_ACTIVATE=1 \
 PMK_OP_RESTART=1 PMK_OP_EXPECT_VERSION=1.8.14 PMK_OP_MIRROR=github \
 	run_op install
-if job_ok; then pass "安装+激活 1.8.14 成功"; else fail "安装 1.8.14 失败：$(job_code) $(job_msg)"; fi
+if job_ok; then pass "安装 1.8.14 成功（当前运行核仍是 mihomo）"; else fail "安装 1.8.14 失败：$(job_code) $(job_msg)"; fi
 note "job: $(cat "$PMK_JOB" 2>/dev/null)"
 [ -x "$PMK_STORE/singbox/v1.8.14/sing-box" ] && pass "版本库落位 store/singbox/v1.8.14/sing-box" \
 	|| fail "版本库缺失"
+[ "$(basename "$(readlink "$PMK_STORE/singbox/active" 2>/dev/null)")" = v1.8.14 ] \
+	&& pass "单内核指针 singbox/active=v1.8.14" || fail "singbox/active 未写入"
+[ "$(cat "$T/uci-state/ferry.main.kernel")" = mihomo ] && pass "运行内核未被改动（uci 仍 mihomo）" \
+	|| fail "安装非运行内核却改了运行内核"
+[ ! -e "$PMK_BIN_DIR/sing-box" ] && pass "current 运行指针未被动（无 /usr/bin/sing-box 链接）" \
+	|| fail "安装非运行内核却改了 current 指针"
+[ ! -f "$SRV_STATE" ] && pass "服务未被重启（fake init.d 未启动）" || fail "安装非运行内核却重启了服务"
+
+echo "===== 1b. 显式切换到 sing-box v1.8.14（这一步才动 current 指针 + 重启服务） ====="
+PMK_OP_KERNEL=singbox PMK_OP_VERSION=v1.8.14 PMK_OP_RESTART=1 run_op switch
+job_ok && pass "切换 sing-box 1.8.14 成功" || fail "切换失败：$(job_code) $(job_msg)"
 [ -L "$PMK_BIN_DIR/sing-box" ] && pass "启用指针 $PMK_BIN_DIR/sing-box -> $(readlink "$PMK_BIN_DIR/sing-box")" \
-	|| fail "未建立 /usr/bin 启用链接"
+	|| fail "未建立 current 启用链接"
 [ "$(cat "$T/uci-state/ferry.main.kernel")" = singbox ] && pass "uci ferry.main.kernel=singbox" \
 	|| fail "uci 未更新"
 [ -f "$SRV_STATE" ] && pass "服务已启动（fake init.d）" || fail "服务未启动"
@@ -279,12 +290,27 @@ fi
 grep -q 'rc=0' "$PMK_RUN/config-check-report.txt" && pass "1.14.4 check rc=0" \
 	|| fail "1.14.4 check 未通过：$(cat "$PMK_RUN/config-check.txt" 2>/dev/null | head -5)"
 
-echo "===== 6. 跨内核切换到 mihomo 1.18.8（停服务→替换→重生成→启动） ====="
+echo "===== 6. 运行 sing-box 时安装 mihomo 1.18.8（只更新 mihomo 指针，不动流量） ====="
+pid_before=$(cat "$SRV_STATE" 2>/dev/null)
+stop_before=$(grep -c stop "$SRV_LOG" 2>/dev/null || echo 0)
 PMK_OP_KERNEL=mihomo PMK_OP_VERSION=v1.18.8 PMK_OP_URLS="$URL/mihomo-linux-amd64-v1.18.8.gz" \
 PMK_OP_SHA256="$(sha_of "$T/www/mihomo-linux-amd64-v1.18.8.gz")" PMK_OP_ACTIVATE=1 \
 PMK_OP_EXPECT_VERSION=1.18.8 \
 	run_op install
-job_ok && pass "mihomo 1.18.8 安装并启用成功" || fail "mihomo 安装失败：$(job_code) $(job_msg)"
+job_ok && pass "mihomo 1.18.8 安装成功" || fail "mihomo 安装失败：$(job_code) $(job_msg)"
+[ "$(cat "$T/uci-state/ferry.main.kernel")" = singbox ] && pass "运行内核仍是 sing-box（未被安装动作切走）" \
+	|| fail "安装 mihomo 却改了运行内核"
+[ -L "$PMK_STORE/mihomo/active" ] && pass "mihomo/active 指针已写入（切到它后才生效）" || fail "mihomo active 指针缺失"
+[ ! -e "$PMK_BIN_DIR/mihomo" ] && pass "current 指针未被动（无 /usr/bin/mihomo 链接）" || fail "current 指针被改动"
+[ "$(cat "$SRV_STATE" 2>/dev/null)" = "$pid_before" ] && pass "服务进程 PID 未变（$pid_before，未重启）" \
+	|| fail "服务被重启（PID $pid_before -> $(cat "$SRV_STATE" 2>/dev/null)）"
+[ "$(grep -c stop "$SRV_LOG" 2>/dev/null || echo 0)" = "$stop_before" ] && pass "服务日志无新增 stop（未中断流量）" \
+	|| fail "安装 mihomo 期间服务被停止"
+[ ! -s "$(cfg_mh)" ] && pass "未生成 mihomo 配置（未启用就不动生效配置）" || fail "安装非运行内核却改了生效配置"
+
+echo "===== 6b. 显式切换到 mihomo 1.18.8（停服务→替换→重生成→启动） ====="
+PMK_OP_KERNEL=mihomo PMK_OP_VERSION=v1.18.8 PMK_OP_RESTART=1 run_op switch
+job_ok && pass "切换到 mihomo 1.18.8 成功" || fail "切换失败：$(job_code) $(job_msg)"
 [ "$(cat "$T/uci-state/ferry.main.kernel")" = mihomo ] && pass "uci ferry.main.kernel=mihomo" || fail "uci 未切换"
 [ -L "$PMK_BIN_DIR/mihomo" ] && pass "启用指针 $PMK_BIN_DIR/mihomo" || fail "mihomo 链接缺失"
 [ -s "$(cfg_mh)" ] && pass "YAML 配置已生成 $(cfg_mh)" || fail "mihomo 配置未生成"
@@ -660,6 +686,151 @@ else
 fi
 echo "$out" | grep -q '"name": *"ghfast"' && pass "保存的两条镜像仍在" || fail "镜像条目被迁移覆盖"
 rm -f "$PMK_MIRRORS"
+
+echo "===== 33. 任务进度字段（阶段/总字节/百分比/速度/HTTP/产物） ====="
+JOBF="$T/prog.json"
+prog_job() { # total bytes phase
+	rm -f "$JOBF"
+	PMK_JOB="$JOBF" PMK_JOB_ID=pj PMK_JOB_OP=install PMK_JOB_KERNEL=singbox \
+	PMK_JOB_VERSION=v1.2.3 PMK_JOB_START=x PMK_JOB_START_TS=$(( $(date +%s) - 3 )) \
+	PMK_JOB_TOTAL="$1" PMK_JOB_DEST=/x/v1.2.3 PMK_JOB_SIZE=1234 \
+	sh -c '. "$0"; pmk_job_set "$3" "msg" "$2" "$4" "$5" ""' "$SRC/kernel.sh" "$1" "$2" "${3}" >/dev/null 2>&1
+}
+prog_job 1000 400 download false null
+out=$(cat "$JOBF" 2>/dev/null)
+echo "$out" | grep -q '"stage":2' && pass "下载阶段 stage=2" || fail "下载阶段索引错误：$out"
+echo "$out" | grep -q '"percent":40' && pass "下载进度按字节计算（400/1000=40%）" || fail "百分比错误：$out"
+echo "$out" | grep -q '"total":1000' && pass "任务带总字节 total" || fail "缺 total：$out"
+echo "$out" | grep -q '"stages":8' && pass "阶段总数 stages=8" || fail "缺 stages：$out"
+echo "$out" | grep -q '"dest":"/x/v1.2.3"' && pass "任务带落位目录 dest" || fail "缺 dest：$out"
+echo "$out" | grep -q '"size":1234' && pass "任务带产物大小 size" || fail "缺 size：$out"
+echo "$out" | grep -q '"elapsed":3' && pass "任务带耗时 elapsed" || fail "缺 elapsed：$out"
+echo "$out" | grep -q '"updated_ts":' && pass "任务带 updated_ts（前端判断 20s 无更新）" || fail "缺 updated_ts"
+prog_job 1000 1000 verify false null
+out=$(cat "$JOBF")
+echo "$out" | grep -q '"stage":3' && pass "校验阶段 stage=3" || fail "校验阶段索引错误：$out"
+prog_job 1000 1000 install false null
+out=$(cat "$JOBF")
+echo "$out" | grep -q '"stage":5' && pass "落位阶段 stage=5" || fail "落位阶段索引错误：$out"
+prog_job 1000 1000 switch false null
+out=$(cat "$JOBF")
+echo "$out" | grep -q '"stage":6' && pass "切换指针阶段 stage=6" || fail "切换阶段索引错误：$out"
+prog_job 1000 1000 done true true
+out=$(cat "$JOBF")
+echo "$out" | grep -q '"stage":7' && echo "$out" | grep -q '"percent":100' && pass "完成阶段 stage=7 / 100%" \
+	|| fail "完成阶段错误：$out"
+# 失败保留失败发生时的阶段（下载失败不应退回“排队”）
+rm -f "$JOBF"
+PMK_JOB="$JOBF" PMK_JOB_ID=pj PMK_JOB_OP=install PMK_JOB_KERNEL=singbox PMK_JOB_VERSION=v1.2.3 \
+PMK_JOB_START=x PMK_JOB_START_TS=$(date +%s) PMK_JOB_TOTAL=1000 \
+	sh -c '. "$0"; pmk_job_set download "d" 400 false null ""; pmk_job_fail ERR_NETWORK "boom" 400' "$SRC/kernel.sh" >/dev/null 2>&1
+out=$(cat "$JOBF")
+echo "$out" | grep -q '"phase":"failed"' && echo "$out" | grep -q '"stage":2' && echo "$out" | grep -q '"percent":40' \
+	&& pass "失败停留下载阶段（stage=2，40%，不回初始态）" || fail "失败阶段/百分比丢失：$out"
+
+echo "===== 34. 慢速下载的进度采样（≥3 点、百分比单调、速度/当前源） ====="
+cat > "$T/slow_server.py" <<'PY'
+import http.server, os, sys, time
+root, port = sys.argv[1], int(sys.argv[2])
+class H(http.server.BaseHTTPRequestHandler):
+    def log_message(self, *a): pass
+    def do_GET(self):
+        p = os.path.join(root, os.path.basename(self.path))
+        if not os.path.isfile(p):
+            self.send_response(404); self.send_header('Content-Length','0'); self.end_headers(); return
+        data = open(p, 'rb').read()
+        self.send_response(200)
+        self.send_header('Content-Type', 'application/octet-stream')
+        self.send_header('Content-Length', str(len(data)))
+        self.end_headers()
+        step = max(1, len(data) // 24)
+        for i in range(0, len(data), step):
+            self.wfile.write(data[i:i+step]); self.wfile.flush(); time.sleep(0.25)
+http.server.HTTPServer(('127.0.0.1', port), H).serve_forever()
+PY
+python3 "$T/slow_server.py" "$T/www" 18082 >/dev/null 2>&1 &
+SLOW_PID=$!
+for i in $(seq 1 30); do curl -sf -o /dev/null "http://127.0.0.1:18082/mihomo-linux-amd64-v1.18.8.gz" && break; sleep 0.2; done
+F="$T/www/mihomo-linux-amd64-v1.18.8.gz"
+SZ=$(wc -c < "$F" | tr -d ' ')
+printf '{"op":"install","kernel":"mihomo","version":"vslowtest","urls":"http://127.0.0.1:18082/mihomo-linux-amd64-v1.18.8.gz","sha256":"%s","activate":0,"size":%s,"mirror":"github"}' \
+	"$(sha_of "$F")" "$SZ" > "$T/args-slow.json"
+cat "$T/args-slow.json" | sh "$SRC/kernel.sh" start >/dev/null 2>&1
+samples=0; lastpct=-1; mono=1; speeds=0; srcseen=0; n=0
+while :; do
+	n=$((n + 1))
+	[ "$n" -gt 400 ] && break
+	[ -f "$PMK_JOB" ] || { sleep 0.3; continue; }
+	pct=$(sed -n 's/.*"percent":\([0-9]*\).*/\1/p' "$PMK_JOB" | tail -1)
+	bytes=$(sed -n 's/.*"bytes":\([0-9]*\).*/\1/p' "$PMK_JOB" | tail -1)
+	spd=$(sed -n 's/.*"speed":\([0-9]*\).*/\1/p' "$PMK_JOB" | tail -1)
+	src=$(sed -n 's/.*"source":"\([^"]*\)".*/\1/p' "$PMK_JOB" | tail -1)
+	[ -n "$pct" ] && [ "$pct" -gt 0 ] && samples=$((samples + 1))
+	[ -n "$pct" ] && [ "$pct" -lt "$lastpct" ] && mono=0
+	[ -n "$pct" ] && lastpct=$pct
+	[ -n "$spd" ] && [ "$spd" -gt 0 ] && speeds=$((speeds + 1))
+	[ -n "$src" ] && srcseen=1
+	grep -q '"done":true' "$PMK_JOB" 2>/dev/null && break
+	sleep 0.2
+done
+kill "$SLOW_PID" 2>/dev/null
+[ "$samples" -ge 3 ] && pass "下载进度采样 $samples 点（含字节与百分比）" || fail "进度采样不足：$samples 点"
+[ "$mono" = 1 ] && pass "进度百分比单调不减（最终 $lastpct%）" || fail "百分出现回退"
+[ "$speeds" -ge 1 ] && pass "有速度采样（$speeds 次 speed>0）" || fail "未见速度字段非零"
+[ "$srcseen" = 1 ] && pass "任务带当前下载源 source" || fail "缺 source 字段"
+job_ok && pass "慢速下载最终安装成功" || fail "慢速下载失败：$(job_code) $(job_msg)"
+echo "$(cat "$PMK_JOB")" | grep -q '"source":"github"' && pass "完成后 source=github" || fail "完成后 source 缺失"
+echo "$(cat "$PMK_JOB")" | grep -q '"stage":7' && pass "完成后 stage=7" || fail "完成后阶段异常"
+echo "$(cat "$PMK_JOB")" | grep -q '"http_code":"200"' && pass "成功后记录 HTTP 200" || fail "未记录 HTTP 码"
+rm -rf "$PMK_STORE/mihomo/vslowtest"
+
+echo "===== 35. 坏源 / 断网：失败阶段与 HTTP 原因（不假装完成） ====="
+PMK_OP_KERNEL=singbox PMK_OP_VERSION=vnohttp PMK_OP_URLS="$URL/no-such-asset.tar.gz" \
+PMK_OP_MIRROR=github PMK_OP_ACTIVATE=0 run_op install
+if ! job_ok && [ "$(job_code)" = ERR_NETWORK ]; then pass "坏源返回 ERR_NETWORK（未假装完成）"; else
+	fail "坏源未按预期失败：$(job_code) $(job_msg)"
+fi
+echo "$(cat "$PMK_JOB")" | grep -q '"http_code":"4[0-9][0-9]"' && pass "失败记录 HTTP 4xx（$(sed -n 's/.*"http_code":"\([^"]*\)".*/\1/p' "$PMK_JOB")）" || fail "未记录 HTTP 状态码：$(cat "$PMK_JOB")"
+echo "$(cat "$PMK_JOB")" | grep -q '"stage":2' && pass "失败停在下载阶段 stage=2" || fail "失败阶段丢失"
+jmsg=$(job_msg)
+case "$jmsg" in *HTTP\ 4*|*404*|*403*) pass "失败原因含 HTTP 码（$jmsg）" ;; *) fail "失败原因不含 HTTP 码：$jmsg" ;; esac
+[ ! -d "$PMK_STORE/singbox/vnohttp" ] && pass "失败未落位" || fail "失败仍落位"
+PMK_OP_KERNEL=singbox PMK_OP_VERSION=voffline PMK_OP_URLS="https://127.0.0.1:1/x.gz" \
+PMK_OP_MIRROR=github PMK_OP_ACTIVATE=0 run_op install
+if ! job_ok && [ "$(job_code)" = ERR_NETWORK ]; then pass "断网/不可达返回 ERR_NETWORK"; else
+	fail "不可达未按预期失败：$(job_code) $(job_msg)"
+fi
+jmsg=$(job_msg)
+case "$jmsg" in *refused*|*不可达*|*timeout*|*timed\ out*|*失败*) pass "不可达给出网络类原因（$jmsg）" ;; *) fail "不可达原因不够具体：$jmsg" ;; esac
+
+echo "===== 36. 版本清单按内核过滤 + 返回可用内核列表（离线） ====="
+out=$(printf '{"kernel":"mihomo"}' | sh "$SRC/kernel.sh" versions)
+echo "$out" | grep -q '"kernels":"mihomo,singbox"' && pass "versions 返回可用内核列表（$out 中的 kernels）" \
+	|| fail "缺 kernels 列表：$out"
+out=$(printf '{"kernel":"singbox"}' | sh "$SRC/kernel.sh" versions)
+mh=$(printf '{"kernel":"mihomo"}' | sh "$SRC/kernel.sh" versions | grep -o '"url"' | wc -l)
+sb=$(echo "$out" | grep -o '"url"' | wc -l)
+[ "$sb" -ge 1 ] && pass "sing-box 清单非空（$sb 条）" || fail "sing-box 清单为空"
+[ "$mh" -ge 1 ] && pass "mihomo 清单非空（$mh 条，与 sing-box 独立）" || fail "mihomo 清单为空"
+echo "$out" | grep -q 'sing-box-1.14.4-linux-amd64' && pass "sing-box 清单条目为 sing-box 资产" || fail "sing-box 清单条目异常"
+if echo "$out" | grep -q 'mihomo-linux'; then fail "sing-box 清单混入 mihomo 版本"; else pass "sing-box 清单不含 mihomo 资产（切换不串味）"; fi
+
+echo "===== 37. 前端：管理内核与运行内核分离、进度阶段、状态未知（静态断言） ====="
+grep -q '管理内核' "$VJS" && pass "存在「管理内核」选择器" || fail "缺管理内核选择器"
+grep -q '即将安装到' "$VJS" && pass "顶部显示「即将安装到」" || fail "缺安装目标摘要"
+grep -q 'manageKernel' "$VJS" && pass "管理内核用独立状态 manageKernel" || fail "管理内核状态缺失"
+grep -q 'kernel: state.manageKernel' "$VJS" && pass "安装参数用 manageKernel（不与运行内核耦合）" || fail "安装参数仍用 selKernel"
+grep -q '不会改动正在运行的内核' "$VJS" && pass "明确文案：切换管理内核不改运行内核" || fail "缺运行时隔离文案"
+grep -q '准备中…' "$VJS" && pass "点击后立刻「准备中…」" || fail "缺即时反馈文案"
+grep -q 'installBtn.disabled = true' "$VJS" && pass "进行中按钮禁用" || fail "按钮未禁用"
+grep -q '状态未知' "$VJS" && pass "轮询异常有「状态未知」态" || fail "缺状态未知态"
+grep -q '20000' "$VJS" && pass "20s 无更新判定" || fail "缺 20s 无更新判定"
+grep -q 'poll.add(state.pollFn, 1)' "$VJS" && pass "job 轮询 1s 一次" || fail "轮询间隔不是 1s"
+grep -q "var want = state.manageKernel" "$VJS" && pass "清单请求绑定当前管理内核（防串味）" || fail "清单请求未绑定内核"
+for st in '排队' '预检' '校验 SHA-256' '解压/识别' '落位' '切换指针' '完成'; do
+	grep -q "$st" "$VJS" && pass "阶段条含「$st」" || fail "阶段条缺「$st」"
+done
+grep -q '失败会停在具体阶段' "$VJS" && pass "说明失败停留在具体阶段" || fail "缺失败阶段说明"
 
 echo
 if [ "$FAILED" -eq 0 ]; then

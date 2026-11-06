@@ -60,10 +60,14 @@ return view.extend({
 			versions: null,
 			versionsErr: '',
 			versionsLoading: false,
+			versionsMeta: null,
 			mirrorsErr: '',
 			job: (st && st.job) ? st.job : null,
+			// 切换运行内核（上方「切换内核 / 版本」）的选择
 			selKernel: (st && st.uci_kernel_norm) || 'mihomo',
 			selVersion: '',
+			// 「获取新版本」里的“管理内核”：只决定管理哪个内核的版本，与运行内核无关
+			manageKernel: (st && st.uci_kernel_norm) || 'mihomo',
 			selUrl: '',
 			preview: null,
 			previewFor: '',
@@ -73,7 +77,12 @@ return view.extend({
 			mirrorMsg: '',
 			curSize: 0,
 			lastInstall: null,
-			busy: false
+			busy: !!(st && st.job && st.job.phase && !st.job.done),
+			kernels: ['mihomo', 'singbox'],
+			maxPct: 0,
+			pollErrs: 0,
+			jobSig: '',
+			jobSigAt: 0
 		};
 
 		var boxStatus = E('div', {});
@@ -96,6 +105,27 @@ return view.extend({
 			return (state.st.installed || []).filter(function(v) { return v && v.kernel; });
 		}
 
+		function kernelLabel(k) { return k === 'singbox' ? 'sing-box' : 'mihomo'; }
+
+		// 「运行中」与「已安装」是两个独立维度：不要把某内核的已装版本当成运行版本
+		function installedByKernel() {
+			var map = {};
+			installedList().forEach(function(v) {
+				if (!map[v.kernel]) map[v.kernel] = [];
+				map[v.kernel].push(v);
+			});
+			return map;
+		}
+
+		function installedText() {
+			var map = installedByKernel(), parts = [];
+			Object.keys(map).forEach(function(k) {
+				var items = map[k].map(function(v) { return v.version + '（' + v.tag + '）' + (v.active ? ' ← 启用' : ''); });
+				parts.push(kernelLabel(k) + '：' + items.join('、'));
+			});
+			return parts.length ? parts.join('； ') : '无';
+		}
+
 		function findCurrent() {
 			var k = state.st.uci_kernel_norm, act = state.st.active;
 			var l = installedList();
@@ -111,9 +141,10 @@ return view.extend({
 			var size = s.active_size || (cur && cur.size) || 0;
 			var binArch = s.active_arch || (cur && cur.arch) || '';
 			var rows = [
-				[ '当前内核', E('strong', {}, [ s.uci_kernel || '—' ]) ],
+				[ '运行中：内核', E('strong', {}, [ kernelLabel(s.uci_kernel_norm || '') + '（' + (s.uci_kernel || '—') + '）' ]) ],
+				[ '运行中：版本', s.active_version ? (s.active_version + '（' + (s.active || '') + '）') : (cur ? cur.version : '无（未纳入内核管理）') ],
 				[ '运行状态', s.running ? E('span', { 'style': 'color:#2e7d32' }, [ '运行中' ]) : E('span', { 'style': 'color:#b12704' }, [ '未运行' ]) ],
-				[ '当前版本', s.active_version ? (s.active_version + '（' + (s.active || '') + '）') : (cur ? cur.version : '无（未纳入内核管理）') ],
+				[ '已安装（按内核）', installedText() ],
 				[ '二进制路径', s.bin_path || '—' ],
 				[ '二进制来源', s.bin_source === 'plugin' ? '插件目录（current 指针）'
 					: (s.bin_source === 'system' ? '系统自带（只读回退，未被覆盖）' : '未找到可执行文件') ],
@@ -308,7 +339,7 @@ return view.extend({
 				.then(function(r) {
 					if (!r || !r.ok) throw new Error((r && r.error) || '启动失败');
 					state.job = { phase: 'queued', message: '任务已提交', done: false };
-					renderJob();
+					renderJob(); updateInstallBtn();
 					startPoll();
 				})
 				.catch(function(e) { state.busy = false; ui.addNotification(null, E('p', {}, [ '' + e ]), 'danger'); });
@@ -322,7 +353,7 @@ return view.extend({
 				.then(function(r) {
 					if (!r || !r.ok) throw new Error((r && r.error) || '回滚失败');
 					state.job = { phase: 'queued', message: '回滚任务已提交', done: false };
-					renderJob(); startPoll();
+					renderJob(); updateInstallBtn(); startPoll();
 				})
 				.catch(function(e) { state.busy = false; ui.addNotification(null, E('p', {}, [ '' + e ]), 'danger'); });
 		}
@@ -337,69 +368,159 @@ return view.extend({
 			});
 		}
 
+		// 阶段与后端 kernel.sh 的 job.stage 一一对应（0..7）
+		var STAGES = [ '排队', '预检', '下载', '校验 SHA-256', '解压/识别', '落位', '切换指针', '完成' ];
+		var PHASE_STAGE = {
+			queued: 0, precheck: 1, download: 2, verify: 3, extract: 4, version: 4,
+			install: 5, switch: 6, done: 7
+		};
+
+		function jobStage(j) {
+			if (j && typeof j.stage === 'number') return j.stage;
+			var m = j ? PHASE_STAGE[j.phase] : 0;
+			return (typeof m === 'number') ? m : 0;
+		}
+
+		// 进度百分比只增不减：后端阶段切换有跳跃，前端仍要单调
+		function jobPercent(j) {
+			if (!j) return 0;
+			if (typeof j.percent === 'number') return j.percent;
+			if (j.done && j.ok) return 100;
+			return 0;
+		}
+
 		function renderJob() {
 			var j = state.job;
 			clear(boxJob);
 			if (!j) return;
-			var stepPct = { queued: 10, download: 35, verify: 55, extract: 70, version: 75, install: 82, switch: 90 };
-			var pct = j.done ? 100 : (stepPct[j.phase] || 10);
-			var bytesTxt = '';
-			if (j.phase === 'download' && !j.done) {
-				var total = state.curSize || 0;
-				bytesTxt = '，已下载 ' + K.fmtBytes(j.bytes || 0) + (total ? ' / ' + K.fmtBytes(total) : '');
-				if (total > 0) pct = Math.min(54, 10 + Math.round(45 * Math.min(1, (j.bytes || 0) / total)));
-			} else if (j.bytes) {
-				bytesTxt = '，共 ' + K.fmtBytes(j.bytes);
-			}
-			add(boxJob, E('div', { 'class': 'cbi-progressbar', 'title': pct + '%' }, [
-				E('div', { 'style': 'width:' + pct + '%' }, [ pct + '%' ])
+			var idx = jobStage(j), pct = jobPercent(j);
+			if (j.id && j.id !== state.pollJobId) { state.pollJobId = j.id; state.maxPct = 0; }
+			if (pct > state.maxPct) state.maxPct = pct;
+			var shown = state.maxPct;
+			var failed = j.done && !j.ok && j.phase !== 'unknown' && j.phase !== 'error';
+
+			// 阶段条：当前阶段高亮，已完成打勾，失败停在对应阶段
+			var strip = E('div', { 'class': 'ferry-stages',
+				'style': 'display:flex;flex-wrap:wrap;gap:4px;margin:0 0 8px 0;font-size:12px' },
+				STAGES.map(function(name, i) {
+					var bg = '#eceff1', fg = '#607d8b', weight = 'normal';
+					if (i < idx || (j.done && j.ok)) { bg = '#e8f5e9'; fg = '#2e7d32'; }
+					if (i === idx && !(j.done && j.ok)) {
+						bg = failed ? '#ffebee' : '#e3f2fd';
+						fg = failed ? '#c62828' : '#1565c0';
+						weight = 'bold';
+					}
+					return E('span', { 'style': 'padding:2px 8px;border-radius:10px;background:' + bg
+						+ ';color:' + fg + ';font-weight:' + weight }, [ (i < idx || (j.done && j.ok) ? '✓ ' : '') + name ]);
+				}));
+			add(boxJob, strip);
+			add(boxJob, E('div', { 'class': 'cbi-progressbar', 'title': shown + '%' }, [
+				E('div', { 'style': 'width:' + shown + '%' }, [ shown + '%' ])
 			]));
-			add(boxJob, E('p', {}, [ '阶段：' + (j.phase || '—') + '　' + (j.message || '') + bytesTxt ]));
-			if (j.source)
-				add(boxJob, E('p', { 'style': 'margin:0' }, [
-					'下载源：' + j.source + (j.fallback ? '（已回退到 ' + j.source + ' 源）' : '')
+
+			var nums = [];
+			if (j.bytes || j.total) {
+				nums.push('已下载 ' + K.fmtBytes(j.bytes || 0) + (j.total ? ' / ' + K.fmtBytes(j.total) : ''));
+				nums.push(shown + '%');
+			}
+			if (j.speed) nums.push(K.fmtBytes(j.speed) + '/s');
+			if (j.source) nums.push('源：' + j.source + (j.fallback ? '（已回退）' : ''));
+			add(boxJob, E('p', { 'style': 'margin:0' }, [
+				E('strong', {}, [ '阶段 ' + Math.min(idx + 1, STAGES.length) + '/' + STAGES.length + '：' + STAGES[idx] + '　' ]),
+				j.message || '',
+				nums.length ? E('span', { 'class': 'cbi-value-help' }, [ '（' + nums.join('；') + '）' ]) : ''
+			]));
+			if (j.http_code || j.detail)
+				add(boxJob, hint('HTTP ' + (j.http_code || '?') + (j.detail ? '：' + j.detail : '')));
+
+			if (failed) {
+				var why = K.errText(j.code);
+				add(boxJob, warn('安装失败（' + (j.code || 'ERR') + '），停在「' + STAGES[idx] + '」阶段：' + (j.message || '')));
+				if (why) add(boxJob, hint('原因：' + why));
+				if (j.http_code) add(boxJob, hint('HTTP 状态码：' + j.http_code));
+				if (j.detail) add(boxJob, hint('下载工具原文：' + j.detail));
+				add(boxJob, E('div', {}, [
+					state.lastInstall
+						? button('重试（沿用上次参数）', 'cbi-button-apply', function() { startInstall(state.lastInstall); })
+						: button('重新获取版本清单', 'cbi-button-neutral', function() { loadVersions(); }),
+					' ',
+					button('查看诊断', 'cbi-button-neutral', function() {
+						ui.addNotification(null, E('p', {}, [ '在路由器上执行：ferry-kernel-diag（打印包版本/架构/空间/依赖/清单来源/各源可达性/最近任务错误）' ]), 'info', 15000);
+					})
 				]));
-			if (j.done) {
-				if (j.ok)
-					add(boxJob, info('完成：' + (j.message || '')));
-				else {
-					add(boxJob, warn('失败（' + (j.code || '') + '）：' + (j.message || '')));
-					add(boxJob, hint('原因：' + K.errText(j.code)));
-					if (state.lastInstall)
-						add(boxJob, button('重试（沿用上次参数）', 'cbi-button-action', function() {
-							startInstall(state.lastInstall);
-						}));
-				}
+			} else if (j.done && j.ok) {
+				add(boxJob, info('安装完成：' + (j.message || '')));
+				add(boxJob, table([ '结果', '' ], [
+					[ '内核', kernelLabel(j.kernel) ],
+					[ '版本', (j.version || '—') + (j.size ? '（' + K.fmtBytes(j.size) + '）' : '') ],
+					[ '来源', (j.source || '—') + (j.fallback ? '（回退命中）' : '') ],
+					[ '落位路径', j.dest || '—' ],
+					[ '耗时', (j.elapsed || 0) + ' 秒' ]
+				]));
+				if (j.kernel && j.running && j.kernel !== j.running)
+					add(boxJob, hint('已安装 ' + kernelLabel(j.kernel) + ' ' + (j.version || '') + '；当前运行 ' + kernelLabel(j.running)
+						+ '，切换到它后才生效（运行中与代理均未中断）。'));
+			} else if (j.phase === 'unknown' || j.phase === 'error') {
+				add(boxJob, warn('状态未知：' + (j.message || '')));
+				add(boxJob, hint('可重试重新开始；或在路由器执行 ferry-kernel-diag 查看诊断（包版本/依赖/清单来源/各源可达性/最近任务错误）。'));
+				add(boxJob, button('重试', 'cbi-button-apply', function() {
+					if (state.lastInstall) startInstall(state.lastInstall);
+					else { loadVersions(); }
+				}));
 			}
 		}
 
+		function stopPoll() {
+			if (state.pollFn) { poll.remove(state.pollFn); state.pollFn = null; }
+		}
+
+		// 轮询间隔 1s；连续失败或 20s 无任何更新 → 明确的「状态未知」，不无限转圈
 		function startPoll() {
 			if (state.pollFn) return;
 			state.busy = true;
+			state.pollErrs = 0;
+			state.jobSig = '';
+			state.jobSigAt = Date.now();
+			// 刷新页面后续跑的任务：首条轮询到达前按钮就必须是处理中
+			updateInstallBtn();
 			state.pollFn = function() {
-				K.callJob().then(function(r) {
+				rpcTimeout(K.callJob(), 5000, '读取任务状态').then(function(r) {
+					state.pollErrs = 0;
 					var j = r && r.job;
-					if (!j) return;
+					if (!j) { goUnknown('后端没有任务记录（可能 rpcd 已重启或任务已被清理）'); return; }
+					var sig = [ j.id || '', j.phase || '', j.updated || '', j.bytes || 0, j.stage || 0 ].join('|');
+					if (sig !== state.jobSig) { state.jobSig = sig; state.jobSigAt = Date.now(); }
 					state.job = j;
-					renderJob();
+					state.busy = !j.done;
+					renderJob(); updateInstallBtn();
 					if (j.done) {
-						state.busy = false;
-						if (state.pollFn) { poll.remove(state.pollFn); state.pollFn = null; }
-						refreshStatus();
+						stopPoll(); state.busy = false;
+						renderJob(); updateInstallBtn(); refreshStatus();
+						if (j.ok) ui.addNotification(null, E('p', {}, [ '内核任务完成：' + (j.message || '') ]), 'info');
+					} else if (Date.now() - state.jobSigAt > 20000) {
+						// 慢阶段（大二进制解压/落位）可能 20s 没有新数据；先提示状态未知，
+						// 但继续轮询：一旦后端有新进度或完成，界面自动恢复，不需要手动刷新
+						goUnknown('20 秒内没有收到任务进度更新（后端可能卡住或 rpcd 无响应；仍在后台轮询）');
 					}
 				}).catch(function(e) {
-					state.pollErrs = (state.pollErrs || 0) + 1;
-					if (state.pollErrs >= 3) {
-						if (state.pollFn) { poll.remove(state.pollFn); state.pollFn = null; }
-						state.busy = false;
-						state.job = { phase: 'error', done: true,
-							message: '任务状态读取失败：' + ((e && e.message) || e) };
-						renderJob();
-					}
+					state.pollErrs++;
+					if (state.pollErrs >= 3) goUnknown('连续读取任务状态失败：' + ((e && e.message) || e));
 				});
 			};
 			poll.add(state.pollFn, 1);
 			state.pollFn();
+		}
+
+		// 只把界面切到「状态未知」，不断轮询：后端只是慢（大文件解压）时，
+		// 下一条进度/完成会自动把界面恢复成正常进度
+		function goUnknown(msg) {
+			state.busy = false;
+			state.job = {
+				phase: 'unknown', done: true, ok: false, code: 'ERR_UNKNOWN',
+				stage: jobStage(state.job), percent: state.maxPct,
+				message: msg + '。可点「重试」重新开始，或执行 ferry-kernel-diag 查看诊断'
+			};
+			renderJob(); updateInstallBtn();
 		}
 
 		function versionOfUrl(u) {
@@ -487,7 +608,36 @@ return view.extend({
 
 			var progress = E('div', { 'id': 'k-progress' });
 
+			// 管理内核：只影响版本清单与安装目标，绝不切换运行内核
+			var manageSel = select((state.kernels || [ 'mihomo', 'singbox' ]).map(function(k) {
+				return [ k, kernelLabel(k) + (k === (state.st.uci_kernel_norm || 'mihomo') ? '（运行中）' : ''),
+					state.manageKernel === k ];
+			}), function(ev) {
+				state.manageKernel = ev.target.value;
+				// 换内核必须清空已选版本，避免「选 sing-box 却装 mihomo 的包」
+				state.versions = null;
+				state.versionsErr = '';
+				state.versionsMeta = null;
+				state.selUrl = '';
+				state.curSize = 0;
+				var shaEl = document.getElementById('k-sha');
+				if (shaEl) shaEl.value = '';
+				loadVersions();
+			});
+
+			var banner = E('div', { 'class': 'alert-message',
+				'style': 'font-weight:bold;margin-bottom:8px' }, [ installTargetText() ]);
+
+			add(boxInstall, banner);
 			add(boxInstall, E('div', { 'class': 'cbi-section' }, [
+				E('div', { 'class': 'cbi-value' }, [
+					E('label', { 'class': 'cbi-value-title' }, [ '管理内核' ]),
+					E('div', { 'class': 'cbi-value-field' }, [
+						manageSel,
+						E('div', { 'class': 'cbi-value-help' }, [ '只决定下面版本清单与安装目标属于哪个内核；'
+							+ '切换这里不会改动正在运行的内核，也不会重启服务或中断代理。要换运行内核请用上方「切换内核 / 版本」。' ])
+					])
+				]),
 				E('div', { 'class': 'cbi-value' }, [
 					E('label', { 'class': 'cbi-value-title' }, [ '内核目录' ]),
 					E('div', { 'class': 'cbi-value-field' }, [
@@ -527,24 +677,8 @@ return view.extend({
 					E('div', { 'class': 'cbi-value-field' }, [
 						verSel,
 						' ',
-						button('下载并安装', 'cbi-button-apply', function() {
-							var u = (document.getElementById('k-custom-url') || {}).value || '';
-							var vsel = u ? null : (state.versions || []).filter(function(v) { return v.url === state.selUrl; })[0];
-							var urls = u || (vsel && vsel.url) || state.selUrl;
-							var version = u ? 'custom-' + new Date().toISOString().replace(/[-:T.Z]/g, '').slice(0, 14)
-								: (vsel ? vsel.version : '');
-							if (!urls || !version) { ui.addNotification(null, E('p', {}, [ '请选择版本或填写自定义 URL' ]), 'warning'); return; }
-							state.curSize = vsel ? (vsel.size || 0) : 0;
-							startInstall({
-								op: 'install', kernel: state.selKernel, version: version, urls: urls,
-								sha256: (document.getElementById('k-sha') || {}).value || (vsel && vsel.sha256) || '',
-								size: vsel ? (vsel.size || 0) : 0,
-								mirror: (u ? 'github' : (state.src === '__custom' ? 'auto' : state.src)),
-								allow_unverified: (document.getElementById('k-allow-unverified') || {}).checked ? 1 : 0,
-								activate: (document.getElementById('k-activate') || {}).checked ? 1 : 0,
-								restart: 1
-							});
-						})
+						installBtn,
+						E('div', { 'class': 'cbi-value-help' }, [ '点下按钮立即进入「准备中…」，随后按阶段显示下载/校验/解压/落位/切换的进度；失败会停在具体阶段并给出原因。' ])
 					])
 				]),
 				E('div', { 'class': 'cbi-value' }, [
@@ -561,7 +695,7 @@ return view.extend({
 							if (!/^\//.test(p)) { ui.addNotification(null, E('p', {}, [ '本地路径必须是绝对路径' ]), 'warning'); return; }
 							var ver = p.replace(/^.*\//, '').replace(/\.(tar\.gz|tgz|gz|bin)$/i, '');
 							startInstall({
-								op: 'install-local', kernel: state.selKernel, version: ver, file: p,
+								op: 'install-local', kernel: state.manageKernel, version: ver, file: p,
 								sha256: (document.getElementById('k-sha') || {}).value || '',
 								allow_unverified: (document.getElementById('k-allow-unverified') || {}).checked ? 1 : 0,
 								activate: (document.getElementById('k-activate') || {}).checked ? 1 : 0,
@@ -575,7 +709,9 @@ return view.extend({
 					E('div', { 'class': 'cbi-value-field' }, [
 						E('label', {}, [ allowUnver, ' 允许未校验安装（官方未提供 checksum 时必须显式勾选）' ]),
 						E('br'),
-						E('label', {}, [ autoActivate, ' 安装后立即启用（会重启服务）' ])
+						E('label', {}, [ autoActivate, isRunningTarget()
+							? ' 安装后立即启用（会重启运行中的内核，代理中断约 5 秒）'
+							: ' 同时写入该内核的启用指针（仅安装，不改运行内核、不重启服务）' ])
 					])
 				]),
 				progress
@@ -592,6 +728,7 @@ return view.extend({
 						button('重试', 'cbi-button-neutral', function() { loadVersions(); })
 					])
 				]));
+			updateInstallBtn();
 		}
 
 		// 所有后端调用都加 5s 上限：rpcd 未重载 / 后端异常时也必须落到错误态，
@@ -610,13 +747,21 @@ return view.extend({
 			});
 		}
 
-		// 版本清单来自包内置清单：纯离线，必须与镜像源/网络状态无关
+		// 版本清单来自包内置清单：纯离线，必须与镜像源/网络状态无关。
+		// 切换管理内核时用 captured 值防止旧请求把新内核的清单覆盖掉。
 		function loadVersions(silent) {
+			var want = state.manageKernel;
 			state.versionsErr = '';
+			state.versions = null;
+			state.selUrl = '';
+			state.curSize = 0;
 			state.versionsLoading = true;
-			if (!silent) ui.addNotification(null, E('p', {}, [ '正在读取 ' + state.selKernel + ' 版本清单…' ]), 'info');
-			rpcTimeout(K.callVersions(state.selKernel, state.prerelease ? 1 : 0), 5000, '读取版本清单')
+			renderInstall();
+			if (!silent) ui.addNotification(null, E('p', {}, [ '正在读取 ' + kernelLabel(want) + ' 版本清单…' ]), 'info');
+			rpcTimeout(K.callVersions(want, state.prerelease ? 1 : 0), 5000, '读取版本清单')
 				.then(function(r) {
+					if (want !== state.manageKernel) return; // 期间又切了内核，丢弃这次结果
+					if (r && r.kernels) state.kernels = ('' + r.kernels).split(',').filter(function(x) { return x; });
 					if (!r || !r.ok) { state.versions = null; state.versionsErr = (r && r.error) || '获取失败'; }
 					else {
 						state.versions = r.versions || [];
@@ -626,22 +771,110 @@ return view.extend({
 						if (!state.selUrl && state.versions.length) {
 							state.selUrl = state.versions[0].url;
 							state.curSize = state.versions[0].size || 0;
+							var shaEl = document.getElementById('k-sha');
+							if (shaEl && state.versions[0].sha256) shaEl.value = state.versions[0].sha256;
 						}
+						if (!state.versions.length)
+							state.versionsErr = '该内核在本机架构（' + (r.arch || '?') + '）没有可用版本，请改用自定义 URL 或本地导入';
 					}
 				})
-				.catch(function(e) { state.versions = null; state.versionsErr = (e && e.message) || ('' + e); })
-				.then(function() { state.versionsLoading = false; renderInstall(); });
+				.catch(function(e) {
+					if (want !== state.manageKernel) return;
+					state.versions = null; state.versionsErr = (e && e.message) || ('' + e);
+				})
+				.then(function() {
+					if (want !== state.manageKernel) return;
+					state.versionsLoading = false; renderInstall();
+				});
+		}
+
+		function selectedVersion() {
+			if (state.src === '__custom') return null;
+			return (state.versions || []).filter(function(v) { return v.url === state.selUrl; })[0] || null;
+		}
+
+		function isRunningTarget() {
+			return state.manageKernel === (state.st.uci_kernel_norm || 'mihomo');
+		}
+
+		function installTargetText() {
+			var v = selectedVersion();
+			var txt = '即将安装到：' + kernelLabel(state.manageKernel) + ' '
+				+ (v ? (v.version + (v.prerelease ? '（预发布）' : '')) : (state.versionsLoading ? '（版本清单读取中…）' : '（请选择版本）'));
+			if (v && v.size) txt += '，' + K.fmtBytes(v.size);
+			txt += '　｜　运行中：' + kernelLabel(state.st.uci_kernel_norm || 'mihomo');
+			if (state.manageKernel !== state.st.uci_kernel_norm)
+				txt += '（安装不会中断代理，切换到它后生效）';
+			else
+				txt += '（更新运行中的内核，切换时代理约中断 5 秒）';
+			return txt;
+		}
+
+		var installBtn = button('下载并安装', 'cbi-button-apply', function() { onInstallClick(); });
+
+		function updateInstallBtn() {
+			var j = state.job;
+			if (state.busy) {
+				installBtn.disabled = true;
+				if (!j || j.phase === 'queued') installBtn.textContent = '准备中…';
+				else if (j.phase === 'download') installBtn.textContent = '下载中…';
+				else installBtn.textContent = '安装中…';
+			} else {
+				installBtn.disabled = false;
+				installBtn.textContent = '下载并安装';
+			}
+		}
+
+		function onInstallClick() {
+			if (state.busy) { ui.addNotification(null, E('p', {}, [ '已有任务在执行' ]), 'warning'); return; }
+			var u = ((document.getElementById('k-custom-url') || {}).value || '').trim();
+			var vsel = u ? null : selectedVersion();
+			var urls = u || (vsel && vsel.url) || state.selUrl;
+			var version = u ? 'custom-' + new Date().toISOString().replace(/[-:T.Z]/g, '').slice(0, 14)
+				: (vsel ? vsel.version : '');
+			if (!urls || !version) { ui.addNotification(null, E('p', {}, [ '请选择版本或填写自定义 URL' ]), 'warning'); return; }
+			state.curSize = vsel ? (vsel.size || 0) : 0;
+			var target = kernelLabel(state.manageKernel) + ' ' + (vsel ? vsel.version : '自定义 URL');
+			var sizeTxt = vsel && vsel.size ? '，大小 ' + K.fmtBytes(vsel.size) : '';
+			var srcTxt = u ? '，来源 自定义 URL' : '，来源 ' + (state.src === '__custom' ? '自动' : state.src);
+			var note = state.manageKernel === state.st.uci_kernel_norm
+				? '目标与正在运行的内核相同：更新/切换期间代理会中断约 5 秒。'
+				: '目标内核当前未运行：安装不会中断代理，也不会切换运行内核；完成后切换到它才生效。';
+			if (!confirm(target + '\n' + note + '\n\n即将安装到：' + target + sizeTxt + srcTxt + '\n\n继续？')) return;
+
+			startInstall({
+				op: 'install', kernel: state.manageKernel, version: version, urls: urls,
+				sha256: (document.getElementById('k-sha') || {}).value || (vsel && vsel.sha256) || '',
+				size: vsel ? (vsel.size || 0) : 0,
+				mirror: (u ? 'github' : (state.src === '__custom' ? 'auto' : state.src)),
+				allow_unverified: (document.getElementById('k-allow-unverified') || {}).checked ? 1 : 0,
+				activate: (document.getElementById('k-activate') || {}).checked ? 1 : 0,
+				restart: 1
+			});
 		}
 
 		function startInstall(args) {
 			if (state.busy) { ui.addNotification(null, E('p', {}, [ '已有任务在执行' ]), 'warning'); return; }
 			state.lastInstall = args;
 			state.busy = true;
-			K.callStart(args).then(function(r) {
-				if (!r || !r.ok) throw new Error((r && r.error) || '任务提交失败');
-				state.job = { phase: 'queued', message: '任务已提交', done: false };
-				renderJob(); startPoll();
-			}).catch(function(e) { state.busy = false; ui.addNotification(null, E('p', {}, [ '' + e ]), 'danger'); });
+			state.maxPct = 0;
+			// 点下按钮立刻进入可见的“准备中”，不等任何网络往返
+			state.job = { phase: 'queued', stage: 0, percent: 2, done: false, ok: null,
+				kernel: args.kernel, version: args.version, running: state.st.uci_kernel_norm || 'mihomo',
+				message: '已提交，正在准备安装（校验参数与空间）…' };
+			renderJob(); updateInstallBtn();
+			rpcTimeout(K.callStart(args), 5000, '提交安装任务')
+				.then(function(r) {
+					if (!r || !r.ok) throw new Error((r && r.error) || '任务提交失败');
+					startPoll();
+				})
+				.catch(function(e) {
+					state.busy = false;
+					state.job = { phase: 'failed', stage: 0, percent: 2, done: true, ok: false,
+						code: 'ERR_SUBMIT', kernel: args.kernel, version: args.version,
+						message: '任务提交失败：' + ((e && e.message) || e) };
+					renderJob(); updateInstallBtn();
+				});
 		}
 
 		function loadMirrors(cb) {
