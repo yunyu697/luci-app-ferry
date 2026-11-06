@@ -17,7 +17,7 @@ include $(TOPDIR)/rules.mk
 
 PKG_NAME:=luci-app-ferry
 PKG_VERSION:=1.0.0
-PKG_RELEASE:=12
+PKG_RELEASE:=13
 
 PKG_LICENSE:=GPL-2.0-only
 PKG_MAINTAINER:=yunyu697
@@ -42,6 +42,13 @@ define Package/luci-app-ferry
 	+nftables +kmod-nft-core +kmod-nft-nat +kmod-nft-tproxy \
 	+kmod-tun +ip-full +uclient-fetch +ca-bundle
 endef
+
+# 说明（与 CI 预编译产物的差异）：
+#   - 上面是「在 buildroot/SDK 里构建」时的完整依赖声明，按分支分别成立。
+#   - CI 直接产出的 ipk/apk 只声明 luci-base：25.12 x86 的 targets feed 实测
+#     没有发布 kmod-nf-tproxy，而 kmod-nft-tproxy 依赖它；把 kmod-nft-tproxy
+#     写成硬依赖会让 25.12 上「整个包安装失败」，代价远大于收益。
+#   - 缺失模块由 firewall_backend=auto 在运行期检测并回退/提示，安装不再被阻断。
 
 define Package/luci-app-ferry/description
   Ferry 把 mihomo 或 sing-box 内核配置成路由器上的透明代理网关：

@@ -1,0 +1,95 @@
+name: qemu-guest
+
+# 只手动触发：这是唯一需要真实 guest 的验证，耗时远高于常规 CI。
+#
+# 覆盖范围：
+#   - 官方 OpenWrt x86_64 镜像（24.10.5 opkg / 25.12.0 apk），固定 SHA-256 校验
+#   - 真实安装本仓库产出的 ipk/apk，断言文件/权限/版本/keep.d
+#   - 真实 mihomo 二进制 + redirect 模式拉起服务（进程/端口/nft/status.json）
+#   - WebUI：uhttpd + LuCI 静态视图 + 菜单/rpcd 注册
+#   - 卸载：prerm 清理运行态、conffile 与用户数据保留；重装验证升级保留
+#   - 重启：开机自启、配置保留、WebUI 可再次访问
+#
+# 说明：GitHub 托管 runner 没有 /dev/kvm，QEMU 走纯软件模拟（TCG），单版本约 10~20 分钟。
+# 因此没有挂到 push/PR 上，只保留 workflow_dispatch；本地等价命令见 tests/qemu/install-smoke.sh。
+# 想更快可以接自托管 runner（需 /dev/kvm + qemu-system-x86_64），本文件不用改。
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: qemu-guest-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  guest-install:
+    name: guest-install-${{ matrix.release }}
+    runs-on: ubuntu-latest
+    # TCG 很慢：给足时间，但绝不 continue-on-error（失败就是失败）
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        release: ['24.10', '25.12']
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install QEMU and e2fsprogs
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            qemu-system-x86 e2fsprogs
+          qemu-system-x86_64 --version
+          e2fsck -V 2>&1 | head -1
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Build ipk + apk
+        run: |
+          set -euo pipefail
+          bash scripts/ci/fetch-apk-tools.sh .ci/tools
+          bash scripts/ci/build-pkgs.sh dist
+          bash scripts/ci/verify-pkgs.sh dist
+          cat dist/build-meta.txt
+
+      - name: Fetch mihomo (amd64 compatible)
+        run: |
+          set -euo pipefail
+          url="https://github.com/MetaCubeX/mihomo/releases/download/v1.19.33/mihomo-linux-amd64-compatible-v1.19.33.gz"
+          mkdir -p .ci/kernels
+          curl -fsSL --retry 5 --retry-all-errors -o .ci/kernels/mihomo.gz "$url"
+          ls -l .ci/kernels/mihomo.gz
+
+      - name: Guest install smoke (${{ matrix.release }})
+        env:
+          RELEASE: ${{ matrix.release }}
+        run: |
+          set -euo pipefail
+          . dist/build-meta.txt
+          case "$RELEASE" in
+            24.10) pkg="dist/$IPK" ;;
+            25.12) pkg="dist/$APK" ;;
+            *) echo "unknown release $RELEASE" >&2; exit 1 ;;
+          esac
+          bash tests/qemu/install-smoke.sh \
+            --release "$RELEASE" \
+            --pkg "$pkg" \
+            --mihomo .ci/kernels/mihomo.gz \
+            --version "$PKGVER" \
+            --work "$HOME/ferry-qemu-work" \
+            --port-base 2500
+
+      - name: Upload guest logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: qemu-guest-logs-${{ matrix.release }}
+          path: |
+            ~/ferry-qemu-work/logs/${{ matrix.release }}/
+            ~/ferry-qemu-work/report/
+          if-no-files-found: warn

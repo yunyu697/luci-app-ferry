@@ -22,6 +22,20 @@ find "$STAGE" -type f \
 	! -path "$STAGE/usr/bin/*" ! -path "$STAGE/usr/libexec/rpcd/*" \
 	! -name '*.sh' -exec chmod 0644 {} +
 
+# 目录权限：git/Windows 检出的目录模式不可靠（曾出现 0777），统一 0755
+find "$STAGE" -type d -exec chmod 0755 {} +
+
+# 确定性 mtime：出包结果不应随检出时间变化（apk 的 ADB 会记录 mtime）
+EPOCH="${SOURCE_DATE_EPOCH:-1600000000}"
+find "$STAGE" -exec touch -h -d "@$EPOCH" {} +
+
+# WSL 的 /mnt/*（9p/drvfs）不支持 chmod，目录会固定显示 0777，打出来的 apk 权限不可信。
+DMODE=$(stat -c '%a' "$STAGE" 2>/dev/null || echo '?')
+if [ "$DMODE" = "777" ]; then
+	echo "WARN: $STAGE 所在文件系统不支持 chmod（模式显示 0777）。" >&2
+	echo "WARN: 请把 STAGE 指到 Linux 文件系统（如 /tmp/ferry-stage）再打包。" >&2
+fi
+
 FILE_COUNT=$(find "$STAGE" -type f | wc -l)
 echo "stage ready: $STAGE ($FILE_COUNT files)"
 echo "--- modes ---"
