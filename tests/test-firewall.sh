@@ -159,6 +159,12 @@ fake_ip
 PATH="$T/bin:$PATH"
 export PATH FAKE_NFT_STATE="$NFT_STATE" FAKE_IPT_STATE="$IPT_STATE" FAKE_IP_STATE="$IP_STATE"
 
+# 离线环境（CI 容器/虚拟机）通常没加载 tproxy 相关内核模块；用伪造的模块列表验证
+# 接管逻辑本身，模块缺失路径由真机覆盖，不能因此让用例静默跳过。
+PM_MODULES_FILE="$T/proc-modules"
+printf 'nft_tproxy 16384 0 - Live 0x0000000000000000\nxt_TPROXY 20480 0 - Live 0x0000000000000000\n' > "$PM_MODULES_FILE"
+export PM_MODULES_FILE
+
 # shellcheck disable=SC1091
 . "$ROOT/files/usr/lib/ferry/common.sh"
 # shellcheck disable=SC1091
@@ -171,6 +177,7 @@ PM_MODE=tproxy
 PM_PROXY_PORT=7890
 PM_DNS_PORT=1053
 PM_LAN_IFACES="br-lan"
+PM_MGMT_CIDRS=''
 PM_BYPASS_CIDR=''
 PM_BYPASS_IP=''
 PM_ENABLE_IPV6=1

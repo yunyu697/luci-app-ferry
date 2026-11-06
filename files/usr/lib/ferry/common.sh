@@ -631,8 +631,15 @@ pm_dnsmasq_apply() {
 	if ! pm_dnsmasq_has_own_server; then
 		need_capture=1
 	elif [ ! -s "$bakdir/server" ]; then
-		# 0 字节备份（断电时数据未落盘）等同没有备份，必须重新采集/补记
-		need_capture=1
+		# 0 字节备份有两种可能：原始上游本来就是空（合法记录），或断电时数据未落盘。
+		# 只读记录有内容时用它修复备份；记录存在但为空说明原值就是空，保留空备份；
+		# 连记录都没有才算真的缺备份。
+		if [ -s "$native/server" ]; then
+			cp "$native/server" "$bakdir/server" 2>/dev/null
+			[ -f "$native/noresolv" ] && cp "$native/noresolv" "$bakdir/noresolv" 2>/dev/null
+		elif [ ! -f "$native/server" ]; then
+			need_capture=1
+		fi
 	fi
 
 	if [ "$need_capture" = 1 ]; then
@@ -640,7 +647,7 @@ pm_dnsmasq_apply() {
 			# 当前配置只剩本工具写入值（还原已消费备份后又在崩溃点重入）：
 			# 不能把自身值当原始值，用最近一次记录的原始上游补回备份；
 			# 连记录都没有时宁可没有备份，也不要写一份空备份污染后续还原
-			if [ -s "$native/server" ]; then
+			if [ -f "$native/server" ]; then
 				cp "$native/server" "$bakdir/server" 2>/dev/null
 				[ -f "$native/noresolv" ] && cp "$native/noresolv" "$bakdir/noresolv" 2>/dev/null
 				pm_log "dnsmasq 原始上游备份缺失，已用最近一次原始上游记录补回"
@@ -693,10 +700,15 @@ pm_dnsmasq_restore() {
 		mkdir -p "$bakdir"
 		pm_dnsmasq_migrate_legacy_backup
 	fi
-	# 优先一次性备份；备份缺失或为空（崩溃点已消费）时退回只读原始记录
+	# 优先一次性备份；备份缺失时退回只读原始记录。
+	# 0 字节备份是合法记录（原始上游本来就是空），不能当成“无备份”直接返回。
 	src="$bakdir/server"
-	[ -s "$src" ] || src="$native/server"
-	[ -s "$src" ] || return 0
+	[ -f "$src" ] || src="$native/server"
+	[ -f "$src" ] || return 0
+	# 备份为空但只读记录有真实内容（断电未落盘）时，用记录恢复
+	if [ ! -s "$src" ] && [ -s "$native/server" ] && [ "$src" != "$native/server" ]; then
+		src="$native/server"
+	fi
 	[ -f "$PM_DHCP_FILE" ] || return 0
 	uci -q get "$PM_DNSMASQ_SECTION" >/dev/null 2>&1 || return 0
 

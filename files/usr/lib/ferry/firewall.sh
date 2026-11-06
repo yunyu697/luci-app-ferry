@@ -150,6 +150,12 @@ pm_nft_build() {
 	return 0
 }
 
+# 模块是否已加载；离线测试可用 PM_MODULES_FILE 指向伪造的模块列表
+pm_module_loaded() {
+	local f="${PM_MODULES_FILE:-/proc/modules}"
+	grep -q "^$1 " "$f" 2>/dev/null
+}
+
 pm_nft_up() {
 	local f4="$PM_RUN_DIR/ferry-v4.nft"
 	local f6="$PM_RUN_DIR/ferry-v6.nft"
@@ -159,7 +165,7 @@ pm_nft_up() {
 	# TPROXY 依赖内核模块；缺失时给出明确原因，而不是把 nft 的 ENOENT 抛给用户
 	if [ "$PM_MODE" = tproxy ]; then
 		modprobe nft_tproxy 2>/dev/null
-		if ! grep -q '^nft_tproxy' /proc/modules 2>/dev/null; then
+		if ! pm_module_loaded nft_tproxy; then
 			pm_log "TPROXY 无法启用：缺少内核模块 kmod-nft-tproxy（安装该模块后重试）" err
 			return 1
 		fi
@@ -245,7 +251,7 @@ pm_ipt_up() {
 
 	if [ "$PM_MODE" = tproxy ]; then
 		modprobe xt_TPROXY 2>/dev/null
-		if ! grep -q '^xt_TPROXY' /proc/modules 2>/dev/null; then
+		if ! pm_module_loaded xt_TPROXY; then
 			pm_log "TPROXY 无法启用：缺少内核模块 xt_TPROXY（kmod-ipt-tproxy）" err
 			return 1
 		fi
