@@ -828,7 +828,8 @@ grep -q '准备中…' "$VJS" && pass "点击后立刻「准备中…」" || fai
 grep -q 'installBtn.disabled = true' "$VJS" && pass "进行中按钮禁用" || fail "按钮未禁用"
 grep -q '状态未知' "$VJS" && pass "轮询异常有「状态未知」态" || fail "缺状态未知态"
 grep -q '20000' "$VJS" && pass "20s 无更新判定" || fail "缺 20s 无更新判定"
-grep -q 'poll.add(state.pollFn, 1)' "$VJS" && pass "job 轮询 1s 一次" || fail "轮询间隔不是 1s"
+grep -q 'poll.add(state.pollFn, 2)' "$VJS" && pass "job 轮询 2s 一次（r14 降频）" || fail "轮询间隔不是 2s"
+grep -q 'POLL_MAX_MS' "$VJS" && pass "轮询有总时长上限（r14）" || fail "缺轮询总时长上限"
 grep -q "var want = state.manageKernel" "$VJS" && pass "清单请求绑定当前管理内核（防串味）" || fail "清单请求未绑定内核"
 for st in '排队' '预检' '校验 SHA-256' '解压/识别' '落位' '切换指针' '完成'; do
 	grep -q "$st" "$VJS" && pass "阶段条含「$st」" || fail "阶段条缺「$st」"
