@@ -1,0 +1,21 @@
+#!/bin/sh /etc/rc.common
+# 面板包的早期启动脚本：必须在 ferry(99) 之前生成 secret 并装防火墙规则，
+# 否则 ferry 生成内核配置时拿不到 secret，面板端点不会被注入。
+START=98
+STOP=11
+
+start() {
+	[ -x /usr/bin/ferry-panel ] || exit 0
+	/usr/bin/ferry-panel boot >/dev/null 2>&1
+	return 0
+}
+
+stop() {
+	[ -x /usr/bin/ferry-panel ] || exit 0
+	/usr/bin/ferry-panel fw-down >/dev/null 2>&1
+	return 0
+}
+
+reload() {
+	start
+}

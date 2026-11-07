@@ -158,7 +158,9 @@ return view.extend({
 		]));
 		diagBox.appendChild(diagResult);
 
-		// 有 pending 时每秒刷新；结束后降频，避免无意义轮询
+		// 有 pending 时每秒刷新；空闲时每 10 秒一次。
+		// 代价：别的标签页/SSH 新建的 pending 最多晚 10 秒出现在本页；
+		// 本页自身触发的保存会整页刷新，不受影响。
 		var tick = 0;
 		timer = window.setInterval(function() {
 			tick++;
@@ -166,7 +168,7 @@ return view.extend({
 				window.clearInterval(timer);
 				return;
 			}
-			if ((status.pending && status.phase === 'pending') || tick % 5 === 0)
+			if ((status.pending && status.phase === 'pending') || tick % 10 === 0)
 				refresh();
 		}, 1000);
 

@@ -1,0 +1,3 @@
+#!/bin/sh
+# CLI 入口：启用/禁用/轮换/状态/清理/开机自愈
+exec /usr/lib/ferry/panel.sh "$@"

@@ -193,6 +193,11 @@ pm_gen_mihomo() {
 		echo "mode: rule"
 		echo "allow-lan: true"
 		echo "bind-address: '*'"
+		# 面板端点：只绑 LAN 接口地址（不是 0.0.0.0），secret 来自 0600 文件
+		if [ "${PM_PANEL_ENABLED:-0}" = 1 ]; then
+			echo "external-controller: \"$PM_PANEL_BIND:$PM_PANEL_PORT\""
+			echo "secret: \"$PM_PANEL_SECRET\""
+		fi
 		echo "ipv6: $( [ "$PM_ENABLE_IPV6" = 1 ] && echo true || echo false )"
 		echo "unified-delay: true"
 		echo "tcp-concurrent: true"
@@ -260,6 +265,7 @@ pm_gen_mihomo() {
 		return 1
 	fi
 	mv "$cfg.tmp" "$cfg"
+	[ "${PM_PANEL_ENABLED:-0}" = 1 ] && PM_PANEL_INJECTED=1
 	pm_log "已生成 mihomo 配置并通过自检：$cfg"
 	return 0
 }
@@ -435,6 +441,15 @@ pm_gen_singbox() {
 		pm_jsonl_join "$PM_RUN_DIR/sb-outbounds-all.jsonl"
 		echo ""
 		echo "  ],"
+		# 面板端点：sing-box 的 Clash API（experimental.clash_api），同样只绑 LAN 地址
+		if [ "${PM_PANEL_ENABLED:-0}" = 1 ]; then
+			echo "  \"experimental\": {"
+			echo "    \"clash_api\": {"
+			echo "      \"external_controller\": \"$PM_PANEL_BIND:$PM_PANEL_PORT\","
+			echo "      \"secret\": \"$PM_PANEL_SECRET\""
+			echo "    }"
+			echo "  },"
+		fi
 		echo "  \"route\": {"
 		echo "    \"auto_detect_interface\": true,"
 		# default_domain_resolver 1.12 起才可用，A/B 输出会被 check 拒绝
@@ -463,6 +478,7 @@ pm_gen_singbox() {
 		return 1
 	fi
 	mv "$cfg.tmp" "$cfg"
+	[ "${PM_PANEL_ENABLED:-0}" = 1 ] && PM_PANEL_INJECTED=1
 	pm_log "已生成 sing-box 配置（区间 $bucket）并通过自检：$cfg"
 	return 0
 }
@@ -489,6 +505,10 @@ pm_prepare() {
 	if [ -n "$PM_CONFIG_PATH" ] && [ -f "$PM_CONFIG_PATH" ]; then
 		PM_RUNTIME_CONFIG="$PM_CONFIG_PATH"
 		PM_RULE_SYNC_MODE=self
+		if [ "${PM_PANEL_WANT:-0}" = 1 ]; then
+			PM_PANEL_REASON=self_config
+			pm_warn "面板已启用，但当前使用自备配置 $PM_CONFIG_PATH：ferry 不会修改它，需自行添加面板监听与 secret（mihomo: external-controller/secret；sing-box: experimental.clash_api）"
+		fi
 		if [ "$PM_KERNEL" = singbox ]; then
 			pm_singbox_check "$PM_CONFIG_PATH" || pm_warn "自备 sing-box 配置自检未通过：$PM_CONFIG_PATH"
 		else
@@ -509,6 +529,10 @@ pm_prepare() {
 			if pm_download "$PM_SUB_URL" "$new" && pm_singbox_check "$new"; then
 				mv "$new" "$dst"
 				PM_RUNTIME_CONFIG="$dst"
+				if [ "${PM_PANEL_WANT:-0}" = 1 ]; then
+					PM_PANEL_REASON=sub_config
+					pm_warn "面板已启用，但 sing-box 使用订阅配置原样运行：订阅内容未注入 clash_api，面板无法连接；请改用节点导入模式或手工在订阅里加入 experimental.clash_api"
+				fi
 				pm_log "已下载并校验 sing-box 订阅配置：$dst"
 				pm_status_write
 				return 0
@@ -517,6 +541,10 @@ pm_prepare() {
 			pm_warn "sing-box 订阅下载/校验失败，尝试使用上次缓存的配置"
 			if [ -s "$dst" ] && pm_singbox_check "$dst"; then
 				PM_RUNTIME_CONFIG="$dst"
+				if [ "${PM_PANEL_WANT:-0}" = 1 ]; then
+					PM_PANEL_REASON=sub_config
+					pm_warn "面板已启用，但 sing-box 继续使用上次缓存的订阅配置：订阅内容未注入 clash_api，面板无法连接"
+				fi
 				pm_status_write
 				return 0
 			fi
@@ -529,6 +557,10 @@ pm_prepare() {
 			if [ -s "$prev" ] && pm_singbox_check "$prev"; then
 				pm_warn "sing-box 未生成新配置，继续使用上一次已验证的配置：$prev"
 				PM_RUNTIME_CONFIG="$prev"
+				if [ "${PM_PANEL_WANT:-0}" = 1 ]; then
+					PM_PANEL_REASON=prev_config
+					pm_warn "面板已启用，但 sing-box 沿用上一次已验证的配置：其中的 clash_api/secret 可能不是当前值"
+				fi
 				pm_status_write
 				return 0
 			fi
@@ -546,6 +578,10 @@ pm_prepare() {
 		if [ -s "$prevm" ] && pm_mihomo_check "$prevm"; then
 			pm_warn "mihomo 未生成新配置，继续使用上一次已验证的配置：$prevm"
 			PM_RUNTIME_CONFIG="$prevm"
+			if [ "${PM_PANEL_WANT:-0}" = 1 ]; then
+				PM_PANEL_REASON=prev_config
+				pm_warn "面板已启用，但 mihomo 沿用上一次已验证的配置：其中的 external-controller/secret 可能不是当前值"
+			fi
 			pm_status_write
 			return 0
 		fi

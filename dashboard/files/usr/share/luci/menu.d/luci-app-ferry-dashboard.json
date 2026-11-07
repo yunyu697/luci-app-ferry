@@ -1,0 +1,13 @@
+{
+	"admin/services/ferry/dashboard": {
+		"title": "面板",
+		"order": 69,
+		"action": {
+			"type": "view",
+			"path": "ferry/dashboard"
+		},
+		"depends": {
+			"acl": [ "luci-app-ferry-dashboard" ]
+		}
+	}
+}

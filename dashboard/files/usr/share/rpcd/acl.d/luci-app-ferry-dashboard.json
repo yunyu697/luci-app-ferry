@@ -1,0 +1,16 @@
+{
+	"luci-app-ferry-dashboard": {
+		"description": "Grant access to the optional Ferry dashboard (zashboard 3.22.0, read-only)",
+		"read": {
+			"ubus": {
+				"luci-ferry-panel": [ "status" ]
+			},
+			"uci": [ "ferry", "ferry-dashboard" ]
+		},
+		"write": {
+			"ubus": {
+				"luci-ferry-panel": [ "status", "enable", "disable", "rotate", "apply" ]
+			}
+		}
+	}
+}

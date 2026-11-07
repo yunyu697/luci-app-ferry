@@ -418,8 +418,10 @@ pt_tmp_disable() {
 
 	{
 		echo "== temporary off at $(date -u '+%Y-%m-%dT%H:%M:%SZ') =="
-		echo "nft tables:"; nft list tables 2>/dev/null || true
-		echo "ferry table:"; nft list table ip "$PM_NFT_TABLE" 2>/dev/null || echo none
+		# nft 快照刚在 pt_snapshot_to 里抓过，这里直接引用，避免同一操作里重复 nft list
+		echo "nft tables:"; cat "$PM_TMP_OFF_DIR/nft.tables" 2>/dev/null || true
+		echo "ferry table:"; cat "$PM_TMP_OFF_DIR/nft-ferry4.dump" 2>/dev/null || echo none
+		echo "ferry6 table:"; cat "$PM_TMP_OFF_DIR/nft-ferry6.dump" 2>/dev/null || echo none
 		echo "ip rule:"; ip rule show 2>/dev/null || true
 		echo "ip route table $PM_IP_ROUTE_TABLE:"; ip route show table "$PM_IP_ROUTE_TABLE" 2>/dev/null || true
 		echo "dnsmasq server:"; uci -q get "$PM_DNSMASQ_SECTION.server" 2>/dev/null || true

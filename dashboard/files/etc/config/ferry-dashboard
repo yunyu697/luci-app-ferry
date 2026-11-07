@@ -1,0 +1,5 @@
+config dashboard 'main'
+	option enabled '0'
+	option port '9090'
+	# 默认按 LAN 接口地址自动选择；只有自动识别失败时才需要手工指定
+	# option bind '192.168.1.1'

@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
-# 校验 ipk/apk：包内文件与源码 files/ 一致（逐文件 diff/cmp）、数量一致、元数据版本一致
+# 校验 ipk/apk：主包 + 可选面板包（luci-app-ferry-dashboard）
+# 每个包都断言：包内文件与源码树逐文件一致（diff -r）、数量一致、元数据版本一致、
+# apk 属主 root、无 0777、conffiles 登记正确；面板包另断言依赖 luci-app-ferry。
 # 用法：scripts/ci/verify-pkgs.sh [dist_dir]
 set -euo pipefail
 
@@ -14,96 +16,131 @@ META="$DIST/build-meta.txt"
 [ -f "$META" ] || { echo "ERROR: 缺少 $META" >&2; exit 1; }
 # shellcheck disable=SC1090
 . "$META"
-IPK="$DIST/$IPK"
-APK="$DIST/$APK"
+[ -n "${IPK:-}" ] || { echo "ERROR: build-meta.txt 缺少 IPK" >&2; exit 1; }
+[ -n "${APK:-}" ] || { echo "ERROR: build-meta.txt 缺少 APK" >&2; exit 1; }
+[ -n "${DASH_IPK:-}" ] || { echo "ERROR: build-meta.txt 缺少 DASH_IPK" >&2; exit 1; }
+[ -n "${DASH_APK:-}" ] || { echo "ERROR: build-meta.txt 缺少 DASH_APK" >&2; exit 1; }
 
 WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT
 
-echo "=== 解包 ipk ==="
-mkdir -p "$WORK/ipk-outer" "$WORK/ipk-data"
-tar -xzf "$IPK" -C "$WORK/ipk-outer"
-tar -xzf "$WORK/ipk-outer/data.tar.gz" -C "$WORK/ipk-data"
-mkdir -p "$WORK/ipk-control"
-tar -xzf "$WORK/ipk-outer/control.tar.gz" -C "$WORK/ipk-control"
+fail() { echo "ERROR: $*" >&2; exit 1; }
 
-echo "=== 解包 apk ==="
-mkdir -p "$WORK/apk-data"
-( cd "$WORK/apk-data" && "$APK_STATIC" extract --allow-untrusted "$APK" >/dev/null )
-
-echo "=== 元数据版本 ==="
-IPK_VER="$(sed -n 's/^Version: //p' "$WORK/ipk-control/control")"
-APK_VER="$("$APK_STATIC" adbdump "$APK" | sed -n 's/^  version: //p' | head -1)"
-[ "$IPK_VER" = "$PKGVER" ] || { echo "ERROR: ipk Version=$IPK_VER != $PKGVER" >&2; exit 1; }
-[ "$APK_VER" = "$PKGVER" ] || { echo "ERROR: apk version=$APK_VER != $PKGVER" >&2; exit 1; }
-echo "ipk=$IPK_VER apk=$APK_VER (expected $PKGVER)"
-
-echo "=== 文件数量 ==="
-REPO_COUNT="$(find "$REPO/files" -type f | wc -l | tr -d ' ')"
-IPK_COUNT="$(find "$WORK/ipk-data" -type f | wc -l | tr -d ' ')"
-# apk 额外带 /lib/apk/packages/* 元数据（conffiles/.list），不计入包内容
-APK_COUNT="$(find "$WORK/apk-data" -type f \
-	! -path "$WORK/apk-data/lib/apk/packages/luci-app-ferry.*" | wc -l | tr -d ' ')"
-echo "repo=$REPO_COUNT ipk=$IPK_COUNT apk=$APK_COUNT"
-[ "$REPO_COUNT" = "$IPK_COUNT" ] || { echo "ERROR: ipk 文件数不一致" >&2; exit 1; }
-[ "$REPO_COUNT" = "$APK_COUNT" ] || { echo "ERROR: apk 文件数不一致" >&2; exit 1; }
-
-echo "=== 内容一致性（diff -r / cmp） ==="
-# repo 不跟踪空目录；把随包空目录补进期望树后做完整 diff -r
-mkdir -p "$WORK/repo-expected"
-cp -a "$REPO/files/." "$WORK/repo-expected/"
-mkdir -p "$WORK/repo-expected/etc/ferry/rules-cache/mihomo" \
-	"$WORK/repo-expected/etc/ferry/rules-cache/sing-box"
-diff -r "$WORK/repo-expected" "$WORK/ipk-data" || {
-	echo "ERROR: ipk 内容与 files/ 不一致" >&2; exit 1;
+# 期望树：源码 files/ 树（主包）或 dashboard/files + vendor（面板包）
+# repo 不跟踪空目录，主包随包空目录需要手工补进期望树。
+prepare_expected() {
+	local label="$1"
+	mkdir -p "$WORK/exp-$label"
+	case "$label" in
+		main)
+			cp -a "$REPO/files/." "$WORK/exp-$label/"
+			mkdir -p "$WORK/exp-$label/etc/ferry/rules-cache/mihomo" \
+				"$WORK/exp-$label/etc/ferry/rules-cache/sing-box"
+			;;
+		dash)
+			cp -a "$REPO/dashboard/files/." "$WORK/exp-$label/"
+			mkdir -p "$WORK/exp-$label/www/luci-static/ferry-dashboard"
+			cp -a "$REPO/dashboard/vendor/zashboard-3.22.0/." \
+				"$WORK/exp-$label/www/luci-static/ferry-dashboard/"
+			;;
+		*) fail "未知期望树 $label" ;;
+	esac
 }
-# apk 的 /lib/apk/packages 是 apk 专有元数据目录，比较内容前先剔除
-mkdir -p "$WORK/apk-data-cmp"
-cp -a "$WORK/apk-data/." "$WORK/apk-data-cmp/"
-rm -rf "$WORK/apk-data-cmp/lib/apk"
-diff -r "$WORK/ipk-data" "$WORK/apk-data-cmp" || {
-	echo "ERROR: ipk 与 apk 内容不一致" >&2; exit 1;
-}
-echo "OK: ipk/apk 与 files/ 逐文件一致（$REPO_COUNT files）"
 
-echo "=== apk 元数据（属主/权限/conffiles） ==="
-"$APK_STATIC" adbdump "$APK" > "$WORK/adbdump.txt" 2>/dev/null || {
-	echo "ERROR: adbdump 失败" >&2; exit 1;
-}
-# 1) 文件属主必须是 root:root（当前用户打包会写成 <builder>:<builder>）
-if grep -qE '^ *user: ' "$WORK/adbdump.txt" && grep -E '^ *user: ' "$WORK/adbdump.txt" \
-	| grep -qv 'user: root'; then
-	echo "ERROR: apk 内文件属主不是 root（疑似泄漏构建用户名）" >&2
-	grep -E '^ *user: ' "$WORK/adbdump.txt" | grep -v 'user: root' | sort -u | head -5 >&2
-	exit 1
-fi
-if grep -qE '^ *group: ' "$WORK/adbdump.txt" && grep -E '^ *group: ' "$WORK/adbdump.txt" \
-	| grep -qv 'group: root'; then
-	echo "ERROR: apk 内文件属组不是 root" >&2; exit 1
-fi
-# 2) 不允许 0777（目录放宽权限会带来安全/一致性问题）
-if grep -q 'mode: 0777' "$WORK/adbdump.txt"; then
-	echo "ERROR: apk 内存在 0777 权限项" >&2
-	grep -B2 'mode: 0777' "$WORK/adbdump.txt" | head -10 >&2
-	exit 1
-fi
-# 3) conffiles 元数据必须存在且登记了配置路径
-for f in conffiles conffiles_static list; do
-	[ -f "$WORK/apk-data/lib/apk/packages/luci-app-ferry.$f" ] || {
-		echo "ERROR: apk 缺少 /lib/apk/packages/luci-app-ferry.$f" >&2; exit 1;
-	}
-done
-grep -qx '/etc/config/ferry' "$WORK/apk-data/lib/apk/packages/luci-app-ferry.conffiles" || {
-	echo "ERROR: apk conffiles 未登记 /etc/config/ferry" >&2; exit 1;
-}
-echo "OK: apk 属主 root、无 0777、conffiles 已登记"
+# 参数：label ipk 文件名 apk 文件名 conffile 包名 依赖关键字
+verify_one() {
+	local label="$1" ipk_name="$2" apk_name="$3" conffile="$4" pkg="$5" dep="$6"
+	local ipk="$DIST/$ipk_name" apk="$DIST/$apk_name"
+	[ -f "$ipk" ] || fail "缺少 $ipk"
+	[ -f "$apk" ] || fail "缺少 $apk"
 
-echo "=== 未打包进包的文件（应为空） ==="
-( cd "$REPO" && find files -type f | sed 's|^files/||' | sort ) > "$WORK/repo-list"
-( cd "$WORK/ipk-data" && find . -type f | sed 's|^\./||' | sort ) > "$WORK/ipk-list"
-if diff -u "$WORK/repo-list" "$WORK/ipk-list"; then
-	echo "OK: 文件清单一致"
-else
-	echo "ERROR: 文件清单不一致" >&2
-	exit 1
-fi
+	echo "=== [$label] 解包 ipk/apk ==="
+	mkdir -p "$WORK/$label-ipk-outer" "$WORK/$label-ipk-data" "$WORK/$label-ipk-control"
+	tar -xzf "$ipk" -C "$WORK/$label-ipk-outer"
+	tar -xzf "$WORK/$label-ipk-outer/data.tar.gz" -C "$WORK/$label-ipk-data"
+	tar -xzf "$WORK/$label-ipk-outer/control.tar.gz" -C "$WORK/$label-ipk-control"
+	mkdir -p "$WORK/$label-apk-data"
+	( cd "$WORK/$label-apk-data" && "$APK_STATIC" extract --allow-untrusted "$apk" >/dev/null )
+
+	echo "=== [$label] 元数据版本/依赖 ==="
+	local ipk_ver apk_ver
+	"$APK_STATIC" adbdump "$apk" > "$WORK/$label-adbdump.txt" 2>/dev/null ||
+		fail "[$label] adbdump 失败"
+	ipk_ver="$(sed -n 's/^Version: //p' "$WORK/$label-ipk-control/control")"
+	apk_ver="$(sed -n 's/^  version: //p' "$WORK/$label-adbdump.txt" | head -1)"
+	[ "$ipk_ver" = "$PKGVER" ] || fail "[$label] ipk Version=$ipk_ver != $PKGVER"
+	[ "$apk_ver" = "$PKGVER" ] || fail "[$label] apk version=$apk_ver != $PKGVER"
+	echo "[$label] ipk=$ipk_ver apk=$apk_ver (expected $PKGVER)"
+	if [ -n "$dep" ]; then
+		grep -q "^Depends: .*$dep" "$WORK/$label-ipk-control/control" ||
+			fail "[$label] ipk Depends 未包含 $dep"
+		grep -q -F -- "- $dep" "$WORK/$label-adbdump.txt" ||
+			fail "[$label] apk depends 未包含 $dep"
+	fi
+
+	echo "=== [$label] 文件数量 ==="
+	local exp_count ipk_count apk_count
+	exp_count="$(find "$WORK/exp-$label" -type f | wc -l | tr -d ' ')"
+	ipk_count="$(find "$WORK/$label-ipk-data" -type f | wc -l | tr -d ' ')"
+	# apk 额外带 /lib/apk/packages/* 元数据（conffiles/.list），不计入包内容
+	apk_count="$(find "$WORK/$label-apk-data" -type f \
+		! -path "$WORK/$label-apk-data/lib/apk/packages/$pkg.*" | wc -l | tr -d ' ')"
+	echo "[$label] repo=$exp_count ipk=$ipk_count apk=$apk_count"
+	[ "$exp_count" = "$ipk_count" ] || fail "[$label] ipk 文件数不一致"
+	[ "$exp_count" = "$apk_count" ] || fail "[$label] apk 文件数不一致"
+
+	echo "=== [$label] 内容一致性（diff -r） ==="
+	diff -r "$WORK/exp-$label" "$WORK/$label-ipk-data" ||
+		fail "[$label] ipk 内容与源码树不一致"
+	# apk 的 /lib/apk/packages 是 apk 专有元数据目录，比较内容前先剔除
+	cp -a "$WORK/$label-apk-data" "$WORK/$label-apk-cmp"
+	rm -rf "$WORK/$label-apk-cmp/lib/apk"
+	# 面板包解包后会留下空的 /lib（apk 元数据容器），比较前清掉
+	[ -d "$WORK/$label-apk-cmp/lib" ] && rmdir "$WORK/$label-apk-cmp/lib" 2>/dev/null || true
+	diff -r "$WORK/$label-ipk-data" "$WORK/$label-apk-cmp" ||
+		fail "[$label] ipk 与 apk 内容不一致"
+	echo "[$label] OK: ipk/apk 与源码树逐文件一致（$exp_count files）"
+
+	echo "=== [$label] apk 元数据（属主/权限/conffiles） ==="
+	[ -s "$WORK/$label-adbdump.txt" ] || fail "[$label] adbdump 结果缺失"
+	# 1) 文件属主/属组必须是 root（当前用户打包会写成 <builder>:<builder>）
+	if grep -qE '^ *user: ' "$WORK/$label-adbdump.txt" &&
+		grep -E '^ *user: ' "$WORK/$label-adbdump.txt" | grep -qv 'user: root'; then
+		fail "[$label] apk 内文件属主不是 root（疑似泄漏构建用户名）"
+	fi
+	if grep -qE '^ *group: ' "$WORK/$label-adbdump.txt" &&
+		grep -E '^ *group: ' "$WORK/$label-adbdump.txt" | grep -qv 'group: root'; then
+		fail "[$label] apk 内文件属组不是 root"
+	fi
+	# 2) 不允许 0777（目录放宽权限会带来安全/一致性问题）
+	if grep -q 'mode: 0777' "$WORK/$label-adbdump.txt"; then
+		fail "[$label] apk 内存在 0777 权限项"
+	fi
+	# 3) conffiles 元数据必须存在且登记了本包配置路径
+	local f
+	for f in conffiles conffiles_static list; do
+		[ -f "$WORK/$label-apk-data/lib/apk/packages/$pkg.$f" ] ||
+			fail "[$label] apk 缺少 /lib/apk/packages/$pkg.$f"
+	done
+	grep -qx "$conffile" "$WORK/$label-apk-data/lib/apk/packages/$pkg.conffiles" ||
+		fail "[$label] apk conffiles 未登记 $conffile"
+	echo "[$label] OK: apk 属主 root、无 0777、conffiles 已登记 $conffile"
+
+	echo "=== [$label] 未打包进包的文件（应为空） ==="
+	( cd "$WORK/exp-$label" && find . -type f | sed 's|^\./||' | sort ) > "$WORK/$label-list-exp"
+	( cd "$WORK/$label-ipk-data" && find . -type f | sed 's|^\./||' | sort ) > "$WORK/$label-list-ipk"
+	if diff -u "$WORK/$label-list-exp" "$WORK/$label-list-ipk"; then
+		echo "[$label] OK: 文件清单一致"
+	else
+		fail "[$label] 文件清单不一致"
+	fi
+}
+
+prepare_expected main
+prepare_expected dash
+
+verify_one main "$IPK" "$APK" "/etc/config/ferry" "luci-app-ferry" ""
+verify_one dash "$DASH_IPK" "$DASH_APK" "/etc/config/ferry-dashboard" \
+	"luci-app-ferry-dashboard" "luci-app-ferry"
+
+echo "OK: 主包与面板包均校验通过"

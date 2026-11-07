@@ -1,0 +1,43 @@
+一次性只读补丁：钉死 zashboard 3.22.0（禁止跟随升级）
+================================================================
+
+上游事实（实测）：zashboard 3.23.0 起移除 sing-box 支持。本面板依赖
+3.22.0 同时兼容 mihomo 与 sing-box，所以版本必须锁死。
+
+- 上游版本：v3.22.0
+- 资产：dist-no-fonts.zip
+- SHA-256：568085968af1d7266311effce22e9dbe4874da7e7b8b3dd609aac848d7d87b0b
+- 许可：MIT（Copyright (c) 2024 Zephyruso），随包保留 LICENSE.zashboard
+
+补丁只改 index.html 两处：
+  1) 在 zashboard 主 bundle 之前插入 ./ferry-readonly.js（只读 shim，独立源文件）；
+  2) 移除 vite-plugin-pwa 的 registerSW.js 注册（避免 Service Worker 缓存
+     住旧 shim，导致禁用后仍从缓存加载）。
+
+不修改上游任何 JS/CSS 产物，因此升级 zashboard 时只需重新核对：
+  - index.html 里 main bundle 的 script 标签是否仍是 `<script type="module" ...>`；
+  - /proxies、/configs、/restart、/upgrade、/providers 这些端点是否仍被 UI 使用；
+  - sing-box 的 experimental.clash_api 覆盖度是否变化。
+
+升级步骤（如果未来真的需要）：
+  1) 重新解包新版本，跑 `scripts/diag/zash-scan.sh`（如存在）或人工核对端点；
+  2) 重新生成 patch；3) 更新本文件里的版本与 SHA-256；4) 必须重新做
+     sing-box 与 mihomo 的真实浏览器验证后再发版。
+
+--- a/index.html
++++ b/index.html
+@@ -31,12 +31,13 @@
+       name="theme-color"
+       content="#FFFFFF"
+     />
++    <script src="./ferry-readonly.js"></script>
+     <script type="module" crossorigin src="./assets/index-CFApER2D.js"></script>
+     <link rel="modulepreload" crossorigin href="./assets/rolldown-runtime-CNC7AqOf.js">
+     <link rel="modulepreload" crossorigin href="./assets/setup-0-xxrEpK.js">
+     <link rel="modulepreload" crossorigin href="./assets/client-C2fMOVzx.js">
+     <link rel="stylesheet" crossorigin href="./assets/index-C7esMOcf.css">
+-  <link rel="manifest" href="./manifest.webmanifest"><script id="vite-plugin-pwa:register-sw" src="./registerSW.js"></script></head>
++  <link rel="manifest" href="./manifest.webmanifest"></head>
+   <body class="h-dvh w-screen">
+     <div id="app"></div>
+     <script>

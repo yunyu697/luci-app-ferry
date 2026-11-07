@@ -62,18 +62,32 @@ EOF
 		fi
 		argf="/tmp/.ferry-rpc-args.$$"
 		cat >"$argf" 2>/dev/null
+		# 快速方法直接同步执行：不再 mktemp + 后台 + 每秒 kill -0 轮询。
+		# 这些调用都在毫秒级完成，套上 watchdog 只会给每次轮询加 4~5 次 fork。
+		# 只有会走网络的 versions / mirror_test 和可能等锁的 start 保留 watchdog。
 		case "$2" in
-			status) run_backend status "$argf" ;;
+			job)
+				# 安装进度轮询每秒一次：纯 sh 内建读取任务文件，不起任何子进程
+				if [ -s /var/etc/ferry/kernel-job.json ]; then
+					read -r line </var/etc/ferry/kernel-job.json 2>/dev/null
+					printf '{"ok":true,"job":%s}\n' "${line:-null}"
+				else
+					echo '{"ok":true,"job":null}'
+				fi
+				;;
+			status)
+				[ -x "$K" ] || exit 0
+				sh "$K" status
+				;;
+			preview) sh "$K" preview <"$argf" ;;
+			remove) sh "$K" remove <"$argf" ;;
+			mirrors) sh "$K" mirrors <"$argf" ;;
+			mirror_set) sh "$K" mirror-set <"$argf" ;;
+			source_set) sh "$K" source-set <"$argf" ;;
+			store_set) sh "$K" store-set <"$argf" ;;
 			versions) run_backend versions "$argf" ;;
-			start) run_backend start "$argf" ;;
-			job) run_backend job "$argf" ;;
-			preview) run_backend preview "$argf" ;;
-			remove) run_backend remove "$argf" ;;
-			mirrors) run_backend mirrors "$argf" ;;
-			mirror_set) run_backend mirror-set "$argf" ;;
 			mirror_test) run_backend mirror-test "$argf" ;;
-			source_set) run_backend source-set "$argf" ;;
-			store_set) run_backend store-set "$argf" ;;
+			start) run_backend start "$argf" ;;
 			*)
 				echo '{"ok":false,"error":"unknown method"}'
 				;;

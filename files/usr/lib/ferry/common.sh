@@ -191,11 +191,109 @@ pm_load() {
 	pm_migrate_legacy
 
 	PM_RUNTIME_CONFIG=''
+	pm_panel_load
 	return 0
 }
 
 pm_is_client() { [ "${PM_DEPLOY:-}" = client ]; }
 pm_is_bypass() { [ "${PM_DEPLOY:-}" = bypass ]; }
+
+# ---------------- Dashboard 面板（独立包 luci-app-ferry-dashboard，可选） ----------------
+# 面板状态单独放 /etc/config/ferry-dashboard：卸载面板包时整份删除，
+# 主包不保存任何面板状态，因此"卸载后面板自动消失"不依赖卸载脚本的记忆。
+# secret 只落 /etc/ferry/panel.secret（0600），既不进 UCI 也不进 www 静态文件。
+PM_PANEL_CONF=ferry-dashboard
+PM_PANEL_SECRET_FILE=${PM_PANEL_SECRET_FILE:-/etc/ferry/panel.secret}
+
+pm_panel_opt() { uci -q get "$PM_PANEL_CONF.main.$1" 2>/dev/null; }
+
+pm_panel_enabled() {
+	case "$(pm_panel_opt enabled)" in
+		1|on|true|yes|enabled) return 0 ;;
+	esac
+	return 1
+}
+
+pm_panel_port() {
+	local p
+	p=$(pm_panel_opt port)
+	case "$p" in
+		''|*[!0-9]*) p=9090 ;;
+	esac
+	[ "$p" -ge 1 ] 2>/dev/null && [ "$p" -le 65535 ] 2>/dev/null || p=9090
+	echo "$p"
+}
+
+# secret：单行、仅 [0-9A-Za-z_-]；文件必须是普通文件（拒绝符号链接），权限强制 0600
+# 不用 stat（极简固件常缺该 applet），改用 ls -ld 的首字段判断
+pm_panel_secret() {
+	local f="$PM_PANEL_SECRET_FILE" s perm
+	[ -f "$f" ] && [ ! -L "$f" ] || return 1
+	perm=$(ls -ld "$f" 2>/dev/null | awk '{print $1}')
+	case "$perm" in
+		-rw-------) ;;
+		*)
+			chmod 600 "$f" 2>/dev/null || return 1
+			perm=$(ls -ld "$f" 2>/dev/null | awk '{print $1}')
+			[ "$perm" = "-rw-------" ] || return 1
+			;;
+	esac
+	s=$(head -n 1 "$f" 2>/dev/null | tr -d '\r\n')
+	case "$s" in
+		''|*[!0-9A-Za-z_-]*) return 1 ;;
+	esac
+	echo "$s"
+}
+
+# 绑定地址：只接受 LAN 接口上的 IPv4 地址，明确拒绝 0.0.0.0 / 通配 / IPv6
+pm_panel_bind() {
+	local ip iface
+	iface=${PM_LAN_IFACE:-$(pm_detect_lan_iface)}
+	ip=$(uci -q get "$PM_PANEL_CONF.main.bind" 2>/dev/null)
+	case "$ip" in
+		''|0.0.0.0|'*'|*:*|*[!0-9.]*) ip='' ;;
+	esac
+	if [ -z "$ip" ] && command -v ip >/dev/null 2>&1; then
+		ip=$(ip -4 -o addr show dev "$iface" 2>/dev/null | awk '$3 == "inet" { sub(/\/.*/, "", $4); print $4; exit }')
+	fi
+	[ -n "$ip" ] || ip=$(uci -q get network.lan.ipaddr 2>/dev/null)
+	ip=${ip%%/*}
+	case "$ip" in
+		''|0.0.0.0|*[!0-9.]*) return 1 ;;
+	esac
+	echo "$ip"
+}
+
+# 一次算好注入所需的三件套，避免生成阶段反复调 uci/ip。
+# PM_PANEL_REASON: disabled / no_secret / no_bind / ready / self_config / sub_config
+pm_panel_load() {
+	PM_PANEL_WANT=0
+	PM_PANEL_ENABLED=0
+	PM_PANEL_INJECTED=0
+	PM_PANEL_PORT=9090
+	PM_PANEL_BIND=''
+	PM_PANEL_SECRET=''
+	PM_PANEL_REASON=disabled
+
+	pm_panel_enabled || return 0
+	PM_PANEL_WANT=1
+	PM_PANEL_ENABLED=1
+	PM_PANEL_PORT=$(pm_panel_port)
+	PM_PANEL_BIND=$(pm_panel_bind) || PM_PANEL_BIND=''
+	PM_PANEL_SECRET=$(pm_panel_secret) || PM_PANEL_SECRET=''
+	if [ -z "$PM_PANEL_SECRET" ]; then
+		PM_PANEL_ENABLED=0
+		PM_PANEL_REASON=no_secret
+		return 0
+	fi
+	if [ -z "$PM_PANEL_BIND" ]; then
+		PM_PANEL_ENABLED=0
+		PM_PANEL_REASON=no_bind
+		return 0
+	fi
+	PM_PANEL_REASON=ready
+	return 0
+}
 
 pm_detect_lan_iface() {
 	local d
@@ -441,7 +539,9 @@ pm_status_write() {
 		pm_rule_sync_list skipped
 		printf '],"failed":['
 		pm_rule_sync_list failed
-		printf ']}}\n'
+		printf ']},"panel":{"enabled":%s,"injected":%s,"port":%s,"bind":"%s","reason":"%s"}}\n' \
+			"${PM_PANEL_WANT:-0}" "${PM_PANEL_INJECTED:-0}" "${PM_PANEL_PORT:-9090}" \
+			"$(pm_json_esc "${PM_PANEL_BIND:-}")" "$(pm_json_esc "${PM_PANEL_REASON:-disabled}")"
 	} > "$PM_STATUS_FILE.tmp" && mv "$PM_STATUS_FILE.tmp" "$PM_STATUS_FILE"
 	return 0
 }

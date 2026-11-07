@@ -81,6 +81,7 @@ return view.extend({
 			kernels: ['mihomo', 'singbox'],
 			maxPct: 0,
 			pollErrs: 0,
+			pollSince: 0,
 			jobSig: '',
 			jobSigAt: 0
 		};
@@ -474,16 +475,25 @@ return view.extend({
 			if (state.pollFn) { poll.remove(state.pollFn); state.pollFn = null; }
 		}
 
-		// 轮询间隔 1s；连续失败或 20s 无任何更新 → 明确的「状态未知」，不无限转圈
+		// 轮询间隔 2s；连续失败或 20s 无任何更新 → 「状态未知」；
+		// 总时长上限 30 分钟，超时停止轮询（避免后端卡死时浏览器每秒请求到天荒地老）。
+		var POLL_MAX_MS = 30 * 60 * 1000;
 		function startPoll() {
 			if (state.pollFn) return;
 			state.busy = true;
 			state.pollErrs = 0;
+			state.pollSince = Date.now();
 			state.jobSig = '';
 			state.jobSigAt = Date.now();
 			// 刷新页面后续跑的任务：首条轮询到达前按钮就必须是处理中
 			updateInstallBtn();
 			state.pollFn = function() {
+				if (Date.now() - (state.pollSince || 0) > POLL_MAX_MS) {
+					stopPoll();
+					state.busy = false;
+					goUnknown('自动轮询已停止（任务超过 30 分钟未结束）。后端任务可能仍在继续，可点「重试」或刷新页面重看进度');
+					return;
+				}
 				rpcTimeout(K.callJob(), 5000, '读取任务状态').then(function(r) {
 					state.pollErrs = 0;
 					var j = r && r.job;
@@ -507,11 +517,11 @@ return view.extend({
 					if (state.pollErrs >= 3) goUnknown('连续读取任务状态失败：' + ((e && e.message) || e));
 				});
 			};
-			poll.add(state.pollFn, 1);
+			poll.add(state.pollFn, 2);
 			state.pollFn();
 		}
 
-		// 只把界面切到「状态未知」，不断轮询：后端只是慢（大文件解压）时，
+		// 只把界面切到「状态未知」，继续轮询（上限 30 分钟）：后端只是慢（大文件解压）时，
 		// 下一条进度/完成会自动把界面恢复成正常进度
 		function goUnknown(msg) {
 			state.busy = false;

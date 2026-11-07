@@ -17,7 +17,7 @@ include $(TOPDIR)/rules.mk
 
 PKG_NAME:=luci-app-ferry
 PKG_VERSION:=1.0.0
-PKG_RELEASE:=13
+PKG_RELEASE:=14
 
 PKG_LICENSE:=GPL-2.0-only
 PKG_MAINTAINER:=yunyu697
@@ -202,3 +202,96 @@ exit 0
 endef
 
 $(eval $(call BuildPackage,luci-app-ferry))
+
+# ===========================================================================
+# 可选独立包：内嵌 zashboard 3.22.0 面板（约 5.5 MB 解包后）
+#
+# 刻意与主包分开：16 MB flash 的设备只装主包，不装这 5.5 MB 静态资源。
+# zashboard 版本锁死 3.22.0：3.23.0 起上游移除 sing-box 支持。
+# vendor/ 里的静态文件 = 上游 dist-no-fonts.zip（SHA-256 见
+# dashboard/patches/zashboard-3.22.0-readonly.patch 的文件头）+ 该 patch。
+# ===========================================================================
+define Package/luci-app-ferry-dashboard
+  SECTION:=luci
+  CATEGORY:=LuCI
+  SUBMENU:=3. Applications
+  TITLE:=Optional dashboard (zashboard 3.22.0, read-only) for Ferry
+  PKGARCH:=all
+  DEPENDS:=+luci-app-ferry +luci-base
+endef
+
+define Package/luci-app-ferry-dashboard/description
+  为 Ferry 提供内嵌的 zashboard 3.22.0 面板（只读补丁，版本锁死）：
+  mihomo 与 sing-box 共用同一个面板入口。监听地址只绑 LAN IPv4，
+  secret 随机生成并注入两个内核的配置，防火墙只放行 LAN。
+  独立安装：不装本包时主包不产生任何面板端点。
+endef
+
+define Package/luci-app-ferry-dashboard/conffiles
+/etc/config/ferry-dashboard
+endef
+
+define Package/luci-app-ferry-dashboard/postinst
+#!/bin/sh
+[ -n "$${IPKG_INSTROOT}" ] && exit 0
+rm -rf /tmp/luci-indexcache /tmp/luci-indexcache.* 2>/dev/null
+chmod 0755 /usr/lib/ferry/panel.sh /usr/bin/ferry-panel /usr/libexec/rpcd/luci-ferry-panel 2>/dev/null
+chmod 0644 /usr/share/luci/menu.d/luci-app-ferry-dashboard.json /usr/share/rpcd/acl.d/luci-app-ferry-dashboard.json 2>/dev/null
+# 开机顺序：ferry-panel(98) 先于 ferry(99)，保证 secret 在生成配置前就位
+[ -x /etc/init.d/ferry-panel ] && /etc/init.d/ferry-panel enable >/dev/null 2>&1
+# 已启用时重新装一次 LAN-only 防火墙（升级/重启 fw4 后可能被清掉）
+[ "$$(uci -q get ferry-dashboard.main.enabled)" = 1 ] && /usr/bin/ferry-panel boot >/dev/null 2>&1
+/etc/init.d/rpcd reload >/dev/null 2>&1 || killall -HUP rpcd 2>/dev/null
+( sleep 4; /etc/init.d/rpcd restart >/dev/null 2>&1 ) >/dev/null 2>&1 &
+logger -t ferry-panel "luci-app-ferry-dashboard postinst: installed/enabled" 2>/dev/null
+exit 0
+endef
+
+define Package/luci-app-ferry-dashboard/prerm
+#!/bin/sh
+[ "$$1" = "upgrade" ] && exit 0
+# 卸载必须回到原状：停面板规则、删 secret、删本包 UCI，并重启内核让
+# external-controller / clash_api 从生成配置里消失（端口释放）
+[ -x /usr/bin/ferry-panel ] && /usr/bin/ferry-panel cleanup
+[ -x /etc/init.d/ferry-panel ] && /etc/init.d/ferry-panel disable >/dev/null 2>&1
+rm -f /etc/config/ferry-dashboard
+exit 0
+endef
+
+define Package/luci-app-ferry-dashboard/install
+	$(INSTALL_DIR) $(1)/etc/config
+	$(INSTALL_CONF) ./dashboard/files/etc/config/ferry-dashboard $(1)/etc/config/ferry-dashboard
+
+	$(INSTALL_DIR) $(1)/etc/init.d
+	$(INSTALL_BIN) ./dashboard/files/etc/init.d/ferry-panel $(1)/etc/init.d/ferry-panel
+
+	$(INSTALL_DIR) $(1)/usr/bin
+	$(INSTALL_BIN) ./dashboard/files/usr/bin/ferry-panel $(1)/usr/bin/ferry-panel
+
+	$(INSTALL_DIR) $(1)/usr/lib/ferry
+	$(INSTALL_BIN) ./dashboard/files/usr/lib/ferry/panel.sh $(1)/usr/lib/ferry/panel.sh
+
+	$(INSTALL_DIR) $(1)/usr/libexec/rpcd
+	$(INSTALL_BIN) ./dashboard/files/usr/libexec/rpcd/luci-ferry-panel $(1)/usr/libexec/rpcd/luci-ferry-panel
+
+	$(INSTALL_DIR) $(1)/usr/share/luci/menu.d
+	$(INSTALL_DATA) ./dashboard/files/usr/share/luci/menu.d/luci-app-ferry-dashboard.json \
+		$(1)/usr/share/luci/menu.d/luci-app-ferry-dashboard.json
+	$(INSTALL_DIR) $(1)/usr/share/rpcd/acl.d
+	$(INSTALL_DATA) ./dashboard/files/usr/share/rpcd/acl.d/luci-app-ferry-dashboard.json \
+		$(1)/usr/share/rpcd/acl.d/luci-app-ferry-dashboard.json
+	$(INSTALL_DIR) $(1)/usr/share/licenses/luci-app-ferry-dashboard
+	$(INSTALL_DATA) ./dashboard/files/usr/share/licenses/luci-app-ferry-dashboard/LICENSE.zashboard \
+		$(1)/usr/share/licenses/luci-app-ferry-dashboard/LICENSE.zashboard
+
+	$(INSTALL_DIR) $(1)/www/luci-static/resources/view/ferry
+	$(INSTALL_DATA) ./dashboard/files/www/luci-static/resources/view/ferry/dashboard.js \
+		$(1)/www/luci-static/resources/view/ferry/dashboard.js
+
+	# zashboard 3.22.0（已打只读补丁）+ 我们的只读 shim
+	$(INSTALL_DIR) $(1)/www/luci-static/ferry-dashboard
+	$(CP) ./dashboard/vendor/zashboard-3.22.0/. $(1)/www/luci-static/ferry-dashboard/
+	$(CP) ./dashboard/files/www/luci-static/ferry-dashboard/. $(1)/www/luci-static/ferry-dashboard/
+endef
+
+$(eval $(call BuildPackage,luci-app-ferry-dashboard))

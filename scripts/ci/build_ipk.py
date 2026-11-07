@@ -12,19 +12,21 @@ import os
 import sys
 import tarfile
 
-NAME = "luci-app-ferry"
+NAME = os.environ.get("IPK_NAME", "luci-app-ferry")
 MAINTAINER = "yunyu697"
-LICENSE = "GPL-2.0-only"
-DESC = ("Ferry (dukou) transparent proxy gateway for OpenWrt "
-        "(mihomo / sing-box)")
+LICENSE = os.environ.get("IPK_LICENSE", "GPL-2.0-only")
+DESC = os.environ.get(
+    "IPK_DESC",
+    "Ferry (dukou) transparent proxy gateway for OpenWrt (mihomo / sing-box)")
+DEPENDS = os.environ.get("IPK_DEPENDS", "luci-base")
 
-PRERM = """#!/bin/sh
+PRERM = os.environ.get("IPK_PRERM") or """#!/bin/sh
 [ "$1" = "upgrade" ] && exit 0
 [ -x /usr/lib/ferry/uninstall.sh ] && /usr/lib/ferry/uninstall.sh
 exit 0
 """
 
-CONFFILES = "/etc/config/ferry\n"
+CONFFILES = os.environ.get("IPK_CONFFILES", "/etc/config/ferry\n")
 
 POSTINST = """#!/bin/sh
 [ -n "${IPKG_INSTROOT}" ] && exit 0
@@ -87,12 +89,12 @@ def control(size, version):
     lines = [
         "Package: %s" % NAME,
         "Version: %s" % version,
-        "Depends: luci-base",
+        "Depends: %s" % DEPENDS,
         "Architecture: all",
         "Section: luci",
         "Priority: optional",
         "Maintainer: %s" % MAINTAINER,
-        "Source: luci-app-ferry",
+        "Source: %s" % NAME,
         "License: %s" % LICENSE,
         "Installed-Size: %d" % size,
         "Description: %s" % DESC,

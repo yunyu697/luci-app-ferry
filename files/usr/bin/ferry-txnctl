@@ -11,7 +11,10 @@ FERRY_LIB_DIR=${FERRY_LIB_DIR:-/usr/lib/ferry}
 . "$FERRY_LIB_DIR/transaction.sh" 2>/dev/null
 
 [ -f "$FERRY_LIB_DIR/common.sh" ] || { echo '{"ok":false,"error":"missing common.sh"}'; exit 1; }
-pm_load >/dev/null 2>&1 || true
+
+# status 只读文件（pending/meta、tmp-off 标记），不依赖 UCI 派生值。
+# 跳过 pm_load 可省掉每次轮询的 config_load 与 2 次 `ip addr`；其余动作用户态需要完整配置。
+[ "$1" = status ] || pm_load >/dev/null 2>&1 || true
 
 case "$1" in
 	status)

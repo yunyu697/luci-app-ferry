@@ -1,0 +1,28 @@
+#!/bin/sh
+# rpcd 后端：面板状态与启用/禁用/轮换
+case "$1" in
+	list)
+		cat <<'EOF'
+{
+  "status": {},
+  "enable": {},
+  "disable": {},
+  "rotate": {},
+  "apply": {}
+}
+EOF
+		;;
+	call)
+		case "$2" in
+			status|enable|disable|rotate|apply)
+				/usr/bin/ferry-panel "$2"
+				;;
+			*)
+				echo '{"ok":false,"error":"unknown method"}'
+				;;
+		esac
+		;;
+	*)
+		echo '{"ok":false,"error":"unknown method"}'
+		;;
+esac
