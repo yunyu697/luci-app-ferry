@@ -6,8 +6,9 @@
 - 运行方式支持 **TPROXY**（默认，TCP+UDP）、**TUN**、**REDIRECT**（仅 TCP）。
 - 接管规则优先 **nftables**（OpenWRT 22.03+ 默认），也提供 **iptables** 兼容路径。
 - 规则放在独立 table / 自定义 chain 中，停止或切换时一键清理。
+- 面板是**独立可选包** `luci-app-ferry-dashboard`（内嵌只读面板，zashboard 3.22.0 版本锁死）：不装它，主包不监听任何额外端口；装了才多出 9090 的 LAN-only 端点（见 1.1 与 7.8）。
 
-> 已通过离线测试与 QEMU 真机验证（OpenWrt 24.10 / opkg、ImmortalWrt 25.12 / apk 的安装、启动、菜单、卸载、重启自愈）；TPROXY 真实转发、ARM 架构、真实手机访问仍未验证，分层清单见第 9 节。
+> 已通过离线测试与 QEMU 真机验证（OpenWrt 24.10 / opkg、ImmortalWrt 25.12 / apk 的安装、启动、菜单、卸载、重启自愈；r14 另验证了双包安装、面板启用、只读拦截、sing-box 能力降级与面板卸载计时）；TPROXY 真实转发、ARM 架构、真实手机访问仍未验证，分层清单见第 9 节。
 
 ---
 
@@ -45,9 +46,14 @@ luci-app-ferry/
 │           ├── presets.js                # 场景预设
 │           ├── deploy.js                 # 部署形态
 │           └── profiles.js               # 配置档案
+├── dashboard/                            # 可选面板包的源码（不编进主包）
+│   ├── files/                            # 面板 UCI/服务/命令/前端/rpcd/菜单/ACL
+│   ├── patches/zashboard-3.22.0-readonly.patch   # 只读补丁（可复核）
+│   └── vendor/zashboard-3.22.0/          # 上游静态资源（版本锁死）
 └── scripts/
     ├── fetch-kernel.sh                   # PC 端下载/校验内核二进制（默认 x86_64）
-    └── build.sh                          # 双格式构建（ipk/apk，按 SDK 自动识别）
+    ├── build.sh                          # 双格式构建（ipk/apk，按 SDK 自动识别）
+    └── ci/                               # 双包构建与校验（build-pkgs.sh、stage*.sh、verify-pkgs.sh）
 ```
 
 安装到设备后的关键路径：
@@ -68,8 +74,24 @@ luci-app-ferry/
 | sing-box 配置 | `/etc/sing-box/config.json`（自动生成或下载） |
 | 运行期临时文件 | `/var/etc/ferry/`（nft 规则文件、生成中间产物） |
 | dnsmasq 上游备份 | `/etc/ferry/dnsmasq-backup/`（持久化，重启后仍可恢复原始上游） |
+| 面板 UCI（仅面板包） | `/etc/config/ferry-dashboard`（conffile） |
+| 面板命令与运行库（仅面板包） | `/usr/bin/ferry-panel`、`/usr/lib/ferry/panel.sh`、`/usr/libexec/rpcd/luci-ferry-panel` |
+| 面板 secret（仅面板包） | `/etc/ferry/panel.secret`（0600，仅注入内核配置，不落 www 静态文件） |
+| 面板静态资源（仅面板包） | `/www/luci-static/ferry-dashboard/`（zashboard 3.22.0 + 只读 shim） |
 
-LuCI 入口：**服务（Services） → Ferry**，即 `admin/services/ferry`，共 6 个页面：
+### 1.1 双包结构（r14 起）
+
+主包与面板包分开编译、分开安装，`dashboard/` 只由面板包引用，主包的 `install` 段不包含其中任何文件。
+
+| 包 | 内容 | 依赖 | r14 资产大小 |
+| --- | --- | --- | --- |
+| `luci-app-ferry`（主包） | 服务/生成器/规则/内核管理 + 6 个 LuCI 页面 | 见 3.3（`luci-base`、`rpcd`、nftables 相关等） | ipk 119,098 B / apk 119,190 B |
+| `luci-app-ferry-dashboard`（可选面板包） | 面板后端（`panel.sh`/`ferry-panel`/rpcd）+ zashboard 3.22.0 + 只读 shim + 1 个「面板」页 | `+luci-app-ferry +luci-base` | ipk 2,932,511 B / apk 2,931,951 B |
+
+- 顺序：**先装主包，再装面板包**；卸载时**先卸面板包，再卸主包**（卸主包不会执行面板包的 prerm，会留下失效的面板 UCI/静态文件）。
+- 面板包未安装时：主包不会创建 `/etc/ferry/panel.secret`、不加载 `ip ferry_panel` 表、不监听 9090，也没有「面板」菜单项。
+
+LuCI 入口：**服务（Services） → Ferry**，即 `admin/services/ferry`。主包提供 6 个页面；装面板包后多一个「面板」页（共 7 个）：
 
 | 页面 | 作用 |
 | --- | --- |
@@ -79,6 +101,7 @@ LuCI 入口：**服务（Services） → Ferry**，即 `admin/services/ferry`，
 | 场景预设 | 7 个一键预设 |
 | 部署形态 | 主路由 / 旁路由 / 客户端，接入说明与配置下载 |
 | 配置档案 | 多套配置的增删改、复制、导入导出、激活切换 |
+| 面板（仅面板包） | 面板启用/禁用/轮换密钥、监听地址与 secret 状态、能力探测表、新窗口或页内 iframe 打开 |
 
 ---
 
@@ -105,6 +128,21 @@ LuCI 入口：**服务（Services） → Ferry**，即 `admin/services/ferry`，
 13. **sing-box 不支持 SSR**：SSR 节点只会出现在 mihomo 的 `proxies` 里；切到 sing-box 时跳过该节点并在 `status.json` 记一条告警，不会导致配置失败。
 14. **镜像源用「主源 + 备用源 + 本地缓存」三级回退**：所有规则集下载失败时保留旧缓存；无缓存则跳过该分类并告警。内核配置里只引用本地文件，不依赖启动时联网（`rule_update=1` 时才会尝试更新）。
 15. **旁路由不改本机转发链**：`deploy=bypass` 时 TUN 的 `auto_route` 固定为 `false`，nft/iptables 仍只处理「本机收到的报文」，不额外插入上游 LAN 劫持；dnsmasq 上游是否改写仍由 `router_dns` 决定（旁路由通常保持开启）。`deploy=client` 时完全不加载 netfilter 规则，只保留 mixed 端口。
+16. **面板独立可选包，不塞进主包**：`luci-app-ferry-dashboard` 的 `DEPENDS:=+luci-app-ferry +luci-base`，主包不反向依赖它；16 MB flash 的设备只装主包即可。
+17. **面板版本锁死 zashboard 3.22.0**：上游 3.23.0 起移除 sing-box 支持，跟随升级会让只读补丁与 sing-box 端点失效，因此禁止跟随升级；确需升级时必须重新核对面板用到的端点（`/version`、`/proxies`、`PUT /proxies/{group}`、`/configs`、`/rules`、`/restart`、`/upgrade`、WS `/traffic`、`/logs` 等），清单见 `docs/dashboard-proposal.md` §13。只读约束由 `dashboard/patches/zashboard-3.22.0-readonly.patch` + 运行期 shim `ferry-readonly.js` 双重保证：`fetch`/`WebSocket` 只放行 GET 与 `PUT /proxies/{group}`，其余写方法（如 `PUT /configs`）在浏览器侧返回 403。
+18. **面板只绑 LAN，secret 随机且 0600**：监听地址取 LAN 接口的 IPv4 地址（不是 `0.0.0.0`），可用 `ferry-dashboard.main.bind` 手工指定；secret 由 `/dev/urandom` 生成 32 位 hex（无 `md5sum` 时走兜底路径），存 `/etc/ferry/panel.secret` 且权限 0600，只注入内核配置，不进 UCI、不落 www 静态文件。防火墙用独立表 `ip ferry_panel`，只放行 LAN 接口/LAN 网段与 `lo`，其余来源对该端口明确 drop。
+19. **同一端口只允许一个内核**：mihomo 与 sing-box 同时监听面板端口必然 `EADDRINUSE`，所以同一时刻只允许一个内核运行；面板状态里的 `conflict.both` 会提示「两个内核同时在运行」。
+20. **卸载面板包回到原状**：停面板规则 → 从两个内核的生成配置里剥离注入（mihomo `external-controller`/`secret`、sing-box `experimental.clash_api`）→ 删 secret/UCI/静态资源/licenses → 重启内核释放端口；`opkg remove` 返回时端口已释放（见 4.7 与 9.3）。
+
+### 2.1 轮询与资源代价（r14）
+
+r14 为降低空闲开销调慢了三处轮询，代价一并列出，避免误判为「页面卡住」：
+
+| 调整 | 位置 | 代价 |
+| --- | --- | --- |
+| 安全页空闲轮询 1 s → 10 s（有 pending 时仍 1 s） | `view/ferry/safety.js` | 别的标签页/SSH 新建的 pending 在本页最晚 10 秒出现（本页自身保存会整页刷新，不受影响） |
+| 安装/升级进度轮询 1 s → 2 s | `view/ferry/kernel.js` | 进度刷新变粗（最长 2 秒一跳）；任务仍按后端真实状态推进 |
+| 进度轮询加 30 分钟上限 | `view/ferry/kernel.js` | 超过 30 分钟的任务会停止自动刷新，需要手动刷新页面才继续看进度（后端任务本身继续执行） |
 
 ---
 
@@ -135,8 +173,8 @@ echo "src-link ferry $(pwd)/feeds/ferry" >> feeds.conf
 make package/luci-app-ferry/compile V=s
 ```
 
-- opkg 分支产物：`bin/packages/<arch>/luci/luci-app-ferry_1.0.0-r2_all.ipk`
-- apk 分支产物：同名源码编出 `.apk`，版本串为 `1.0.0-r2`（`PKG_RELEASE` 被 apk 拼成 `-r2`）
+- opkg 分支产物：`bin/packages/<arch>/luci/luci-app-ferry_1.0.0-r14_all.ipk`
+- apk 分支产物：同名源码编出 `.apk`，版本串为 `1.0.0-r14`（`PKG_RELEASE` 被 apk 拼成 `-r2`）
 
 ### 3.3 依赖与各分支包名
 
@@ -177,12 +215,25 @@ make package/luci-app-ferry/compile V=s
 - `PKG_VERSION` 不能含 `-`（`1.0.0-beta` 会被当成 revision 分隔符），保持 `1.0.0`。
 - `PKG_RELEASE` 必须是纯数字，apk 会拼成 `-r1`。
 
+### 3.5 双包构建与产物校验（`scripts/ci/`）
+
+不走 SDK 时，CI/本地可以用这一组脚本直接产出并校验四个包：
+
+| 脚本 | 作用 |
+| --- | --- |
+| `ci/build-pkgs.sh` | 构建主包 + 面板包的 ipk/apk，产物落到 `$DIST`，并写 `build-meta.txt`（`IPK`/`APK`/`DASH_IPK`/`DASH_APK`） |
+| `ci/stage.sh`、`ci/stage-dashboard.sh` | 生成两个包的期望安装树（用于逐文件比对） |
+| `ci/verify-pkgs.sh [dist_dir]` | **同时校验两个包**：版本与依赖、文件数量、包内文件与源码树 `diff -r` 全等、apk 属主 `root`、无 0777、conffiles 登记、文件清单；面板包额外断言依赖 `luci-app-ferry` |
+| `ci/post-install-dashboard.sh`、`ci/pre-deinstall-dashboard.sh` | QEMU 里安装/卸载面板包时的辅助脚本 |
+
+r14 实测：主包 39 个文件、面板包 51 个文件（面板后端 10 + zashboard vendor 41），双格式四包全部通过。
 
 ---
 
+
 ## 4. 安装
 
-以 **x86_64 固件**（软路由、虚拟机、多数云主机）为主线；包名以实际产物为准：ipk 是 `luci-app-ferry_1.0.0-r2_all.ipk`，apk 是 `luci-app-ferry-1.0.0-r2.apk`（以 `ls dist/apk` 为准）。三条分支的命令都是“上传 → 装包 → 跑一次 uci-defaults → 打开开关”。
+以 **x86_64 固件**（软路由、虚拟机、多数云主机）为主线；包名以实际产物为准：ipk 是 `luci-app-ferry_1.0.0-r14_all.ipk`，apk 是 `luci-app-ferry-1.0.0-r14.apk`（以 `ls dist/apk` 为准）。三条分支的命令都是“上传 → 装包 → 跑一次 uci-defaults → 打开开关”。
 
 ### 4.1 OpenWRT apk 分支（main / snapshot）
 
@@ -203,11 +254,11 @@ uci commit ferry
 
 ```sh
 # PC 端
-scp dist/ipk/luci-app-ferry_1.0.0-r2_all.ipk root@192.168.1.1:/tmp/
+scp dist/ipk/luci-app-ferry_1.0.0-r14_all.ipk root@192.168.1.1:/tmp/
 
 # 路由器
 opkg update
-opkg install /tmp/luci-app-ferry_1.0.0-r2_all.ipk
+opkg install /tmp/luci-app-ferry_1.0.0-r14_all.ipk
 sh /etc/uci-defaults/50-ferry
 uci set ferry.main.enabled='1'
 uci commit ferry
@@ -219,15 +270,32 @@ uci commit ferry
 包格式仍是 ipk，命令与 4.2 完全一致：
 
 ```sh
-scp dist/ipk/luci-app-ferry_1.0.0-r2_all.ipk root@192.168.1.1:/tmp/
+scp dist/ipk/luci-app-ferry_1.0.0-r14_all.ipk root@192.168.1.1:/tmp/
 opkg update
-opkg install /tmp/luci-app-ferry_1.0.0-r2_all.ipk
+opkg install /tmp/luci-app-ferry_1.0.0-r14_all.ipk
 sh /etc/uci-defaults/50-ferry
 uci set ferry.main.enabled='1' && uci commit ferry
 /etc/init.d/ferry restart
 ```
 
 差异集中在固件侧（见 4.5 与第 9 节）：ImmortalWrt 通常预装 `dnsmasq-full`（与 `dnsmasq` 互斥，勿重复装）；LuCI 23.05 的控件比 24.10 少，页面已做降级；`nftables` 是默认后端。
+
+### 4.3.1 可选：安装面板包（`luci-app-ferry-dashboard`）
+
+面板是独立包，装完还需要显式启用（默认 `enabled=0`，装包本身不会注入内核配置）：
+
+```sh
+# opkg 分支
+opkg install /tmp/luci-app-ferry-dashboard_1.0.0-r14_all.ipk
+/usr/bin/ferry-panel enable        # 生成 secret、注入内核、重启一次内核
+/usr/bin/ferry-panel status        # enabled/injected/running/reason=ready
+
+# apk 分支
+apk add --allow-untrusted /tmp/luci-app-ferry-dashboard-1.0.0-r14.apk
+/usr/bin/ferry-panel enable
+```
+
+也可以在 LuCI「服务 → Ferry → 面板」里点「启用面板」，效果相同。启用后仅在 LAN 地址监听 `9090`（可用 `uci set ferry-dashboard.main.port` / `.bind` 调整），不要把它暴露到 WAN。
 
 ### 4.4 apk 签名
 
@@ -316,6 +384,27 @@ prerm 会调用 `/usr/lib/ferry/uninstall.sh`，它按顺序做四件事：
 4. 用持久化备份还原 dnsmasq 上游。
 
 全过程幂等，并且总是 `exit 0`：清理失败不会把包卡在“无法卸载”的状态。
+
+#### 面板包（可选）的卸载
+
+顺序是**先卸面板包，再卸主包**：`opkg remove luci-app-ferry-dashboard`（apk 分支 `apk del luci-app-ferry-dashboard`）。面板包的 prerm 会调用 `/usr/bin/ferry-panel cleanup`，依次：
+
+1. 删 `ip ferry_panel` 表、停 `ferry-panel` 服务；
+2. 从两个内核的生成配置里剥离注入（mihomo 删 `external-controller`/`secret`，sing-box 删 `experimental.clash_api` 整块）；
+3. 删 `/etc/config/ferry-dashboard`、`/etc/ferry/panel.secret`、面板状态目录、`/www/luci-static/ferry-dashboard/`、`/usr/share/licenses/luci-app-ferry-dashboard/`，清 LuCI 索引缓存；
+4. 等 apply 标记消失，再等面板端口真正释放（每次最多 20 秒）。
+
+实测（OpenWrt 24.10.5 / QEMU，mihomo 内核，`/proc/uptime` 计时）：`opkg remove` 返回 0，耗时 **5.46 s**；**返回瞬间 9090 已无监听**（+1 s、+31 s 复核仍为 0）。随后主包的异步 reload 会把 mihomo 重新拉起，但配置里已没有 `external-controller`，端口保持释放。
+
+| 卸载后面板相关内容 | 结果 |
+| --- | --- |
+| `ferry-dashboard` UCI、`/etc/ferry/panel.secret` | 删除 |
+| `/www/luci-static/ferry-dashboard/`、licenses、`/usr/lib/ferry/panel.sh`、`/usr/bin/ferry-panel` | 随包删除 |
+| `ip ferry_panel` 表、rc.d 中的 `K11ferry-panel`/`S98ferry-panel` | 清理/撤销 |
+| 两内核配置中的面板注入 | 0 处（mihomo 与 sing-box 都还原为不含面板端点的生成结果） |
+| 主包的 `ferry`/`ferry6` 表、dnsmasq 上游、节点/profile | 不受影响，保持原状 |
+
+> 卸载时 opkg 可能打印 `file_sha256sum_alloc: Failed to open file /etc/config/ferry-dashboard` / `Not deleting modified conffile`：这是 prerm 已主动删掉该 conffile 导致的噪声，卸载结果正常。
 
 #### 包已删 / 脚本没跑时的兜底
 
@@ -1003,6 +1092,34 @@ pt_begin（快照 + meta） → stop → start（PM_TXN_SKIP=1，避免自检误
 测试断言：对生成包内所有文本 `grep` 植入的原始凭据，必须零命中（`tests/test-diag.sh` PASS=49，
 QEMU 内 PASS=24/0）。
 
+### 7.8 面板实现（可选包）
+
+| 组成 | 作用 |
+| --- | --- |
+| `usr/lib/ferry/panel.sh` | secret 生成、bind/port 计算、注入、`ip ferry_panel` 防火墙、`panel_apply_bg`、`panel_cleanup` |
+| `usr/bin/ferry-panel` | CLI：`enable` / `disable` / `rotate` / `apply` / `cleanup` / `boot` / `status` |
+| `usr/libexec/rpcd/luci-ferry-panel` | rpcd 后端：status / enable / disable / rotate / apply |
+| `view/ferry/dashboard.js` | LuCI「面板」页：状态表、能力探测表、启用/禁用/轮换、新窗口或 iframe |
+| `www/luci-static/ferry-dashboard/` | zashboard 3.22.0（已打只读补丁）+ 运行期 shim `ferry-readonly.js` |
+
+**注入**：`generate.sh` 在生成配置时读取面板状态——mihomo 追加 `external-controller: <bind>:<port>` 与 `secret: "<secret>"`；sing-box 追加 `experimental.clash_api`（`external-controller` + `secret`）。`config_path` 自备配置与 sing-box 订阅配置不会被改写，面板分别给出 `self_config` / `sub_config` 原因提示。
+
+**启用流程**：`enabled=1` → 生成 32 位 hex secret（0600）→ 取 LAN IPv4 作为 bind → 下发 `ip ferry_panel`（LAN 网段 + `lo` accept，其余 `tcp dport <port>` 明确 drop）→ `panel_apply_bg` 以 `PM_TXN_SKIP=1 /etc/init.d/ferry reload` 异步重启内核（标记 `/var/run/ferry-panel/apply.since`，日志 `/tmp/ferry-panel-apply.log`）。页面轮询 `status`，`applying=true` 期间显示「约 5–30 秒」。禁用与轮换 key 走同一套流程。
+
+**只读边界**：`ferry-readonly.js` 同时接管 `fetch`、`XMLHttpRequest` 与 `WebSocket`——GET/HEAD/OPTIONS 全放行；写方法只放行 `PUT /proxies/{group}`（切换节点）；其余方法返回 403；WS 只放行 `/traffic`、`/logs`、`/memory`、`/connections`。shim 不改 zashboard 资源，失败/回退时删 `index.html` 里一行 `<script>` 即可。
+
+**能力探测**（`caps` 字段随当前内核变化，页面按「可用 / 只读 / 不可用」着色，sing-box 下不可用项置灰并给出说明）：
+
+| 能力 | mihomo | sing-box |
+| --- | --- | --- |
+| 规则页（`/rules`） | available | unavailable（隐藏入口） |
+| 配置页（`/configs`） | readonly | unavailable |
+| 延迟明细 | available | unavailable（探测返回通用错误） |
+| 重启 / 升级内核 | unavailable（由 ferry 内核页负责） | unavailable |
+| 切换节点（`PUT /proxies/{group}`） | available | available |
+
+`status` 里可看 `enabled`/`injected`/`bind`/`port`/`secret`/`kernel`/`type`/`mode`/`reason`/`running`/`service_enabled`/`applying`/`conflict`/`caps`；`reason` 取值含 `ready`、`disabled`、`no_secret`、`no_bind`、`self_config`、`sub_config`、`not_injected`；`conflict.both` 表示两个内核同时在跑（同端口会 `EADDRINUSE`）。
+
 ---
 
 ## 8. 常见问题（FAQ）
@@ -1076,6 +1193,10 @@ iptables -t nat -S | grep PM_
 | ImmortalWrt 25.12.0 | apk | 重启自愈 + 卸载断言 | 21 项 PASS（pre-deinstall 标记文件被写出） |
 | OpenWrt 24.10.4 | ipk | 内核管理：全新安装 mihomo 1.18.8 → 切 sing-box 1.8.14/1.10.7/1.11.0/1.14.4 → 回滚 → 卸非当前版本 → 跨内核切回 mihomo → 切 mihomo 1.19.33 | 12 节 PASS（见下方明细） |
 | ImmortalWrt 25.12.0 | apk | 内核管理：全新安装 mihomo 1.19.33 → 切 sing-box 1.10.7 → 切 mihomo 1.18.8 → 回滚 1.19.33 → 卸非当前版本 → `apk del` 保留内核文件 | 6 节 PASS |
+| OpenWrt 24.10.5 | ipk | 面板包：安装 → 启用 → mihomo 下页面渲染与只读拦截 | 27 项 DOM 断言全 PASS |
+| OpenWrt 24.10.5 | ipk | 切 sing-box 后面板能力探测、置灰与隐藏 | 21 项 DOM 断言全 PASS |
+| OpenWrt 24.10.5 | ipk | 主包 RESTORE：冻结包 `--force-reinstall` + 逐文件 md5 | 38/38 OK，FAILED 0 |
+| OpenWrt 24.10.5 | ipk | 面板包完整卸载计时（`/proc/uptime`） | 5.46 s；返回瞬间 9090 已释放 |
 
 ### 9.1.1 内核管理真机明细（QEMU x86_64，真实上游二进制）
 
@@ -1178,13 +1299,27 @@ ImmortalWrt 25.12.0（apk）同一脚本的 `imm` 模式全流程 PASS：mihomo 
 - TPROXY/TUN 的**真实客户端流量转发**：QEMU 里只断言了规则、策略路由、进程与配置，没有真实终端跑流量。
 - ARM/MIPS 等非 x86_64 架构；本包本身 `Architecture: all`，但内核二进制需自行匹配架构，未实测。
 - sing-box 路径已在 QEMU 上实际切换并启动（1.8.14 / 1.10.7 / 1.11.0 / 1.14.4 各自 `check` 通过、进程存活），但**真实终端流量**仍未验证。
-- 真实手机/电视/游戏机等终端接入；旁路由真实拓扑连通性；节点延迟测试未实现。
+- 真实手机/电视/游戏机等终端接入；旁路由真实拓扑连通性；ferry 自己的节点页没有延迟测试（面板在 mihomo 下可看逐节点延迟）。
 - 上游订阅与规则集在真实网络下的下载行为（离线测试用本地缓存）。
 - apk 签名/信任链：发布包未签名，必须 `--allow-untrusted`。
 - LuCI 在 23.05 的具体渲染、`ui.showModal` 回调、`fs.exec` 提权行为。
+- 面板包只在 OpenWrt 24.10.5 + ipk 上实测；apk 分支与 ImmortalWrt 未单独跑面板。
+- 面板的真实 LAN 客户端访问（手机/电视/WLAN）未实测：验证是通过宿主侧 SSH 隧道访问 `192.168.1.1:9090` 完成的。
 
+### 9.3 面板与双包验证明细（r14）
+
+| 项 | 方法 | 结果 |
+| --- | --- | --- |
+| mihomo 下页面与只读 | headless Chrome + DOM 断言（不依赖截图） | 27/27 PASS：登录、状态表、「面板」页 iframe 首屏、能力表、`GET /version` 200、`PUT /proxies/{group}` 放行、`PUT /configs` 403、未打补丁页面对照非 403 |
+| sing-box 下能力降级 | 同上，切内核后复跑 | 21/21 PASS：内核识别为 sing-box、四项能力置灰、横幅提示、规则页入口隐藏且不白屏、只读 403 仍生效 |
+| 监听与密钥 | guest 内 `netstat`/`ls` | 仅 `192.168.1.1:9090`（mihomo）或同地址（sing-box）；secret 0600、32 位 hex，仅出现在内核配置里 |
+| 双包校验 | `scripts/ci/verify-pkgs.sh` | 主包 39 文件、面板包 51 文件；ipk/apk 四包内容均与源码树逐文件全等 |
+| 主包 RESTORE | 冻结包 `opkg install --force-reinstall` + `md5sum -c` | 返回 0，38/38 OK |
+| 面板卸载 | 冻结面板包 + `ferry-panel enable` → 计时 `opkg remove` | 5.46 s，`REMOVE_RC=0`，返回瞬间 9090 无监听 |
+| 卸载后还原 | 卸载后快照 | UCI/secret/静态目录/licenses/`ip ferry_panel` 全无；两内核注入 0 处；主包 `ferry`/`ferry6` 表与 dnsmasq 上游不变 |
 
 ---
+
 
 ## 10. 排障命令
 
